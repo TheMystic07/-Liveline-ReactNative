@@ -7,6 +7,7 @@ import {
   Group,
   Line as SkiaLine,
   Path,
+  rect,
   vec,
 } from '@shopify/react-native-skia';
 import { useSkiaFont } from 'number-flow-react-native/skia';
@@ -15,9 +16,11 @@ import Animated, {
   Easing,
   runOnJS,
   useAnimatedStyle,
+  useDerivedValue,
   useSharedValue,
   withTiming,
 } from 'react-native-reanimated';
+import type { SharedValue } from 'react-native-reanimated';
 
 import { BADGE_NUMBER_FLOW_FONT_SRC } from './BadgeSkiaNumberFlow';
 import { supportsTwoDecimalNumberFlow } from './chartNumberFlow';
@@ -36,7 +39,8 @@ import { EmptyState } from './render/EmptyState';
 import { ReferenceLineCanvas } from './render/ReferenceLineCanvas';
 import { ReferenceLineLabel } from './render/ReferenceLineLabel';
 import { BadgeOverlay } from './render/BadgeOverlay';
-import type { LiveLineChartProps, LiveLinePoint, LiveLineSeries } from './types';
+import type { ChartPadding, LiveLineChartProps, LiveLinePoint, LiveLineSeries } from './types';
+import { useChartSmoothingEngine } from './smoothingEngine';
 import {
   calcGridTicksJs,
   calcTimeTicksJs,
@@ -49,6 +53,93 @@ import {
   toScreenYJs,
 } from './nativeChartUtils';
 import { monotoneSplinePath } from './math/spline';
+
+const MULTI_WIN_BUF = 0.015;
+
+function SeriesTipPath({
+  svTipT,
+  svMin,
+  svMax,
+  svTipV,
+  color,
+  lastPoint,
+  svBuildMin,
+  svBuildMax,
+  svBuildTipT,
+  layoutWidth,
+  layoutHeight,
+  pad,
+  win,
+}: {
+  svTipT: SharedValue<number>;
+  svMin: SharedValue<number>;
+  svMax: SharedValue<number>;
+  svTipV: SharedValue<number>;
+  color: string;
+  lastPoint: LiveLinePoint | null;
+  svBuildMin: SharedValue<number>;
+  svBuildMax: SharedValue<number>;
+  svBuildTipT: SharedValue<number>;
+  layoutWidth: number;
+  layoutHeight: number;
+  pad: ChartPadding;
+  win: number;
+}) {
+  const dvPath = useDerivedValue(() => {
+    'worklet';
+    if (!lastPoint || layoutWidth <= 0 || layoutHeight <= 0) return '';
+    const bMin = svBuildMin.value;
+    const bMax = svBuildMax.value;
+    const buildSpan = Math.max(1e-4, bMax - bMin);
+    const cMin = svMin.value;
+    const cMax = svMax.value;
+    const curSpan = Math.max(1e-4, cMax - cMin);
+    const ch = Math.max(1, layoutHeight - pad.top - pad.bottom);
+    const cw = Math.max(1, layoutWidth - pad.left - pad.right);
+
+    const rightEdgeBuild = svBuildTipT.value + win * MULTI_WIN_BUF;
+    const leftEdgeBuild = rightEdgeBuild - win;
+    const x0 =
+      pad.left + ((lastPoint.time - leftEdgeBuild) / (rightEdgeBuild - leftEdgeBuild || 1)) * cw;
+    const y0Build = pad.top + (1 - (lastPoint.value - bMin) / buildSpan) * ch;
+
+    const scaleY = buildSpan / curSpan;
+    const translateY =
+      (pad.top + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
+    const y0 = y0Build * scaleY + translateY;
+
+    const rightEdgeCur = svTipT.value + win * MULTI_WIN_BUF;
+    const leftEdgeCur = rightEdgeCur - win;
+    const x1 =
+      pad.left + ((svTipT.value - leftEdgeCur) / (rightEdgeCur - leftEdgeCur || 1)) * cw;
+    const y1 = pad.top + (1 - (svTipV.value - cMin) / curSpan) * ch;
+
+    return `M ${x0} ${y0} L ${x1} ${y1}`;
+  }, [
+    lastPoint,
+    layoutWidth,
+    layoutHeight,
+    pad,
+    win,
+    svBuildMin,
+    svBuildMax,
+    svBuildTipT,
+    svTipT,
+    svMin,
+    svMax,
+    svTipV,
+  ]);
+  return (
+    <Path
+      path={dvPath}
+      style="stroke"
+      strokeWidth={2}
+      strokeJoin="round"
+      strokeCap="round"
+      color={color}
+    />
+  );
+}
 
 function computeUnionRange(
   series: Array<{ points: LiveLinePoint[]; value: number }>,
@@ -154,6 +245,8 @@ export function NativeMultiSeriesChart({
     });
   }, [leftEdge, rightEdge, visibleSeries]);
 
+  const empty = loading || layout.width <= 0 || preparedSeries.every((entry) => entry.points.length < 2);
+
   const range = useMemo(
     () => computeUnionRange(preparedSeries, referenceLine?.value),
     [preparedSeries, referenceLine?.value],
@@ -195,10 +288,108 @@ export function NativeMultiSeriesChart({
     });
   }, [leftEdge, latestTime, layout.height, layout.width, pad, preparedSeries, range.max, range.min, rightEdge]);
 
+  const engine = useChartSmoothingEngine({
+    targetMin: range.min,
+    targetMax: range.max,
+    seriesTargets: visibleSeries.map((e) => ({ id: e.id, value: e.value })),
+    dataTipT: latestTime,
+    enabled: !empty,
+  });
+
+  const [pathBuildSnapshot, setPathBuildSnapshot] = useState({
+    range: { min: 0, max: 1 },
+    tipT: 0,
+    tips: {} as Record<string, number>,
+  });
+
+  useEffect(() => {
+    if (!empty) engine.pulse();
+  }, [series, latestTime, empty, engine]);
+
+  useEffect(() => {
+    if (empty) return;
+    const tips: Record<string, number> = {};
+    for (const v of visibleSeries) {
+      tips[v.id] = engine.getSeriesTipV(v.id).value;
+    }
+    setPathBuildSnapshot({
+      range: { min: engine.svMin.value, max: engine.svMax.value },
+      tipT: engine.svTipT.value,
+      tips,
+    });
+  }, [series, empty, visibleSeries, engine]);
+
+  const svBuildMin = useSharedValue(0);
+  const svBuildMax = useSharedValue(1);
+  const svBuildTipT = useSharedValue(0);
+
+  useEffect(() => {
+    svBuildMin.value = pathBuildSnapshot.range.min;
+    svBuildMax.value = pathBuildSnapshot.range.max;
+    svBuildTipT.value = pathBuildSnapshot.tipT;
+  }, [pathBuildSnapshot, svBuildMin, svBuildMax, svBuildTipT]);
+
+  const staticSeriesPaths = useMemo(() => {
+    const tipT = pathBuildSnapshot.tipT;
+    const bMin = pathBuildSnapshot.range.min;
+    const bMax = pathBuildSnapshot.range.max;
+    const snapRight = tipT + activeWindow * MULTI_WIN_BUF;
+    const snapLeft = snapRight - activeWindow;
+    return preparedSeries.map((entry) => {
+      const screenPoints = entry.points.map((point) => ({
+        x: toScreenXJs(point.time, snapLeft, snapRight, layout.width, pad),
+        y: toScreenYJs(point.value, bMin, bMax, layout.height, pad),
+      }));
+      const tipV = pathBuildSnapshot.tips[entry.id] ?? entry.value;
+      const livePoint = {
+        x: toScreenXJs(tipT, snapLeft, snapRight, layout.width, pad),
+        y: toScreenYJs(tipV, bMin, bMax, layout.height, pad),
+      };
+      const merged = screenPoints.length > 0 ? [...screenPoints, livePoint] : [livePoint];
+      return {
+        id: entry.id,
+        color: entry.color,
+        label: entry.label ?? entry.id,
+        path: monotoneSplinePath(merged),
+        livePoint,
+        points: entry.points,
+      };
+    });
+  }, [activeWindow, layout.height, layout.width, pad, pathBuildSnapshot, preparedSeries]);
+
+  const evMin = engine.svMin;
+  const evMax = engine.svMax;
+  const evTipT = engine.svTipT;
+
+  const dvRangeScaleY = useDerivedValue(() => {
+    'worklet';
+    const bMin = svBuildMin.value;
+    const bMax = svBuildMax.value;
+    const cMin = evMin.value;
+    const cMax = evMax.value;
+    const buildSpan = Math.max(1e-4, bMax - bMin);
+    const curSpan = Math.max(1e-4, cMax - cMin);
+    return buildSpan / curSpan;
+  });
+
+  const dvRangeTranslateY = useDerivedValue(() => {
+    'worklet';
+    const bMin = svBuildMin.value;
+    const bMax = svBuildMax.value;
+    const cMin = evMin.value;
+    const cMax = evMax.value;
+    const buildSpan = Math.max(1e-4, bMax - bMin);
+    const curSpan = Math.max(1e-4, cMax - cMin);
+    const scaleY = buildSpan / curSpan;
+    const h = layout.height;
+    const ch = Math.max(1, h - pad.top - pad.bottom);
+    return (pad.top + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
+  }, [layout.height, pad.top, pad.bottom]);
+
   const primaryPath = useMemo(() => {
     if (!primarySeries) return null;
-    return seriesPaths.find((p) => p.id === primarySeries.id) ?? seriesPaths[0] ?? null;
-  }, [primarySeries, seriesPaths]);
+    return staticSeriesPaths.find((p) => p.id === primarySeries.id) ?? staticSeriesPaths[0] ?? null;
+  }, [primarySeries, staticSeriesPaths]);
 
   const pillH = BADGE_LINE_H + BADGE_PAD_Y * 2;
   const badgeBgPath = useMemo(
@@ -329,7 +520,8 @@ export function NativeMultiSeriesChart({
     return Gesture.Simultaneous(pan, pinch);
   }, [pinchToZoom, resolvedWin, scrub]);
 
-  const empty = loading || layout.width <= 0 || preparedSeries.every((entry) => entry.points.length < 2);
+  const clipRect =
+    chartWidth > 0 && chartHeight > 0 ? rect(pad.left, pad.top, chartWidth, chartHeight) : undefined;
 
   return (
     <View style={[styles.root, { height }, style]}>
@@ -407,19 +599,43 @@ export function NativeMultiSeriesChart({
                     />
                   ) : null}
 
-                  {seriesPaths.map((entry) => (
-                    <Group key={entry.id}>
-                      <Path
-                        path={entry.path}
-                        style="stroke"
-                        strokeWidth={2}
-                        strokeJoin="round"
-                        strokeCap="round"
-                        color={entry.color}
-                      />
-                      <Circle cx={entry.livePoint.x} cy={entry.livePoint.y} r={4} color={entry.color} />
-                    </Group>
-                  ))}
+                  {staticSeriesPaths.map((entry) => {
+                    const lastPt =
+                      entry.points.length > 0 ? entry.points[entry.points.length - 1]! : null;
+                    return (
+                      <Group key={entry.id} clip={clipRect}>
+                        <Group
+                          transform={
+                            [{ translateY: dvRangeTranslateY }, { scaleY: dvRangeScaleY }] as never
+                          }
+                        >
+                          <Path
+                            path={entry.path}
+                            style="stroke"
+                            strokeWidth={2}
+                            strokeJoin="round"
+                            strokeCap="round"
+                            color={entry.color}
+                          />
+                        </Group>
+                        <SeriesTipPath
+                          svTipT={evTipT}
+                          svMin={evMin}
+                          svMax={evMax}
+                          svTipV={engine.getSeriesTipV(entry.id)}
+                          color={entry.color}
+                          lastPoint={lastPt}
+                          svBuildMin={svBuildMin}
+                          svBuildMax={svBuildMax}
+                          svBuildTipT={svBuildTipT}
+                          layoutWidth={layout.width}
+                          layoutHeight={layout.height}
+                          pad={pad}
+                          win={activeWindow}
+                        />
+                      </Group>
+                    );
+                  })}
 
                   {badge && primarySeries && !empty ? (
                     <SkiaLine

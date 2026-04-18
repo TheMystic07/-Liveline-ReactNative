@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
@@ -6,14 +6,17 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 import {
   LiveLineChart,
-  type BadgeVariant,
   type LiveLinePoint,
   type LiveLineSeries,
-  type LiveLineTheme,
   type LiveOrderbookSnapshot,
   type WindowOption,
 } from './src/chart';
-import { Chip, ControlRow } from './src/demo/Controls';
+import { useChartConfig } from './src/demo/config/useChartConfig';
+import { useFeedConfig } from './src/demo/config/useFeedConfig';
+import { useInteractionConfig } from './src/demo/config/useInteractionConfig';
+import { ChartControlsSection } from './src/demo/controls/ChartControlsSection';
+import { FeedControlsSection } from './src/demo/controls/FeedControlsSection';
+import { InteractionControlsSection } from './src/demo/controls/InteractionControlsSection';
 import { useMockLiveFeed } from './src/demo/useMockLiveFeed';
 
 const WINDOWS: WindowOption[] = [
@@ -23,138 +26,92 @@ const WINDOWS: WindowOption[] = [
   { label: '2m', secs: 120 },
 ];
 
-const TICK_RATES = [
-  { label: '80ms', value: 80 },
-  { label: '150ms', value: 150 },
-  { label: '300ms', value: 300 },
-  { label: '900ms', value: 900 },
-];
-
-const ACCENTS = [
-  { label: 'Blue', value: '#3b82f6' },
-  { label: 'Bitcoin', value: '#f7931a' },
-  { label: 'Green', value: '#22c55e' },
-  { label: 'Red', value: '#ef4444' },
-  { label: 'Violet', value: '#8b5cf6' },
-];
-
 export default function App() {
-  const [theme, setTheme] = useState<LiveLineTheme>('dark');
-  const [windowSecs, setWindowSecs] = useState(30);
-  const [tickMs, setTickMs] = useState(300);
-  const [volatility, setVolatility] = useState<'calm' | 'normal' | 'chaos'>('normal');
-  const [paused, setPaused] = useState(false);
-  const [accent, setAccent] = useState(ACCENTS[0].value);
-  const [degenMode, setDegenMode] = useState(false);
-  const [badgeVariant, setBadgeVariant] = useState<BadgeVariant>('default');
-  const [showBadge, setShowBadge] = useState(true);
-  const [chartView, setChartView] = useState<'line' | 'multi' | 'candle'>('line');
-  const [candleLineMorph, setCandleLineMorph] = useState(false);
-  const [showReferenceLine, setShowReferenceLine] = useState(false);
-  const [degenScale, setDegenScale] = useState<1 | 1.5 | 2>(1);
-  const [degenDownMomentum, setDegenDownMomentum] = useState(false);
-  const [badgeNumberFlow, setBadgeNumberFlow] = useState(false);
-  const [scrubNumberFlow, setScrubNumberFlow] = useState(false);
-  const [scrubHaptics, setScrubHaptics] = useState(true);
-  const [snapToPointScrubbing, setSnapToPointScrubbing] = useState(false);
-  const [pinchToZoom, setPinchToZoom] = useState(false);
-  const [liveDotGlow, setLiveDotGlow] = useState(false);
-  const [lineTrailGlow, setLineTrailGlow] = useState(false);
-  const [gradientLineColoring, setGradientLineColoring] = useState(false);
-  const [showOrderbookStream, setShowOrderbookStream] = useState(false);
+  const chart = useChartConfig();
+  const feed = useFeedConfig();
+  const interaction = useInteractionConfig();
+
+  const effectivePaused = feed.paused || !feed.appIsActive;
 
   const degenConfig = useMemo(
     () =>
-      degenMode
-        ? {
-            scale: degenScale,
-            downMomentum: degenDownMomentum,
-          }
+      feed.degenMode
+        ? { scale: feed.degenScale, downMomentum: feed.degenDownMomentum }
         : false,
-    [degenMode, degenScale, degenDownMomentum],
+    [feed.degenMode, feed.degenScale, feed.degenDownMomentum],
   );
 
-  const feed = useMockLiveFeed({
-    tickMs,
-    volatility,
-    paused,
-    mania: degenMode,
+  const liveFeed = useMockLiveFeed({
+    tickMs: feed.tickMs,
+    volatility: feed.volatility,
+    paused: effectivePaused,
+    mania: feed.degenMode,
   });
 
   const valueDelta = useMemo(() => {
-    if (feed.data.length < 2) return 0;
-    return feed.value - feed.data[Math.max(0, feed.data.length - 24)].value;
-  }, [feed.data, feed.value]);
+    if (liveFeed.data.length < 2) return 0;
+    return liveFeed.value - liveFeed.data[Math.max(0, liveFeed.data.length - 24)].value;
+  }, [liveFeed.data, liveFeed.value]);
 
-  const syntheticOrderbook = useMemo((): LiveOrderbookSnapshot => {
-    const mid = feed.value;
+  const syntheticOrderbook = useMemo((): LiveOrderbookSnapshot | undefined => {
+    if (chart.chartView === 'multi' || !chart.showOrderbookStream) return undefined;
+    const mid = liveFeed.value;
     const spread =
       Math.max(0.02, mid * 0.0011) *
-      (volatility === 'chaos' ? 2.1 : volatility === 'calm' ? 0.62 : 1);
+      (feed.volatility === 'chaos' ? 2.1 : feed.volatility === 'calm' ? 0.62 : 1);
     const levels = 10;
     const bids: [number, number][] = [];
     const asks: [number, number][] = [];
-    const n = feed.data.length;
+    const n = liveFeed.data.length;
     for (let i = 0; i < levels; i++) {
       const j = i + 1;
-      const szb = 3 + ((i * 19 + (n % 13)) % 78) * (volatility === 'chaos' ? 1.45 : 1);
-      const sza = 3 + ((i * 17 + (n % 10)) % 76) * (volatility === 'chaos' ? 1.4 : 1);
+      const szb = 3 + ((i * 19 + (n % 13)) % 78) * (feed.volatility === 'chaos' ? 1.45 : 1);
+      const sza = 3 + ((i * 17 + (n % 10)) % 76) * (feed.volatility === 'chaos' ? 1.4 : 1);
       bids.push([mid - spread * j, szb]);
       asks.push([mid + spread * j, sza]);
     }
     return { bids, asks };
-  }, [feed.value, feed.data.length, volatility]);
+  }, [chart.chartView, liveFeed.value, liveFeed.data.length, chart.showOrderbookStream, feed.volatility]);
 
   const demoSeries = useMemo((): LiveLineSeries[] => {
-    const d = feed.data;
+    if (chart.chartView !== 'multi') return [];
+    const d = liveFeed.data;
     if (d.length === 0) return [];
     const hedge: LiveLinePoint[] = d.map((p) => ({
       time: p.time,
       value: p.value * 0.998 - valueDelta * 0.12,
     }));
-    const hedgeVal = hedge[hedge.length - 1]?.value ?? feed.value;
+    const hedgeVal = hedge[hedge.length - 1]?.value ?? liveFeed.value;
     return [
-      {
-        id: 'primary',
-        label: 'Primary',
-        color: accent,
-        data: d,
-        value: feed.value,
-      },
-      {
-        id: 'hedge',
-        label: 'Hedge',
-        color: '#22c55e',
-        data: hedge,
-        value: hedgeVal,
-      },
+      { id: 'primary', label: 'Primary', color: chart.accent, data: d, value: liveFeed.value },
+      { id: 'hedge', label: 'Hedge', color: '#22c55e', data: hedge, value: hedgeVal },
     ];
-  }, [accent, feed.data, feed.value, valueDelta]);
+  }, [chart.accent, chart.chartView, liveFeed.data, liveFeed.value, valueDelta]);
 
-  const pageBackground = theme === 'dark' ? '#111111' : '#f5f5f5';
-  const panelBackground = theme === 'dark' ? 'rgba(255,255,255,0.02)' : 'rgba(0,0,0,0.02)';
-  const panelBorder = theme === 'dark' ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)';
-  const headline = theme === 'dark' ? '#ffffff' : '#111111';
-  const muted = theme === 'dark' ? 'rgba(255,255,255,0.35)' : 'rgba(0,0,0,0.35)';
+  const pageBackground = chart.theme === 'dark' ? '#111111' : '#f5f5f5';
+  const panelBackground = chart.theme === 'dark' ? 'rgba(255,255,255,0.02)' : 'rgba(0,0,0,0.02)';
+  const panelBorder = chart.theme === 'dark' ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)';
+  const headline = chart.theme === 'dark' ? '#ffffff' : '#111111';
+  const muted = chart.theme === 'dark' ? 'rgba(255,255,255,0.35)' : 'rgba(0,0,0,0.35)';
   const deltaColor = valueDelta >= 0 ? '#22c55e' : '#ef4444';
-  const modeSupportsOrderbook = chartView !== 'multi';
-  const modeSupportsScrubNumberFlow = chartView === 'line';
-  const modeSupportsScrubHaptics = chartView === 'line';
-  const modeSupportsSnap = chartView !== 'candle';
-  const modeSupportsLiveDotGlow = chartView === 'line';
-  const modeSupportsLineTrailGlow = chartView === 'line' || (chartView === 'candle' && candleLineMorph);
-  const modeSupportsGradientLine = chartView === 'line' || (chartView === 'candle' && candleLineMorph);
-  const modeSupportsDegen = chartView === 'line';
+
+  const modeSupportsOrderbook = chart.chartView !== 'multi';
+  const modeSupportsScrubNumberFlow = chart.chartView === 'line';
+  const modeSupportsScrubHaptics = chart.chartView === 'line';
+  const modeSupportsSnap = chart.chartView !== 'candle';
+  const modeSupportsLiveDotGlow = chart.chartView === 'line';
+  const modeSupportsLineTrailGlow =
+    chart.chartView === 'line' || (chart.chartView === 'candle' && chart.candleLineMorph);
+  const modeSupportsGradientLine =
+    chart.chartView === 'line' || (chart.chartView === 'candle' && chart.candleLineMorph);
+  const modeSupportsDegen = chart.chartView === 'line';
 
   return (
     <GestureHandlerRootView style={styles.gestureRoot}>
       <SafeAreaProvider>
         <SafeAreaView style={[styles.safeArea, { backgroundColor: pageBackground }]}>
-          <StatusBar style={theme === 'dark' ? 'light' : 'dark'} />
-          <ScrollView
-            contentContainerStyle={styles.scrollContent}
-            showsVerticalScrollIndicator={false}
-          >
+          <StatusBar style={chart.theme === 'dark' ? 'light' : 'dark'} />
+          <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
             <View style={styles.contentWrap}>
               <View style={styles.headerBlock}>
                 <Text style={[styles.title, { color: headline }]}>Liveline</Text>
@@ -164,268 +121,31 @@ export default function App() {
               </View>
 
               <View
-                style={[
-                  styles.controlPanel,
-                  {
-                    backgroundColor: panelBackground,
-                    borderColor: panelBorder,
-                  },
-                ]}
+                style={[styles.controlPanel, { backgroundColor: panelBackground, borderColor: panelBorder }]}
               >
-                <ControlRow label="Theme" labelColor={muted}>
-                  <Chip
-                    active={theme === 'dark'}
-                    label="Dark"
-                    onPress={() => setTheme('dark')}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={theme === 'light'}
-                    label="Light"
-                    onPress={() => setTheme('light')}
-                    theme={theme}
-                    accent={accent}
-                  />
-                </ControlRow>
-
-                <ControlRow label="Transport" labelColor={muted}>
-                  {TICK_RATES.map((option) => (
-                    <Chip
-                      key={option.value}
-                      active={tickMs === option.value}
-                      label={option.label}
-                      onPress={() => setTickMs(option.value)}
-                      theme={theme}
-                      accent={accent}
-                    />
-                  ))}
-                  <Chip
-                    active={paused}
-                    label={paused ? 'Resume' : 'Pause'}
-                    onPress={() => setPaused((current) => !current)}
-                    theme={theme}
-                    accent={accent}
-                  />
-                </ControlRow>
-
-                <ControlRow label="Profile" labelColor={muted}>
-                  <Chip
-                    active={!degenMode}
-                    label="Classic"
-                    onPress={() => setDegenMode(false)}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={degenMode}
-                    label="Degen"
-                    onPress={() => setDegenMode(true)}
-                    disabled={!modeSupportsDegen}
-                    theme={theme}
-                    accent={accent}
-                  />
-                </ControlRow>
-
-                <ControlRow label="Badge" labelColor={muted}>
-                  <Chip
-                    active={showBadge}
-                    label="On"
-                    onPress={() => setShowBadge(true)}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={!showBadge}
-                    label="Off"
-                    onPress={() => setShowBadge(false)}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={badgeVariant === 'default'}
-                    label="Default"
-                    onPress={() => setBadgeVariant('default')}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={badgeVariant === 'minimal'}
-                    label="Minimal"
-                    onPress={() => setBadgeVariant('minimal')}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={badgeNumberFlow}
-                    label="Num flow"
-                    onPress={() => setBadgeNumberFlow((current) => !current)}
-                    theme={theme}
-                    accent={accent}
-                  />
-                </ControlRow>
-
-                <ControlRow label="Chart" labelColor={muted}>
-                  <Chip
-                    active={chartView === 'line'}
-                    label="Line"
-                    onPress={() => {
-                      setChartView('line');
-                      setCandleLineMorph(false);
-                    }}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={chartView === 'multi'}
-                    label="Multi"
-                    onPress={() => setChartView('multi')}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={chartView === 'candle'}
-                    label="Candle"
-                    onPress={() => setChartView('candle')}
-                    theme={theme}
-                    accent={accent}
-                  />
-                </ControlRow>
-
-                <ControlRow label="Scrub" labelColor={muted}>
-                  <Chip
-                    active={modeSupportsScrubNumberFlow && scrubNumberFlow}
-                    label="Num flow"
-                    onPress={() => setScrubNumberFlow((current) => !current)}
-                    disabled={!modeSupportsScrubNumberFlow}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={modeSupportsScrubHaptics && scrubHaptics}
-                    label="Haptics"
-                    onPress={() => setScrubHaptics((current) => !current)}
-                    disabled={!modeSupportsScrubHaptics}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={modeSupportsSnap && snapToPointScrubbing}
-                    label="Snap"
-                    onPress={() => setSnapToPointScrubbing((current) => !current)}
-                    disabled={!modeSupportsSnap}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={pinchToZoom}
-                    label="Pinch"
-                    onPress={() => setPinchToZoom((current) => !current)}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={showReferenceLine}
-                    label="Ref line"
-                    onPress={() => setShowReferenceLine((current) => !current)}
-                    theme={theme}
-                    accent={accent}
-                  />
-                </ControlRow>
-
-                <ControlRow label="Effects" labelColor={muted}>
-                  <Chip
-                    active={modeSupportsOrderbook && showOrderbookStream}
-                    label="Book stream"
-                    onPress={() => setShowOrderbookStream((current) => !current)}
-                    disabled={!modeSupportsOrderbook}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={modeSupportsLiveDotGlow && liveDotGlow}
-                    label="Dot glow"
-                    onPress={() => setLiveDotGlow((current) => !current)}
-                    disabled={!modeSupportsLiveDotGlow}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={modeSupportsLineTrailGlow && lineTrailGlow}
-                    label="Trail glow"
-                    onPress={() => setLineTrailGlow((current) => !current)}
-                    disabled={!modeSupportsLineTrailGlow}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={modeSupportsGradientLine && gradientLineColoring}
-                    label="Gradient"
-                    onPress={() => setGradientLineColoring((current) => !current)}
-                    disabled={!modeSupportsGradientLine}
-                    theme={theme}
-                    accent={accent}
-                  />
-                </ControlRow>
-
-                <ControlRow label="Degen+" labelColor={muted}>
-                  <Chip
-                    active={modeSupportsDegen && degenDownMomentum}
-                    label="Down move"
-                    onPress={() => setDegenDownMomentum((current) => !current)}
-                    disabled={!modeSupportsDegen}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  {[1, 1.5, 2].map((scale) => (
-                    <Chip
-                      key={scale}
-                      active={modeSupportsDegen && degenScale === scale}
-                      label={`${scale}x`}
-                      onPress={() => setDegenScale(scale as 1 | 1.5 | 2)}
-                      disabled={!modeSupportsDegen}
-                      theme={theme}
-                      accent={accent}
-                    />
-                  ))}
-                </ControlRow>
-
-                <ControlRow label="Volatility" labelColor={muted}>
-                  <Chip
-                    active={volatility === 'calm'}
-                    label="Calm"
-                    onPress={() => setVolatility('calm')}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={volatility === 'normal'}
-                    label="Normal"
-                    onPress={() => setVolatility('normal')}
-                    theme={theme}
-                    accent={accent}
-                  />
-                  <Chip
-                    active={volatility === 'chaos'}
-                    label="Chaos"
-                    onPress={() => setVolatility('chaos')}
-                    theme={theme}
-                    accent={accent}
-                  />
-                </ControlRow>
-
-                <ControlRow label="Accent" labelColor={muted}>
-                  {ACCENTS.map((option) => (
-                    <Chip
-                      key={option.value}
-                      active={accent === option.value}
-                      label={option.label}
-                      onPress={() => setAccent(option.value)}
-                      theme={theme}
-                      accent={option.value}
-                    />
-                  ))}
-                </ControlRow>
+                <ChartControlsSection
+                  config={chart}
+                  muted={muted}
+                  chartViewSupportsGlow={modeSupportsLiveDotGlow}
+                  chartViewSupportsOrderbook={modeSupportsOrderbook}
+                  chartViewSupportsGradient={modeSupportsGradientLine}
+                  chartViewSupportsTrailGlow={modeSupportsLineTrailGlow}
+                />
+                <FeedControlsSection
+                  feed={feed}
+                  accent={chart.accent}
+                  theme={chart.theme}
+                  muted={muted}
+                  chartViewSupportsDegen={modeSupportsDegen}
+                />
+                <InteractionControlsSection
+                  interaction={interaction}
+                  chart={chart}
+                  muted={muted}
+                  chartViewSupportsScrubNumberFlow={modeSupportsScrubNumberFlow}
+                  chartViewSupportsScrubHaptics={modeSupportsScrubHaptics}
+                  chartViewSupportsSnap={modeSupportsSnap}
+                />
               </View>
 
               <Text style={[styles.helperText, { color: muted }]}>
@@ -433,59 +153,54 @@ export default function App() {
               </Text>
 
               <LiveLineChart
-                data={feed.data}
-                value={feed.value}
-                theme={theme}
-                color={accent}
-                window={windowSecs}
+                data={liveFeed.data}
+                value={liveFeed.value}
+                theme={chart.theme}
+                color={chart.accent}
+                window={chart.windowSecs}
                 windows={WINDOWS}
-                onWindowChange={setWindowSecs}
+                onWindowChange={chart.setWindowSecs}
                 windowStyle="rounded"
                 momentum
-                badge={showBadge}
-                badgeVariant={badgeVariant}
-                badgeNumberFlow={badgeNumberFlow}
-                scrubNumberFlow={scrubNumberFlow}
-                scrubHaptics={scrubHaptics}
-                snapToPointScrubbing={snapToPointScrubbing}
-                pinchToZoom={pinchToZoom}
+                badge={chart.showBadge}
+                badgeVariant={chart.badgeVariant}
+                badgeNumberFlow={chart.badgeNumberFlow}
+                scrubNumberFlow={interaction.scrubNumberFlow}
+                scrubHaptics={interaction.scrubHaptics}
+                snapToPointScrubbing={interaction.snapToPointScrubbing}
+                pinchToZoom={interaction.pinchToZoom}
                 referenceLine={
-                  showReferenceLine
-                    ? { value: feed.value - valueDelta / 2, label: 'MID' }
+                  chart.showReferenceLine
+                    ? { value: liveFeed.value - valueDelta / 2, label: 'MID' }
                     : undefined
                 }
-                liveDotGlow={liveDotGlow}
-                lineTrailGlow={lineTrailGlow}
-                gradientLineColoring={gradientLineColoring}
+                liveDotGlow={chart.liveDotGlow}
+                lineTrailGlow={chart.lineTrailGlow}
+                gradientLineColoring={chart.gradientLineColoring}
                 degen={degenConfig}
-                paused={paused}
-                loading={feed.data.length < 2}
+                paused={effectivePaused}
+                loading={liveFeed.data.length < 2}
                 height={320}
-                mode={chartView === 'candle' ? 'candle' : 'line'}
+                mode={chart.chartView === 'candle' ? 'candle' : 'line'}
                 onModeChange={(next) => {
-                  setChartView(next === 'candle' ? 'candle' : 'line');
-                  if (next === 'line') setCandleLineMorph(false);
+                  chart.setChartView(next === 'candle' ? 'candle' : 'line');
+                  if (next === 'line') chart.setCandleLineMorph(false);
                 }}
-                showBuiltInModeToggle={chartView !== 'multi'}
-                showBuiltInMorphToggle={chartView === 'candle'}
-                lineMode={candleLineMorph}
-                onLineModeChange={setCandleLineMorph}
-                {...(chartView === 'candle'
-                  ? {
-                      candles: feed.candles,
-                      liveCandle: feed.liveCandle,
-                    }
-                  : chartView === 'multi'
+                showBuiltInModeToggle={chart.chartView !== 'multi'}
+                showBuiltInMorphToggle={chart.chartView === 'candle'}
+                lineMode={chart.candleLineMorph}
+                onLineModeChange={chart.setCandleLineMorph}
+                {...(chart.chartView === 'candle'
+                  ? { candles: liveFeed.candles, liveCandle: liveFeed.liveCandle }
+                  : chart.chartView === 'multi'
                     ? { series: demoSeries }
                     : {})}
-                orderbook={
-                  chartView === 'multi' || !showOrderbookStream ? undefined : syntheticOrderbook
-                }
+                orderbook={syntheticOrderbook}
               />
 
               <View style={styles.statusRail}>
                 <Text style={[styles.statusText, { color: muted }]}>
-                  value: <Text style={{ color: headline }}>{feed.value.toFixed(2)}</Text>
+                  value: <Text style={{ color: headline }}>{liveFeed.value.toFixed(2)}</Text>
                 </Text>
                 <Text style={[styles.statusText, { color: muted }]}>
                   delta:{' '}
@@ -495,23 +210,26 @@ export default function App() {
                   </Text>
                 </Text>
                 <Text style={[styles.statusText, { color: muted }]}>
-                  tick: <Text style={{ color: headline }}>{tickMs}ms</Text>
+                  tick: <Text style={{ color: headline }}>{feed.tickMs}ms</Text>
                 </Text>
                 <Text style={[styles.statusText, { color: muted }]}>
-                  vol: <Text style={{ color: headline }}>{volatility}</Text>
+                  vol: <Text style={{ color: headline }}>{feed.volatility}</Text>
                 </Text>
                 <Text style={[styles.statusText, { color: muted }]}>
-                  mode: <Text style={{ color: headline }}>{degenMode ? 'degen' : 'classic'}</Text>
+                  mode: <Text style={{ color: headline }}>{feed.degenMode ? 'degen' : 'classic'}</Text>
+                </Text>
+                <Text style={[styles.statusText, { color: muted }]}>
+                  lifecycle: <Text style={{ color: headline }}>{feed.appIsActive ? 'active' : 'paused'}</Text>
                 </Text>
                 <Text style={[styles.statusText, { color: muted }]}>
                   chart:{' '}
                   <Text style={{ color: headline }}>
-                    {chartView}
-                    {chartView === 'candle' ? (candleLineMorph ? ' +morph' : '') : ''}
+                    {chart.chartView}
+                    {chart.chartView === 'candle' ? (chart.candleLineMorph ? ' +morph' : '') : ''}
                   </Text>
                 </Text>
                 <Text style={[styles.statusText, { color: muted }]}>
-                  badge: <Text style={{ color: headline }}>{showBadge ? 'on' : 'off'}</Text>
+                  badge: <Text style={{ color: headline }}>{chart.showBadge ? 'on' : 'off'}</Text>
                 </Text>
               </View>
             </View>
@@ -523,55 +241,15 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  gestureRoot: {
-    flex: 1,
-  },
-  safeArea: {
-    flex: 1,
-  },
-  scrollContent: {
-    paddingHorizontal: 20,
-    paddingVertical: 28,
-  },
-  contentWrap: {
-    width: '100%',
-    maxWidth: 960,
-    alignSelf: 'center',
-    gap: 14,
-  },
-  headerBlock: {
-    gap: 4,
-  },
-  title: {
-    fontSize: 20,
-    fontWeight: '600',
-  },
-  subtitle: {
-    fontSize: 12,
-    lineHeight: 18,
-    maxWidth: 720,
-  },
-  controlPanel: {
-    borderRadius: 12,
-    borderWidth: 1,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    gap: 8,
-  },
-  helperText: {
-    fontSize: 11,
-    lineHeight: 16,
-    marginTop: -2,
-    marginBottom: 4,
-  },
-  statusRail: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 14,
-    paddingTop: 2,
-  },
-  statusText: {
-    fontSize: 11,
-    fontFamily: 'monospace',
-  },
+  gestureRoot: { flex: 1 },
+  safeArea: { flex: 1 },
+  scrollContent: { paddingHorizontal: 20, paddingVertical: 28 },
+  contentWrap: { width: '100%', maxWidth: 960, alignSelf: 'center', gap: 14 },
+  headerBlock: { gap: 4 },
+  title: { fontSize: 20, fontWeight: '600' },
+  subtitle: { fontSize: 12, lineHeight: 18, maxWidth: 720 },
+  controlPanel: { borderRadius: 12, borderWidth: 1, paddingHorizontal: 12, paddingVertical: 10, gap: 8 },
+  helperText: { fontSize: 11, lineHeight: 16, marginTop: -2, marginBottom: 4 },
+  statusRail: { flexDirection: 'row', flexWrap: 'wrap', gap: 14, paddingTop: 2 },
+  statusText: { fontSize: 11, fontFamily: 'monospace' },
 });

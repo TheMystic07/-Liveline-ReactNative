@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { CandlePoint, LiveLinePoint } from '../chart';
 
 type Volatility = 'calm' | 'normal' | 'chaos';
+const FEED_FLUSH_MS = 200;
 
 const VOLATILITY_SCALE: Record<Volatility, number> = {
   calm: 0.22,
@@ -12,6 +13,50 @@ const VOLATILITY_SCALE: Record<Volatility, number> = {
 
 /** Wall-clock bucket length (seconds) for OHLC candles (matches upstream-style fixed period). */
 export const MOCK_CANDLE_BUCKET_SEC = 5;
+
+const CAPACITY = 480;
+
+class PointRing {
+  private buf: LiveLinePoint[] = new Array(CAPACITY);
+  private head = 0;
+  private size = 0;
+
+  push(p: LiveLinePoint): void {
+    const idx = (this.head + this.size) % CAPACITY;
+    this.buf[idx] = p;
+    if (this.size < CAPACITY) {
+      this.size += 1;
+    } else {
+      this.head = (this.head + 1) % CAPACITY;
+    }
+  }
+
+  seed(points: LiveLinePoint[]): void {
+    const take = Math.min(CAPACITY, points.length);
+    this.head = 0;
+    this.size = take;
+    for (let i = 0; i < take; i++) {
+      this.buf[i] = points[points.length - take + i]!;
+    }
+  }
+
+  toArray(): LiveLinePoint[] {
+    const out = new Array<LiveLinePoint>(this.size);
+    for (let i = 0; i < this.size; i++) {
+      out[i] = this.buf[(this.head + i) % CAPACITY]!;
+    }
+    return out;
+  }
+
+  get length(): number {
+    return this.size;
+  }
+
+  last(): LiveLinePoint | undefined {
+    if (this.size === 0) return undefined;
+    return this.buf[(this.head + this.size - 1) % CAPACITY];
+  }
+}
 
 function bucketStart(timeSec: number): number {
   return Math.floor(timeSec / MOCK_CANDLE_BUCKET_SEC) * MOCK_CANDLE_BUCKET_SEC;
@@ -29,43 +74,137 @@ function nextPoint(previous: number, time: number, volatility: Volatility) {
 
 function aggregateOHLC(points: LiveLinePoint[]): { candles: CandlePoint[]; live: CandlePoint | undefined } {
   if (points.length === 0) return { candles: [], live: undefined };
-  const sorted = [...points].sort((a, b) => a.time - b.time);
-  const lastT = sorted[sorted.length - 1].time;
+
+  const lastT = points[points.length - 1]!.time;
   const currentBucket = bucketStart(lastT);
-  const groups = new Map<number, LiveLinePoint[]>();
-  for (const p of sorted) {
-    const b = bucketStart(p.time);
-    const arr = groups.get(b) ?? [];
-    arr.push(p);
-    groups.set(b, arr);
-  }
   const history: CandlePoint[] = [];
-  for (const [b, arr] of [...groups.entries()].sort((x, y) => x[0] - y[0])) {
-    if (b >= currentBucket) continue;
-    const open = arr[0].value;
-    const close = arr[arr.length - 1].value;
-    let high = open;
-    let low = open;
-    for (const q of arr) {
-      if (q.value > high) high = q.value;
-      if (q.value < low) low = q.value;
-    }
-    history.push({ time: b, open, high, low, close });
-  }
-  const cur = groups.get(currentBucket);
+
+  let bucket = bucketStart(points[0]!.time);
+  let open = points[0]!.value;
+  let high = open;
+  let low = open;
+  let close = open;
+  let seen = 0;
   let live: CandlePoint | undefined;
-  if (cur && cur.length > 0) {
-    const open = cur[0].value;
-    const close = cur[cur.length - 1].value;
-    let high = open;
-    let low = open;
-    for (const q of cur) {
-      if (q.value > high) high = q.value;
-      if (q.value < low) low = q.value;
+
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i]!;
+    const b = bucketStart(p.time);
+    if (b !== bucket) {
+      const candle: CandlePoint = { time: bucket, open, high, low, close };
+      if (bucket < currentBucket) {
+        history.push(candle);
+      } else {
+        live = candle;
+      }
+      bucket = b;
+      open = p.value;
+      high = p.value;
+      low = p.value;
+      close = p.value;
+      seen = 1;
+      continue;
     }
-    live = { time: currentBucket, open, high, low, close };
+    if (p.value > high) high = p.value;
+    if (p.value < low) low = p.value;
+    close = p.value;
+    seen += 1;
   }
-  return { candles: history.slice(-140), live };
+
+  if (seen > 0) {
+    const candle: CandlePoint = { time: bucket, open, high, low, close };
+    if (bucket < currentBucket) {
+      history.push(candle);
+    } else {
+      live = candle;
+    }
+  }
+
+  const candles = history.length > 140 ? history.slice(-140) : history;
+  return { candles, live };
+}
+
+type FeedSnapshot = {
+  data: LiveLinePoint[];
+  value: number;
+  candles: CandlePoint[];
+  liveCandle: CandlePoint | undefined;
+};
+
+function buildSeedSnapshot(baseValue: number, volatility: Volatility): FeedSnapshot {
+  const seedEnd = Date.now() / 1000;
+  const seeded: LiveLinePoint[] = [];
+  let cursor = baseValue;
+
+  for (let index = 140; index >= 0; index -= 1) {
+    const point = nextPoint(cursor, seedEnd - index * 0.6, volatility);
+    cursor = point.value;
+    seeded.push(point);
+  }
+
+  const { candles, live } = aggregateOHLC(seeded);
+  return {
+    data: seeded,
+    value: cursor,
+    candles,
+    liveCandle: live,
+  };
+}
+
+function nextSnapshotFromRing(
+  current: FeedSnapshot,
+  nextData: LiveLinePoint[],
+  point: LiveLinePoint,
+): FeedSnapshot {
+  const pointBucket = bucketStart(point.time);
+  const live = current.liveCandle;
+
+  if (!live) {
+    return {
+      data: nextData,
+      value: point.value,
+      candles: current.candles,
+      liveCandle: {
+        time: pointBucket,
+        open: point.value,
+        high: point.value,
+        low: point.value,
+        close: point.value,
+      },
+    };
+  }
+
+  if (pointBucket < live.time) {
+    const { candles, live: fallbackLive } = aggregateOHLC(nextData);
+    return { data: nextData, value: point.value, candles, liveCandle: fallbackLive };
+  }
+
+  if (pointBucket === live.time) {
+    return {
+      data: nextData,
+      value: point.value,
+      candles: current.candles,
+      liveCandle: {
+        ...live,
+        high: Math.max(live.high, point.value),
+        low: Math.min(live.low, point.value),
+        close: point.value,
+      },
+    };
+  }
+
+  return {
+    data: nextData,
+    value: point.value,
+    candles: [...current.candles, live].slice(-140),
+    liveCandle: {
+      time: pointBucket,
+      open: point.value,
+      high: point.value,
+      low: point.value,
+      close: point.value,
+    },
+  };
 }
 
 export function useMockLiveFeed({
@@ -81,26 +220,24 @@ export function useMockLiveFeed({
   mania?: boolean;
   baseValue?: number;
 }) {
-  const [data, setData] = useState<LiveLinePoint[]>([]);
-  const [value, setValue] = useState(baseValue);
+  const ringRef = useRef<PointRing>(new PointRing());
+  const [feed, setFeed] = useState<FeedSnapshot>(() => {
+    const snap = buildSeedSnapshot(baseValue, volatility);
+    ringRef.current.seed(snap.data);
+    return snap;
+  });
   const latestValueRef = useRef(baseValue);
   const hasSeedDataRef = useRef(false);
+  const pendingPointRef = useRef<LiveLinePoint | null>(null);
 
   useEffect(() => {
-    const seedEnd = Date.now() / 1000;
-    const seeded: LiveLinePoint[] = [];
-    let cursor = baseValue;
-
-    for (let index = 140; index >= 0; index -= 1) {
-      const point = nextPoint(cursor, seedEnd - index * 0.6, volatility);
-      cursor = point.value;
-      seeded.push(point);
-    }
-
-    latestValueRef.current = cursor;
+    const seeded = buildSeedSnapshot(baseValue, volatility);
+    latestValueRef.current = seeded.value;
     hasSeedDataRef.current = true;
-    setData(seeded);
-    setValue(cursor);
+    pendingPointRef.current = null;
+    ringRef.current = new PointRing();
+    ringRef.current.seed(seeded.data);
+    setFeed(seeded);
   }, [baseValue, volatility]);
 
   useEffect(() => {
@@ -124,22 +261,23 @@ export function useMockLiveFeed({
         value: basePoint.value + maniaSpike + momentumDrift,
       };
       latestValueRef.current = point.value;
-      setValue(point.value);
-      setData((current) => [...current.slice(-480), point]);
+      pendingPointRef.current = point;
     }, tickMs);
 
-    return () => clearInterval(interval);
+    const flush = setInterval(() => {
+      const point = pendingPointRef.current;
+      if (!point) return;
+      pendingPointRef.current = null;
+      ringRef.current.push(point);
+      const nextData = ringRef.current.toArray();
+      setFeed((current) => nextSnapshotFromRing(current, nextData, point));
+    }, FEED_FLUSH_MS);
+
+    return () => {
+      clearInterval(interval);
+      clearInterval(flush);
+    };
   }, [mania, paused, tickMs, volatility]);
 
-  const { candles, live } = useMemo(() => aggregateOHLC(data), [data]);
-
-  return useMemo(
-    () => ({
-      data,
-      value,
-      candles,
-      liveCandle: live,
-    }),
-    [candles, data, live, value],
-  );
+  return useMemo(() => feed, [feed]);
 }

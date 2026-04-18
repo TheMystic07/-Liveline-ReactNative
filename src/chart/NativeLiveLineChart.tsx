@@ -11,7 +11,6 @@ import {
   Path,
   Rect,
   RoundedRect,
-  Shadow,
   rect,
   vec,
 } from '@shopify/react-native-skia';
@@ -145,7 +144,7 @@ const CANDLE_OHLC_LERP_SPEED = 0.25;
 const LINE_MORPH_MS = 500;
 /** Throttle JS merges while OHLC lerps on the UI thread (ms). */
 const CANDLE_SMOOTH_EMIT_MS = 32;
-const ENGINE_IDLE_STOP_MS = 120;
+const ENGINE_IDLE_STOP_MS = 60;
 const ARROW_WAVE_DURATION_MS = 680;
 const SCRUB_HAPTIC_MIN_INTERVAL_MS = 48;
 const PINCH_WINDOW_MIN_SECS = 5;
@@ -564,7 +563,6 @@ function buildPath(
   buffer: number,
   floor: boolean,
 ) {
-  'worklet';
   if (pts.length === 0 || w <= 0 || h <= 0) return '';
 
   const cw = w - pad.left - pad.right;
@@ -922,6 +920,8 @@ export function NativeLiveLineChart({
     }),
     [contentInset, grid, badge],
   );
+  const padTopForEngine = pad.top;
+  const padBottomForEngine = pad.bottom;
 
   /* ---- time window with smooth transition (upstream log-space cosine easing) ---- */
   const resolvedWin = useMemo(() => {
@@ -1269,6 +1269,13 @@ export function NativeLiveLineChart({
   const svLineModeProg = useSharedValue(0);
   /** Morph overlay line tip (tick value), independent of candle-close badge lerp. */
   const svMorphTipV = useSharedValue(0);
+  const svStaticLinePath = useSharedValue('');
+  const svStaticFillPath = useSharedValue('');
+  const svStaticMorphLinePath = useSharedValue('');
+  const svRangeTransform = useSharedValue({ scaleY: 1, translateY: 0 });
+  const svBuildMin = useSharedValue(0);
+  const svBuildMax = useSharedValue(1);
+  const svBuildTipT = useSharedValue(0);
   const liveCandleBucketRef = useRef<number | null>(null);
 
   const [lineMorphJs, setLineMorphJs] = useState(0);
@@ -1329,6 +1336,20 @@ export function NativeLiveLineChart({
 
   const [flowPillW, setFlowPillW] = useState(80);
   const [engineActive, setEngineActive] = useState(false);
+
+  type BuildSnapshot = {
+    range: { min: number; max: number };
+    tipT: number;
+    tipV: number;
+    morphTipV: number;
+  };
+
+  const [buildSnapshot, setBuildSnapshot] = useState<BuildSnapshot>({
+    range: { min: 0, max: 1 },
+    tipT: 0,
+    tipV: 0,
+    morphTipV: 0,
+  });
   const setPinchWindowStable = useCallback((nextWindow: number | null) => {
     setPinchWindow((prev) => {
       if (prev === nextWindow) return prev;
@@ -1670,6 +1691,22 @@ export function NativeLiveLineChart({
       if (Math.abs(nextDisp - tgt) < prevR * VALUE_SNAP_THRESHOLD) nextDisp = tgt;
       svTipV.value = nextDisp;
 
+      /* ---- Range transform (static path follows range animation) ---- */
+      {
+        const bMin = svBuildMin.value;
+        const bMax = svBuildMax.value;
+        const cMin = svMin.value;
+        const cMax = svMax.value;
+        const buildSpan = Math.max(1e-4, bMax - bMin);
+        const curSpan = Math.max(1e-4, cMax - cMin);
+        const scaleY = buildSpan / curSpan;
+        const h = svChartH.value;
+        const ch = Math.max(1, h - padTopForEngine - padBottomForEngine);
+        const translateY =
+          (padTopForEngine + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
+        svRangeTransform.value = { scaleY, translateY };
+      }
+
       /* ---- Live candle OHLC smoothing (upstream `CANDLE_LERP_SPEED`) ---- */
       if (svIsCandleFlag.value === 1) {
         const spd = CANDLE_OHLC_LERP_SPEED;
@@ -1835,7 +1872,19 @@ export function NativeLiveLineChart({
         svEngineIdleMs.value = 0;
       }
     },
-    [stopEngine, flushGridSmooth, flushSmoothedDisplay],
+    [
+      stopEngine,
+      flushGridSmooth,
+      flushSmoothedDisplay,
+      padTopForEngine,
+      padBottomForEngine,
+      svBuildMin,
+      svBuildMax,
+      svRangeTransform,
+      svMin,
+      svMax,
+      svChartH,
+    ],
   );
 
   const engineFrame = useFrameCallback(onEngineFrame, false);
@@ -1849,6 +1898,21 @@ export function NativeLiveLineChart({
       svShakeY.value = 0;
     }
   }, [empty, engineActive, engineFrame, svArrowUp, svArrowDown, svShakeX, svShakeY]);
+
+  useEffect(() => {
+    setBuildSnapshot({
+      range: { min: svMin.value, max: svMax.value },
+      tipT: svTipT.value,
+      tipV: svTipV.value,
+      morphTipV: svMorphTipV.value,
+    });
+  }, [effectiveData, morphLineData, svMin, svMax, svTipT, svTipV, svMorphTipV]);
+
+  useEffect(() => {
+    svBuildMin.value = buildSnapshot.range.min;
+    svBuildMax.value = buildSnapshot.range.max;
+    svBuildTipT.value = buildSnapshot.tipT;
+  }, [buildSnapshot, svBuildMin, svBuildMax, svBuildTipT]);
 
   /* ---- degen burst ---- */
   const spawnPt = useMemo(
@@ -1920,15 +1984,14 @@ export function NativeLiveLineChart({
     ? rect(pad.left, pad.top, chartW, chartH)
     : undefined;
 
-  // Line path
-  const dvLinePath = useDerivedValue(
+  const staticLinePath = useMemo(
     () =>
       buildPath(
         effectiveData,
-        svTipT.value,
-        svTipV.value,
-        svMin.value,
-        svMax.value,
+        buildSnapshot.tipT,
+        buildSnapshot.tipV,
+        buildSnapshot.range.min,
+        buildSnapshot.range.max,
         layout.width,
         layout.height,
         pad,
@@ -1936,17 +1999,21 @@ export function NativeLiveLineChart({
         buf,
         false,
       ),
-    [effectiveData, layout.width, layout.height, pad, win, buf],
+    [effectiveData, buildSnapshot, layout.width, layout.height, pad, win, buf],
   );
 
-  const dvMorphLinePath = useDerivedValue(
+  useEffect(() => {
+    svStaticLinePath.value = staticLinePath;
+  }, [staticLinePath, svStaticLinePath]);
+
+  const staticMorphLinePath = useMemo(
     () =>
       buildPath(
         morphLineData,
-        svTipT.value,
-        svMorphTipV.value,
-        svMin.value,
-        svMax.value,
+        buildSnapshot.tipT,
+        buildSnapshot.morphTipV,
+        buildSnapshot.range.min,
+        buildSnapshot.range.max,
         layout.width,
         layout.height,
         pad,
@@ -1954,18 +2021,21 @@ export function NativeLiveLineChart({
         buf,
         false,
       ),
-    [morphLineData, layout.width, layout.height, pad, win, buf],
+    [morphLineData, buildSnapshot, layout.width, layout.height, pad, win, buf],
   );
 
-  // Fill path
-  const dvFillPath = useDerivedValue(
+  useEffect(() => {
+    svStaticMorphLinePath.value = staticMorphLinePath;
+  }, [staticMorphLinePath, svStaticMorphLinePath]);
+
+  const staticFillPath = useMemo(
     () =>
       buildPath(
         effectiveData,
-        svTipT.value,
-        svTipV.value,
-        svMin.value,
-        svMax.value,
+        buildSnapshot.tipT,
+        buildSnapshot.tipV,
+        buildSnapshot.range.min,
+        buildSnapshot.range.max,
         layout.width,
         layout.height,
         pad,
@@ -1973,8 +2043,93 @@ export function NativeLiveLineChart({
         buf,
         true,
       ),
-    [effectiveData, layout.width, layout.height, pad, win, buf],
+    [effectiveData, buildSnapshot, layout.width, layout.height, pad, win, buf],
   );
+
+  useEffect(() => {
+    svStaticFillPath.value = staticFillPath;
+  }, [staticFillPath, svStaticFillPath]);
+
+  const dvRangeScaleY = useDerivedValue(() => svRangeTransform.value.scaleY);
+  const dvRangeTranslateY = useDerivedValue(() => svRangeTransform.value.translateY);
+
+  const svTipLinePath = useDerivedValue(() => {
+    'worklet';
+    const pts = effectiveData;
+    if (!pts || pts.length === 0) return '';
+    const last = pts[pts.length - 1]!;
+    const w = layout.width;
+    const h = layout.height;
+    if (w <= 0 || h <= 0) return '';
+
+    const bMin = svBuildMin.value;
+    const bMax = svBuildMax.value;
+    const buildSpan = Math.max(1e-4, bMax - bMin);
+    const cMin = svMin.value;
+    const cMax = svMax.value;
+    const curSpan = Math.max(1e-4, cMax - cMin);
+
+    const ch = Math.max(1, h - pad.top - pad.bottom);
+    const cw = Math.max(1, w - pad.left - pad.right);
+
+    const rightEdgeBuild = svBuildTipT.value + win * buf;
+    const leftEdgeBuild = rightEdgeBuild - win;
+    const x0 =
+      pad.left + ((last.time - leftEdgeBuild) / (rightEdgeBuild - leftEdgeBuild || 1)) * cw;
+    const y0Build = pad.top + (1 - (last.value - bMin) / buildSpan) * ch;
+
+    const scaleY = buildSpan / curSpan;
+    const translateY =
+      (pad.top + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
+    const y0 = y0Build * scaleY + translateY;
+
+    const rightEdgeCur = svTipT.value + win * buf;
+    const leftEdgeCur = rightEdgeCur - win;
+    const x1 =
+      pad.left + ((svTipT.value - leftEdgeCur) / (rightEdgeCur - leftEdgeCur || 1)) * cw;
+    const y1 = pad.top + (1 - (svTipV.value - cMin) / curSpan) * ch;
+
+    return `M ${x0} ${y0} L ${x1} ${y1}`;
+  }, [effectiveData, layout.width, layout.height, pad, win, buf]);
+
+  const svTipMorphLinePath = useDerivedValue(() => {
+    'worklet';
+    const pts = morphLineData;
+    if (!pts || pts.length === 0) return '';
+    const last = pts[pts.length - 1]!;
+    const w = layout.width;
+    const h = layout.height;
+    if (w <= 0 || h <= 0) return '';
+
+    const bMin = svBuildMin.value;
+    const bMax = svBuildMax.value;
+    const buildSpan = Math.max(1e-4, bMax - bMin);
+    const cMin = svMin.value;
+    const cMax = svMax.value;
+    const curSpan = Math.max(1e-4, cMax - cMin);
+
+    const ch = Math.max(1, h - pad.top - pad.bottom);
+    const cw = Math.max(1, w - pad.left - pad.right);
+
+    const rightEdgeBuild = svBuildTipT.value + win * buf;
+    const leftEdgeBuild = rightEdgeBuild - win;
+    const x0 =
+      pad.left + ((last.time - leftEdgeBuild) / (rightEdgeBuild - leftEdgeBuild || 1)) * cw;
+    const y0Build = pad.top + (1 - (last.value - bMin) / buildSpan) * ch;
+
+    const scaleY = buildSpan / curSpan;
+    const translateY =
+      (pad.top + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
+    const y0 = y0Build * scaleY + translateY;
+
+    const rightEdgeCur = svTipT.value + win * buf;
+    const leftEdgeCur = rightEdgeCur - win;
+    const x1 =
+      pad.left + ((svTipT.value - leftEdgeCur) / (rightEdgeCur - leftEdgeCur || 1)) * cw;
+    const y1 = pad.top + (1 - (svMorphTipV.value - cMin) / curSpan) * ch;
+
+    return `M ${x0} ${y0} L ${x1} ${y1}`;
+  }, [morphLineData, layout.width, layout.height, pad, win, buf]);
 
   // Live dot position
   const dvLiveX = useDerivedValue(
@@ -2790,23 +2945,29 @@ export function NativeLiveLineChart({
                       {/* -- Fill gradient (scrub splits like upstream drawLine) — reveal-gated -- */}
                       {fill && clipRect ? (
                         <Group clip={clipRect} opacity={dvRevealLineOp}>
-                          <Group clip={dvClipL}>
-                            <Path path={dvFillPath}>
-                              <LinearGradient
-                                start={vec(0, pad.top)}
-                                end={vec(0, layout.height - pad.bottom)}
-                                colors={[pal.accentFillTop, pal.accentFillBottom]}
-                              />
-                            </Path>
-                          </Group>
-                          <Group clip={dvClipR} opacity={dvRightSegOp}>
-                            <Path path={dvFillPath}>
-                              <LinearGradient
-                                start={vec(0, pad.top)}
-                                end={vec(0, layout.height - pad.bottom)}
-                                colors={[pal.accentFillTop, pal.accentFillBottom]}
-                              />
-                            </Path>
+                          <Group
+                            transform={
+                              [{ translateY: dvRangeTranslateY }, { scaleY: dvRangeScaleY }] as never
+                            }
+                          >
+                            <Group clip={dvClipL}>
+                              <Path path={svStaticFillPath}>
+                                <LinearGradient
+                                  start={vec(0, pad.top)}
+                                  end={vec(0, layout.height - pad.bottom)}
+                                  colors={[pal.accentFillTop, pal.accentFillBottom]}
+                                />
+                              </Path>
+                            </Group>
+                            <Group clip={dvClipR} opacity={dvRightSegOp}>
+                              <Path path={svStaticFillPath}>
+                                <LinearGradient
+                                  start={vec(0, pad.top)}
+                                  end={vec(0, layout.height - pad.bottom)}
+                                  colors={[pal.accentFillTop, pal.accentFillBottom]}
+                                />
+                              </Path>
+                            </Group>
                           </Group>
                         </Group>
                       ) : null}
@@ -2817,7 +2978,7 @@ export function NativeLiveLineChart({
                         rightClip={dvClipR}
                         rightOpacity={dvRightSegOp}
                         revealOpacity={dvRevealLineOp}
-                        path={dvLinePath}
+                        path={svStaticLinePath}
                         layoutHeight={layout.height}
                         padTop={pad.top}
                         padRight={pad.right}
@@ -2829,6 +2990,9 @@ export function NativeLiveLineChart({
                         gradientLineColoring={gradientLineColoring}
                         gradientStartColor={pal.gridLabel}
                         gradientEndColor={pal.accent}
+                        rangeScaleY={dvRangeScaleY}
+                        rangeTranslateY={dvRangeTranslateY}
+                        tipPath={svTipLinePath}
                       />
                     </>
                   ) : null}
@@ -2862,16 +3026,23 @@ export function NativeLiveLineChart({
                             {row.isLive ? (
                               <Group>
                                 <RoundedRect
+                                  x={row.cx - row.halfBody - 6}
+                                  y={row.bodyTop - 6}
+                                  width={row.bodyW + 12}
+                                  height={row.bodyH + 12}
+                                  r={row.radius + 3}
+                                  color={row.fill}
+                                  opacity={0.12}
+                                />
+                                <RoundedRect
                                   x={row.cx - row.halfBody - 2}
                                   y={row.bodyTop - 2}
                                   width={row.bodyW + 4}
                                   height={row.bodyH + 4}
                                   r={row.radius + 1}
                                   color={row.fill}
-                                  opacity={0.15}
-                                >
-                                  <Shadow dx={0} dy={0} blur={10} color={row.fill} />
-                                </RoundedRect>
+                                  opacity={0.22}
+                                />
                                 <RoundedRect
                                   x={row.cx - row.halfBody}
                                   y={row.bodyTop}
@@ -2901,7 +3072,7 @@ export function NativeLiveLineChart({
                           rightClip={dvClipR}
                           rightOpacity={dvRightSegOp}
                           revealOpacity={1}
-                          path={dvMorphLinePath}
+                          path={svStaticMorphLinePath}
                           layoutHeight={layout.height}
                           padTop={pad.top}
                           padRight={pad.right}
@@ -2913,6 +3084,9 @@ export function NativeLiveLineChart({
                           gradientLineColoring={gradientLineColoring}
                           gradientStartColor={pal.gridLabel}
                           gradientEndColor={pal.accent}
+                          rangeScaleY={dvRangeScaleY}
+                          rangeTranslateY={dvRangeTranslateY}
+                          tipPath={svTipMorphLinePath}
                         />
                       </Group>
                     </>

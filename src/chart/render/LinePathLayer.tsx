@@ -24,6 +24,9 @@ type LinePathLayerProps = {
   gradientLineColoring: boolean;
   gradientStartColor: string;
   gradientEndColor: string;
+  rangeScaleY: SharedValue<number>;
+  rangeTranslateY: SharedValue<number>;
+  tipPath?: SharedValue<string>;
 };
 
 export function LinePathLayer({
@@ -44,60 +47,75 @@ export function LinePathLayer({
   gradientLineColoring,
   gradientStartColor,
   gradientEndColor,
+  rangeScaleY,
+  rangeTranslateY,
+  tipPath,
 }: LinePathLayerProps) {
   if (!clipRect) return null;
 
   return (
     <Group clip={clipRect} opacity={revealOpacity}>
-      {trailGlow ? (
+      <Group transform={[{ translateY: rangeTranslateY }, { scaleY: rangeScaleY }] as never}>
+        {trailGlow ? (
+          <Path
+            path={path}
+            style="stroke"
+            strokeWidth={lineWidth + 4}
+            strokeJoin="round"
+            strokeCap="round"
+            color={trailGlowColor}
+            opacity={0.5}
+          />
+        ) : null}
+
+        <Group clip={leftClip}>
+          <Path
+            path={path}
+            style="stroke"
+            strokeWidth={lineWidth}
+            strokeJoin="round"
+            strokeCap="round"
+            color={gradientLineColoring ? undefined : lineColor}
+          >
+            {gradientLineColoring ? (
+              <LinearGradient
+                start={vec(0, padTop)}
+                end={vec(layoutWidth - padRight, layoutHeight)}
+                colors={[gradientStartColor, gradientEndColor]}
+              />
+            ) : null}
+          </Path>
+        </Group>
+
+        <Group clip={rightClip} opacity={rightOpacity}>
+          <Path
+            path={path}
+            style="stroke"
+            strokeWidth={lineWidth}
+            strokeJoin="round"
+            strokeCap="round"
+            color={gradientLineColoring ? undefined : lineColor}
+          >
+            {gradientLineColoring ? (
+              <LinearGradient
+                start={vec(0, padTop)}
+                end={vec(layoutWidth - padRight, layoutHeight)}
+                colors={[gradientStartColor, gradientEndColor]}
+              />
+            ) : null}
+          </Path>
+        </Group>
+      </Group>
+      {tipPath ? (
         <Path
-          path={path}
+          path={tipPath}
           style="stroke"
-          strokeWidth={lineWidth + 4}
+          strokeWidth={lineWidth}
           strokeJoin="round"
           strokeCap="round"
-          color={trailGlowColor}
-          opacity={0.5}
+          color={gradientLineColoring ? gradientEndColor : (lineColor as string)}
         />
       ) : null}
-
-      <Group clip={leftClip}>
-        <Path
-          path={path}
-          style="stroke"
-          strokeWidth={lineWidth}
-          strokeJoin="round"
-          strokeCap="round"
-          color={gradientLineColoring ? undefined : lineColor}
-        >
-          {gradientLineColoring ? (
-            <LinearGradient
-              start={vec(0, padTop)}
-              end={vec(layoutWidth - padRight, layoutHeight)}
-              colors={[gradientStartColor, gradientEndColor]}
-            />
-          ) : null}
-        </Path>
-      </Group>
-
-      <Group clip={rightClip} opacity={rightOpacity}>
-        <Path
-          path={path}
-          style="stroke"
-          strokeWidth={lineWidth}
-          strokeJoin="round"
-          strokeCap="round"
-          color={gradientLineColoring ? undefined : lineColor}
-        >
-          {gradientLineColoring ? (
-            <LinearGradient
-              start={vec(0, padTop)}
-              end={vec(layoutWidth - padRight, layoutHeight)}
-              colors={[gradientStartColor, gradientEndColor]}
-            />
-          ) : null}
-        </Path>
-      </Group>
     </Group>
   );
 }
