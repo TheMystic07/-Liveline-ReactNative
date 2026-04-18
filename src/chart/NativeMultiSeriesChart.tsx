@@ -39,7 +39,7 @@ import { EmptyState } from './render/EmptyState';
 import { ReferenceLineCanvas } from './render/ReferenceLineCanvas';
 import { ReferenceLineLabel } from './render/ReferenceLineLabel';
 import { BadgeOverlay } from './render/BadgeOverlay';
-import type { ChartPadding, LiveLineChartProps, LiveLinePoint, LiveLineSeries } from './types';
+import type { LiveLineChartProps, LiveLinePoint, LiveLineSeries } from './types';
 import { useChartSmoothingEngine } from './smoothingEngine';
 import {
   calcGridTicksJs,
@@ -62,13 +62,18 @@ function SeriesTipPath({
   svMax,
   svTipV,
   color,
-  lastPoint,
+  hasLastPoint,
+  lastTime,
+  lastValue,
   svBuildMin,
   svBuildMax,
   svBuildTipT,
   layoutWidth,
   layoutHeight,
-  pad,
+  padLeft,
+  padRight,
+  padTop,
+  padBottom,
   win,
 }: {
   svTipT: SharedValue<number>;
@@ -76,50 +81,60 @@ function SeriesTipPath({
   svMax: SharedValue<number>;
   svTipV: SharedValue<number>;
   color: string;
-  lastPoint: LiveLinePoint | null;
+  hasLastPoint: boolean;
+  lastTime: number;
+  lastValue: number;
   svBuildMin: SharedValue<number>;
   svBuildMax: SharedValue<number>;
   svBuildTipT: SharedValue<number>;
   layoutWidth: number;
   layoutHeight: number;
-  pad: ChartPadding;
+  padLeft: number;
+  padRight: number;
+  padTop: number;
+  padBottom: number;
   win: number;
 }) {
   const dvPath = useDerivedValue(() => {
     'worklet';
-    if (!lastPoint || layoutWidth <= 0 || layoutHeight <= 0) return '';
+    if (!hasLastPoint || layoutWidth <= 0 || layoutHeight <= 0) return '';
     const bMin = svBuildMin.value;
     const bMax = svBuildMax.value;
     const buildSpan = Math.max(1e-4, bMax - bMin);
     const cMin = svMin.value;
     const cMax = svMax.value;
     const curSpan = Math.max(1e-4, cMax - cMin);
-    const ch = Math.max(1, layoutHeight - pad.top - pad.bottom);
-    const cw = Math.max(1, layoutWidth - pad.left - pad.right);
+    const ch = Math.max(1, layoutHeight - padTop - padBottom);
+    const cw = Math.max(1, layoutWidth - padLeft - padRight);
 
     const rightEdgeBuild = svBuildTipT.value + win * MULTI_WIN_BUF;
     const leftEdgeBuild = rightEdgeBuild - win;
     const x0 =
-      pad.left + ((lastPoint.time - leftEdgeBuild) / (rightEdgeBuild - leftEdgeBuild || 1)) * cw;
-    const y0Build = pad.top + (1 - (lastPoint.value - bMin) / buildSpan) * ch;
+      padLeft + ((lastTime - leftEdgeBuild) / (rightEdgeBuild - leftEdgeBuild || 1)) * cw;
+    const y0Build = padTop + (1 - (lastValue - bMin) / buildSpan) * ch;
 
     const scaleY = buildSpan / curSpan;
     const translateY =
-      (pad.top + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
+      (padTop + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
     const y0 = y0Build * scaleY + translateY;
 
     const rightEdgeCur = svTipT.value + win * MULTI_WIN_BUF;
     const leftEdgeCur = rightEdgeCur - win;
     const x1 =
-      pad.left + ((svTipT.value - leftEdgeCur) / (rightEdgeCur - leftEdgeCur || 1)) * cw;
-    const y1 = pad.top + (1 - (svTipV.value - cMin) / curSpan) * ch;
+      padLeft + ((svTipT.value - leftEdgeCur) / (rightEdgeCur - leftEdgeCur || 1)) * cw;
+    const y1 = padTop + (1 - (svTipV.value - cMin) / curSpan) * ch;
 
     return `M ${x0} ${y0} L ${x1} ${y1}`;
   }, [
-    lastPoint,
+    hasLastPoint,
+    lastTime,
+    lastValue,
     layoutWidth,
     layoutHeight,
-    pad,
+    padLeft,
+    padRight,
+    padTop,
+    padBottom,
     win,
     svBuildMin,
     svBuildMax,
@@ -624,13 +639,18 @@ export function NativeMultiSeriesChart({
                           svMax={evMax}
                           svTipV={engine.getSeriesTipV(entry.id)}
                           color={entry.color}
-                          lastPoint={lastPt}
+                          hasLastPoint={lastPt != null}
+                          lastTime={lastPt?.time ?? 0}
+                          lastValue={lastPt?.value ?? 0}
                           svBuildMin={svBuildMin}
                           svBuildMax={svBuildMax}
                           svBuildTipT={svBuildTipT}
                           layoutWidth={layout.width}
                           layoutHeight={layout.height}
-                          pad={pad}
+                          padLeft={pad.left}
+                          padRight={pad.right}
+                          padTop={pad.top}
+                          padBottom={pad.bottom}
                           win={activeWindow}
                         />
                       </Group>

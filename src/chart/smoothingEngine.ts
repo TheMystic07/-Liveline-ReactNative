@@ -19,6 +19,27 @@ const MAX_DELTA_MS = 50;
 /** Max simultaneous series (multi-mode uses 2). */
 const MAX_SERIES = 8;
 
+function tickSeriesSlot(
+  slot: SharedValue<number>,
+  target: SharedValue<number>,
+  dt: number,
+  prevR: number,
+): void {
+  'worklet';
+  const cur = slot.value;
+  const tgt = target.value;
+  const gap = Math.abs(tgt - cur);
+  const spd = RANGE_LERP_SPEED + (1 - Math.min(gap / prevR, 1)) * ADAPTIVE_SPEED_BOOST;
+  let next = lerpFr(cur, tgt, spd, dt);
+  if (Math.abs(next - tgt) < prevR * VALUE_SNAP_THRESHOLD) next = tgt;
+  slot.value = next;
+}
+
+function slotPairConverged(slot: SharedValue<number>, target: SharedValue<number>): boolean {
+  'worklet';
+  return Math.abs(slot.value - target.value) <= 1e-4;
+}
+
 export type SmoothingEngineInputs = {
   targetMin: number;
   targetMax: number;
@@ -183,24 +204,29 @@ export function useChartSmoothingEngine(
       const sMin = svMin.value;
       const sMax = svMax.value;
       const prevR = Math.max(1e-4, sMax - sMin);
-      for (let i = 0; i < MAX_SERIES; i++) {
-        const cur = slots[i]!.value;
-        const tgt = targets[i]!.value;
-        const gap = Math.abs(tgt - cur);
-        const spd = RANGE_LERP_SPEED + (1 - Math.min(gap / prevR, 1)) * ADAPTIVE_SPEED_BOOST;
-        let next = lerpFr(cur, tgt, spd, dt);
-        if (Math.abs(next - tgt) < prevR * VALUE_SNAP_THRESHOLD) next = tgt;
-        slots[i]!.value = next;
-      }
+      tickSeriesSlot(slot0, target0, dt, prevR);
+      tickSeriesSlot(slot1, target1, dt, prevR);
+      tickSeriesSlot(slot2, target2, dt, prevR);
+      tickSeriesSlot(slot3, target3, dt, prevR);
+      tickSeriesSlot(slot4, target4, dt, prevR);
+      tickSeriesSlot(slot5, target5, dt, prevR);
+      tickSeriesSlot(slot6, target6, dt, prevR);
+      tickSeriesSlot(slot7, target7, dt, prevR);
 
       let allConverged =
         Math.abs(svMin.value - tMin) < 1e-4 && Math.abs(svMax.value - tMax) < 1e-4;
       if (allConverged) {
-        for (let i = 0; i < MAX_SERIES; i++) {
-          if (Math.abs(slots[i]!.value - targets[i]!.value) > 1e-4) {
-            allConverged = false;
-            break;
-          }
+        if (
+          !slotPairConverged(slot0, target0) ||
+          !slotPairConverged(slot1, target1) ||
+          !slotPairConverged(slot2, target2) ||
+          !slotPairConverged(slot3, target3) ||
+          !slotPairConverged(slot4, target4) ||
+          !slotPairConverged(slot5, target5) ||
+          !slotPairConverged(slot6, target6) ||
+          !slotPairConverged(slot7, target7)
+        ) {
+          allConverged = false;
         }
       }
 

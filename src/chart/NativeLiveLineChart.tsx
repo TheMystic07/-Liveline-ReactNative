@@ -1276,6 +1276,13 @@ export function NativeLiveLineChart({
   const svBuildMin = useSharedValue(0);
   const svBuildMax = useSharedValue(1);
   const svBuildTipT = useSharedValue(0);
+  /** Last committed data point — worklet must not read `effectiveData` / `morphLineData` arrays (host crash). */
+  const svLastLineDataT = useSharedValue(0);
+  const svLastLineDataV = useSharedValue(0);
+  const svLastMorphDataT = useSharedValue(0);
+  const svLastMorphDataV = useSharedValue(0);
+  const svLineDataCount = useSharedValue(0);
+  const svMorphDataCount = useSharedValue(0);
   const liveCandleBucketRef = useRef<number | null>(null);
 
   const [lineMorphJs, setLineMorphJs] = useState(0);
@@ -1914,6 +1921,24 @@ export function NativeLiveLineChart({
     svBuildTipT.value = buildSnapshot.tipT;
   }, [buildSnapshot, svBuildMin, svBuildMax, svBuildTipT]);
 
+  useEffect(() => {
+    svLineDataCount.value = effectiveData.length;
+    if (effectiveData.length > 0) {
+      const l = effectiveData[effectiveData.length - 1]!;
+      svLastLineDataT.value = l.time;
+      svLastLineDataV.value = l.value;
+    }
+  }, [effectiveData, svLastLineDataT, svLastLineDataV, svLineDataCount]);
+
+  useEffect(() => {
+    svMorphDataCount.value = morphLineData.length;
+    if (morphLineData.length > 0) {
+      const l = morphLineData[morphLineData.length - 1]!;
+      svLastMorphDataT.value = l.time;
+      svLastMorphDataV.value = l.value;
+    }
+  }, [morphLineData, svLastMorphDataT, svLastMorphDataV, svMorphDataCount]);
+
   /* ---- degen burst ---- */
   const spawnPt = useMemo(
     () => ({
@@ -2053,14 +2078,21 @@ export function NativeLiveLineChart({
   const dvRangeScaleY = useDerivedValue(() => svRangeTransform.value.scaleY);
   const dvRangeTranslateY = useDerivedValue(() => svRangeTransform.value.translateY);
 
+  const tipPadL = pad.left;
+  const tipPadR = pad.right;
+  const tipPadT = pad.top;
+  const tipPadB = pad.bottom;
+  const tipLayW = layout.width;
+  const tipLayH = layout.height;
+
   const svTipLinePath = useDerivedValue(() => {
     'worklet';
-    const pts = effectiveData;
-    if (!pts || pts.length === 0) return '';
-    const last = pts[pts.length - 1]!;
-    const w = layout.width;
-    const h = layout.height;
-    if (w <= 0 || h <= 0) return '';
+    if (svLineDataCount.value < 1 || tipLayW <= 0 || tipLayH <= 0) return '';
+
+    const lastT = svLastLineDataT.value;
+    const lastV = svLastLineDataV.value;
+    const w = tipLayW;
+    const h = tipLayH;
 
     const bMin = svBuildMin.value;
     const bMax = svBuildMax.value;
@@ -2069,37 +2101,56 @@ export function NativeLiveLineChart({
     const cMax = svMax.value;
     const curSpan = Math.max(1e-4, cMax - cMin);
 
-    const ch = Math.max(1, h - pad.top - pad.bottom);
-    const cw = Math.max(1, w - pad.left - pad.right);
+    const ch = Math.max(1, h - tipPadT - tipPadB);
+    const cw = Math.max(1, w - tipPadL - tipPadR);
 
     const rightEdgeBuild = svBuildTipT.value + win * buf;
     const leftEdgeBuild = rightEdgeBuild - win;
     const x0 =
-      pad.left + ((last.time - leftEdgeBuild) / (rightEdgeBuild - leftEdgeBuild || 1)) * cw;
-    const y0Build = pad.top + (1 - (last.value - bMin) / buildSpan) * ch;
+      tipPadL + ((lastT - leftEdgeBuild) / (rightEdgeBuild - leftEdgeBuild || 1)) * cw;
+    const y0Build = tipPadT + (1 - (lastV - bMin) / buildSpan) * ch;
 
     const scaleY = buildSpan / curSpan;
     const translateY =
-      (pad.top + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
+      (tipPadT + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
     const y0 = y0Build * scaleY + translateY;
 
     const rightEdgeCur = svTipT.value + win * buf;
     const leftEdgeCur = rightEdgeCur - win;
     const x1 =
-      pad.left + ((svTipT.value - leftEdgeCur) / (rightEdgeCur - leftEdgeCur || 1)) * cw;
-    const y1 = pad.top + (1 - (svTipV.value - cMin) / curSpan) * ch;
+      tipPadL + ((svTipT.value - leftEdgeCur) / (rightEdgeCur - leftEdgeCur || 1)) * cw;
+    const y1 = tipPadT + (1 - (svTipV.value - cMin) / curSpan) * ch;
 
     return `M ${x0} ${y0} L ${x1} ${y1}`;
-  }, [effectiveData, layout.width, layout.height, pad, win, buf]);
+  }, [
+    tipLayW,
+    tipLayH,
+    tipPadL,
+    tipPadR,
+    tipPadT,
+    tipPadB,
+    win,
+    buf,
+    svLineDataCount,
+    svLastLineDataT,
+    svLastLineDataV,
+    svBuildMin,
+    svBuildMax,
+    svBuildTipT,
+    svMin,
+    svMax,
+    svTipT,
+    svTipV,
+  ]);
 
   const svTipMorphLinePath = useDerivedValue(() => {
     'worklet';
-    const pts = morphLineData;
-    if (!pts || pts.length === 0) return '';
-    const last = pts[pts.length - 1]!;
-    const w = layout.width;
-    const h = layout.height;
-    if (w <= 0 || h <= 0) return '';
+    if (svMorphDataCount.value < 1 || tipLayW <= 0 || tipLayH <= 0) return '';
+
+    const lastT = svLastMorphDataT.value;
+    const lastV = svLastMorphDataV.value;
+    const w = tipLayW;
+    const h = tipLayH;
 
     const bMin = svBuildMin.value;
     const bMax = svBuildMax.value;
@@ -2108,28 +2159,47 @@ export function NativeLiveLineChart({
     const cMax = svMax.value;
     const curSpan = Math.max(1e-4, cMax - cMin);
 
-    const ch = Math.max(1, h - pad.top - pad.bottom);
-    const cw = Math.max(1, w - pad.left - pad.right);
+    const ch = Math.max(1, h - tipPadT - tipPadB);
+    const cw = Math.max(1, w - tipPadL - tipPadR);
 
     const rightEdgeBuild = svBuildTipT.value + win * buf;
     const leftEdgeBuild = rightEdgeBuild - win;
     const x0 =
-      pad.left + ((last.time - leftEdgeBuild) / (rightEdgeBuild - leftEdgeBuild || 1)) * cw;
-    const y0Build = pad.top + (1 - (last.value - bMin) / buildSpan) * ch;
+      tipPadL + ((lastT - leftEdgeBuild) / (rightEdgeBuild - leftEdgeBuild || 1)) * cw;
+    const y0Build = tipPadT + (1 - (lastV - bMin) / buildSpan) * ch;
 
     const scaleY = buildSpan / curSpan;
     const translateY =
-      (pad.top + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
+      (tipPadT + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
     const y0 = y0Build * scaleY + translateY;
 
     const rightEdgeCur = svTipT.value + win * buf;
     const leftEdgeCur = rightEdgeCur - win;
     const x1 =
-      pad.left + ((svTipT.value - leftEdgeCur) / (rightEdgeCur - leftEdgeCur || 1)) * cw;
-    const y1 = pad.top + (1 - (svMorphTipV.value - cMin) / curSpan) * ch;
+      tipPadL + ((svTipT.value - leftEdgeCur) / (rightEdgeCur - leftEdgeCur || 1)) * cw;
+    const y1 = tipPadT + (1 - (svMorphTipV.value - cMin) / curSpan) * ch;
 
     return `M ${x0} ${y0} L ${x1} ${y1}`;
-  }, [morphLineData, layout.width, layout.height, pad, win, buf]);
+  }, [
+    tipLayW,
+    tipLayH,
+    tipPadL,
+    tipPadR,
+    tipPadT,
+    tipPadB,
+    win,
+    buf,
+    svMorphDataCount,
+    svLastMorphDataT,
+    svLastMorphDataV,
+    svBuildMin,
+    svBuildMax,
+    svBuildTipT,
+    svMin,
+    svMax,
+    svTipT,
+    svMorphTipV,
+  ]);
 
   // Live dot position
   const dvLiveX = useDerivedValue(
