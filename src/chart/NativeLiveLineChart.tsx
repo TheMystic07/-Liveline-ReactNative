@@ -1272,7 +1272,9 @@ export function NativeLiveLineChart({
   const svStaticLinePath = useSharedValue('');
   const svStaticFillPath = useSharedValue('');
   const svStaticMorphLinePath = useSharedValue('');
-  const svRangeTransform = useSharedValue({ scaleY: 1, translateY: 0 });
+  /** Skia `transform` must receive `SharedValue`, not `DerivedValue` — keep scalars here. */
+  const svAnimRangeScaleY = useSharedValue(1);
+  const svAnimRangeTranslateY = useSharedValue(0);
   const svBuildMin = useSharedValue(0);
   const svBuildMax = useSharedValue(1);
   const svBuildTipT = useSharedValue(0);
@@ -1711,7 +1713,8 @@ export function NativeLiveLineChart({
         const ch = Math.max(1, h - padTopForEngine - padBottomForEngine);
         const translateY =
           (padTopForEngine + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
-        svRangeTransform.value = { scaleY, translateY };
+        svAnimRangeScaleY.value = scaleY;
+        svAnimRangeTranslateY.value = translateY;
       }
 
       /* ---- Live candle OHLC smoothing (upstream `CANDLE_LERP_SPEED`) ---- */
@@ -1887,7 +1890,8 @@ export function NativeLiveLineChart({
       padBottomForEngine,
       svBuildMin,
       svBuildMax,
-      svRangeTransform,
+      svAnimRangeScaleY,
+      svAnimRangeTranslateY,
       svMin,
       svMax,
       svChartH,
@@ -2074,9 +2078,6 @@ export function NativeLiveLineChart({
   useEffect(() => {
     svStaticFillPath.value = staticFillPath;
   }, [staticFillPath, svStaticFillPath]);
-
-  const dvRangeScaleY = useDerivedValue(() => svRangeTransform.value.scaleY);
-  const dvRangeTranslateY = useDerivedValue(() => svRangeTransform.value.translateY);
 
   const tipPadL = pad.left;
   const tipPadR = pad.right;
@@ -3017,7 +3018,7 @@ export function NativeLiveLineChart({
                         <Group clip={clipRect} opacity={dvRevealLineOp}>
                           <Group
                             transform={
-                              [{ translateY: dvRangeTranslateY }, { scaleY: dvRangeScaleY }] as never
+                              [{ translateY: svAnimRangeTranslateY }, { scaleY: svAnimRangeScaleY }] as never
                             }
                           >
                             <Group clip={dvClipL}>
@@ -3060,8 +3061,8 @@ export function NativeLiveLineChart({
                         gradientLineColoring={gradientLineColoring}
                         gradientStartColor={pal.gridLabel}
                         gradientEndColor={pal.accent}
-                        rangeScaleY={dvRangeScaleY}
-                        rangeTranslateY={dvRangeTranslateY}
+                        rangeScaleY={svAnimRangeScaleY}
+                        rangeTranslateY={svAnimRangeTranslateY}
                         tipPath={svTipLinePath}
                       />
                     </>
@@ -3154,8 +3155,8 @@ export function NativeLiveLineChart({
                           gradientLineColoring={gradientLineColoring}
                           gradientStartColor={pal.gridLabel}
                           gradientEndColor={pal.accent}
-                          rangeScaleY={dvRangeScaleY}
-                          rangeTranslateY={dvRangeTranslateY}
+                          rangeScaleY={svAnimRangeScaleY}
+                          rangeTranslateY={svAnimRangeTranslateY}
                           tipPath={svTipMorphLinePath}
                         />
                       </Group>

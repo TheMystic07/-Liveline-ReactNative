@@ -15,6 +15,7 @@ import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
   Easing,
   runOnJS,
+  useAnimatedReaction,
   useAnimatedStyle,
   useDerivedValue,
   useSharedValue,
@@ -376,30 +377,48 @@ export function NativeMultiSeriesChart({
   const evMax = engine.svMax;
   const evTipT = engine.svTipT;
 
-  const dvRangeScaleY = useDerivedValue(() => {
-    'worklet';
-    const bMin = svBuildMin.value;
-    const bMax = svBuildMax.value;
-    const cMin = evMin.value;
-    const cMax = evMax.value;
-    const buildSpan = Math.max(1e-4, bMax - bMin);
-    const curSpan = Math.max(1e-4, cMax - cMin);
-    return buildSpan / curSpan;
-  });
+  /** Skia `Group` transform must not use `DerivedValue` — only plain `SharedValue`s. */
+  const svMultiLayH = useSharedValue(0);
+  const svMultiPadTop = useSharedValue(0);
+  const svMultiPadBot = useSharedValue(0);
+  const svMultiRangeScaleY = useSharedValue(1);
+  const svMultiRangeTranslateY = useSharedValue(0);
 
-  const dvRangeTranslateY = useDerivedValue(() => {
-    'worklet';
-    const bMin = svBuildMin.value;
-    const bMax = svBuildMax.value;
-    const cMin = evMin.value;
-    const cMax = evMax.value;
-    const buildSpan = Math.max(1e-4, bMax - bMin);
-    const curSpan = Math.max(1e-4, cMax - cMin);
-    const scaleY = buildSpan / curSpan;
-    const h = layout.height;
-    const ch = Math.max(1, h - pad.top - pad.bottom);
-    return (pad.top + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
-  }, [layout.height, pad.top, pad.bottom]);
+  useEffect(() => {
+    svMultiLayH.value = layout.height;
+    svMultiPadTop.value = pad.top;
+    svMultiPadBot.value = pad.bottom;
+  }, [layout.height, pad.top, pad.bottom, svMultiLayH, svMultiPadTop, svMultiPadBot]);
+
+  useAnimatedReaction(
+    () => {
+      'worklet';
+      const bMin = svBuildMin.value;
+      const bMax = svBuildMax.value;
+      const cMin = evMin.value;
+      const cMax = evMax.value;
+      const buildSpan = Math.max(1e-4, bMax - bMin);
+      const curSpan = Math.max(1e-4, cMax - cMin);
+      const scaleY = buildSpan / curSpan;
+      const h = svMultiLayH.value;
+      const pt = svMultiPadTop.value;
+      const pb = svMultiPadBot.value;
+      const ch = Math.max(1, h - pt - pb);
+      const translateY = (pt + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
+      return `${scaleY}:${translateY}`;
+    },
+    (packed) => {
+      'worklet';
+      if (packed == null) return;
+      const parts = packed.split(':');
+      const sy = Number(parts[0]);
+      const ty = Number(parts[1]);
+      if (!Number.isFinite(sy) || !Number.isFinite(ty)) return;
+      svMultiRangeScaleY.value = sy;
+      svMultiRangeTranslateY.value = ty;
+    },
+    [svBuildMin, svBuildMax, evMin, evMax, svMultiLayH, svMultiPadTop, svMultiPadBot],
+  );
 
   const primaryPath = useMemo(() => {
     if (!primarySeries) return null;
@@ -621,7 +640,7 @@ export function NativeMultiSeriesChart({
                       <Group key={entry.id} clip={clipRect}>
                         <Group
                           transform={
-                            [{ translateY: dvRangeTranslateY }, { scaleY: dvRangeScaleY }] as never
+                            [{ translateY: svMultiRangeTranslateY }, { scaleY: svMultiRangeScaleY }] as never
                           }
                         >
                           <Path
