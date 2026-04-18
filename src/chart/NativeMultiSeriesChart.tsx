@@ -57,6 +57,8 @@ import { monotoneSplinePath } from './math/spline';
 
 const MULTI_WIN_BUF = 0.015;
 
+type RangeTransform = Array<{ translateY: number } | { scaleY: number }>;
+
 function SeriesTipPath({
   svTipT,
   svMin,
@@ -383,6 +385,10 @@ export function NativeMultiSeriesChart({
   const svMultiPadBot = useSharedValue(0);
   const svMultiRangeScaleY = useSharedValue(1);
   const svMultiRangeTranslateY = useSharedValue(0);
+  const svMultiRangeTransform = useSharedValue<RangeTransform>([
+    { translateY: 0 },
+    { scaleY: 1 },
+  ]);
 
   useEffect(() => {
     svMultiLayH.value = layout.height;
@@ -418,6 +424,17 @@ export function NativeMultiSeriesChart({
       svMultiRangeTranslateY.value = ty;
     },
     [svBuildMin, svBuildMax, evMin, evMax, svMultiLayH, svMultiPadTop, svMultiPadBot],
+  );
+
+  useAnimatedReaction(
+    () => ({
+      translateY: svMultiRangeTranslateY.value,
+      scaleY: svMultiRangeScaleY.value,
+    }),
+    ({ translateY, scaleY }) => {
+      svMultiRangeTransform.value = [{ translateY }, { scaleY }];
+    },
+    [svMultiRangeTranslateY, svMultiRangeScaleY],
   );
 
   const primaryPath = useMemo(() => {
@@ -638,11 +655,7 @@ export function NativeMultiSeriesChart({
                       entry.points.length > 0 ? entry.points[entry.points.length - 1]! : null;
                     return (
                       <Group key={entry.id} clip={clipRect}>
-                        <Group
-                          transform={
-                            [{ translateY: svMultiRangeTranslateY }, { scaleY: svMultiRangeScaleY }] as never
-                          }
-                        >
+                        <Group transform={svMultiRangeTransform}>
                           <Path
                             path={entry.path}
                             style="stroke"

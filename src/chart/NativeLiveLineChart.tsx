@@ -180,6 +180,8 @@ const FINE_LABEL_HIDE_PX = 40;
 const GRID_LABEL_FADE_IN = 0.18;
 const GRID_LABEL_FADE_OUT = 0.12;
 
+type RangeTransform = Array<{ translateY: number } | { scaleY: number }>;
+
 /* ------------------------------------------------------------------ */
 /*  Pure helpers                                                       */
 /* ------------------------------------------------------------------ */
@@ -1275,6 +1277,10 @@ export function NativeLiveLineChart({
   /** Skia `transform` must receive `SharedValue`, not `DerivedValue` — keep scalars here. */
   const svAnimRangeScaleY = useSharedValue(1);
   const svAnimRangeTranslateY = useSharedValue(0);
+  const svFillRangeTransform = useSharedValue<RangeTransform>([
+    { translateY: 0 },
+    { scaleY: 1 },
+  ]);
   const svBuildMin = useSharedValue(0);
   const svBuildMax = useSharedValue(1);
   const svBuildTipT = useSharedValue(0);
@@ -1288,6 +1294,17 @@ export function NativeLiveLineChart({
   const liveCandleBucketRef = useRef<number | null>(null);
 
   const [lineMorphJs, setLineMorphJs] = useState(0);
+  useAnimatedReaction(
+    () => ({
+      translateY: svAnimRangeTranslateY.value,
+      scaleY: svAnimRangeScaleY.value,
+    }),
+    ({ translateY, scaleY }) => {
+      svFillRangeTransform.value = [{ translateY }, { scaleY }];
+    },
+    [svAnimRangeTranslateY, svAnimRangeScaleY],
+  );
+
   useAnimatedReaction(
     () => Math.round(svLineModeProg.value * 50) / 50,
     (v, prev) => {
@@ -3016,11 +3033,7 @@ export function NativeLiveLineChart({
                       {/* -- Fill gradient (scrub splits like upstream drawLine) — reveal-gated -- */}
                       {fill && clipRect ? (
                         <Group clip={clipRect} opacity={dvRevealLineOp}>
-                          <Group
-                            transform={
-                              [{ translateY: svAnimRangeTranslateY }, { scaleY: svAnimRangeScaleY }] as never
-                            }
-                          >
+                          <Group transform={svFillRangeTransform}>
                             <Group clip={dvClipL}>
                               <Path path={svStaticFillPath}>
                                 <LinearGradient

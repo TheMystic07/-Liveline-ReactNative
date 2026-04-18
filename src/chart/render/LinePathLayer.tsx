@@ -4,7 +4,11 @@ import {
   Path,
   vec,
 } from '@shopify/react-native-skia';
-import type { SharedValue } from 'react-native-reanimated';
+import {
+  useAnimatedReaction,
+  useSharedValue,
+  type SharedValue,
+} from 'react-native-reanimated';
 
 type LinePathLayerProps = {
   clipRect: any;
@@ -29,6 +33,8 @@ type LinePathLayerProps = {
   tipPath?: SharedValue<string>;
 };
 
+type RangeTransform = Array<{ translateY: number } | { scaleY: number }>;
+
 export function LinePathLayer({
   clipRect,
   leftClip,
@@ -51,11 +57,27 @@ export function LinePathLayer({
   rangeTranslateY,
   tipPath,
 }: LinePathLayerProps) {
+  const rangeTransform = useSharedValue<RangeTransform>([
+    { translateY: 0 },
+    { scaleY: 1 },
+  ]);
+
+  useAnimatedReaction(
+    () => ({
+      translateY: rangeTranslateY.value,
+      scaleY: rangeScaleY.value,
+    }),
+    ({ translateY, scaleY }) => {
+      rangeTransform.value = [{ translateY }, { scaleY }];
+    },
+    [rangeTranslateY, rangeScaleY],
+  );
+
   if (!clipRect) return null;
 
   return (
     <Group clip={clipRect} opacity={revealOpacity}>
-      <Group transform={[{ translateY: rangeTranslateY }, { scaleY: rangeScaleY }] as never}>
+      <Group transform={rangeTransform}>
         {trailGlow ? (
           <Path
             path={path}
