@@ -10,6 +10,7 @@ import {
   LinearGradient,
   Path,
   Rect,
+  RoundedRect,
   Shadow,
   rect,
   vec,
@@ -31,7 +32,15 @@ import Animated, {
 
 import { parseColorRgb, resolvePalette } from './theme';
 import { lerp as lerpFr } from './math/lerp';
+import {
+  collapseCandleOHLC,
+  inferCandleWidthSecs,
+  layoutLivelineCandles,
+  LIVELINE_CANDLE_BULL,
+  LIVELINE_CANDLE_BEAR,
+} from './draw/livelineCandlestick';
 import type {
+  CandlePoint,
   ChartPadding,
   DegenOptions,
   LiveLineChartProps,
@@ -67,6 +76,8 @@ import { LinePathLayer } from './render/LinePathLayer';
 import { type ParticleSpec, ParticlesLayer } from './render/ParticlesLayer';
 import { ReferenceLineCanvas } from './render/ReferenceLineCanvas';
 import { ReferenceLineLabel } from './render/ReferenceLineLabel';
+import { CandleScrubOHLCTooltip } from './render/CandleScrubOHLCTooltip';
+import { OrderbookStreamOverlay } from './orderbookStream/OrderbookStreamOverlay';
 import { ScrubTooltip } from './render/ScrubTooltip';
 import { useTrackedGridLabels, useTrackedTimeLabels } from './render/useTrackedAxisLabels';
 import { scrubCentTickHaptic, scrubPanBeginHaptic } from './scrubHaptics';
@@ -122,12 +133,18 @@ const VALUE_SNAP_THRESHOLD = 0.001;
 /** Throttle grid label refresh while range lerps (ms, worklet accumulator). */
 const GRID_FLUSH_MS = 110;
 /** Wall-clock tick for time axis when the last sample time lags (ms, JS interval). */
-const LIVE_AXIS_WALL_MS = 220;
+const LIVE_AXIS_WALL_MS = 480;
 /** How fast `svTipT` eases toward wall clock between ticks (scaled by `engineDt`). */
 const LIVE_TIP_CLOCK_CATCHUP = 0.42;
 /** Upstream `BADGE_WIDTH_LERP` — badge pill width eases toward measured text. */
 const BADGE_WIDTH_LERP = 0.15;
 const MAX_DELTA_MS = 50;
+/** Upstream `CANDLE_LERP_SPEED` — live OHLC eases toward each tick. */
+const CANDLE_OHLC_LERP_SPEED = 0.25;
+/** Upstream `LINE_MORPH_MS` — line↔candle morph duration. */
+const LINE_MORPH_MS = 500;
+/** Throttle JS merges while OHLC lerps on the UI thread (ms). */
+const CANDLE_SMOOTH_EMIT_MS = 32;
 const ENGINE_IDLE_STOP_MS = 120;
 const ARROW_WAVE_DURATION_MS = 680;
 const SCRUB_HAPTIC_MIN_INTERVAL_MS = 48;
@@ -357,6 +374,83 @@ function sampleScrubAtX(
   };
 }
 
+/** Candle scrub: X → time, nearest visible bucket, snap crosshair to candle center (matches NativeCandlestickChart). */
+function sampleCandleScrubAtX(
+  x: number,
+  chartW: number,
+  pad: ChartPadding,
+  win: number,
+  buf: number,
+  tipT: number,
+  tipV: number,
+  candles: readonly CandlePoint[],
+  candleWidthSecs: number,
+) {
+  'worklet';
+  const chartWi = Math.max(1, chartW - pad.left - pad.right);
+  const rightEdge = tipT + win * buf;
+  const leftEdge = rightEdge - win;
+  const liveX =
+    pad.left + ((tipT - leftEdge) / (rightEdge - leftEdge || 1)) * chartWi;
+  if (candles.length === 0) {
+    const rawHx = clampW(x, pad.left, liveX);
+    const rawHt = leftEdge + ((rawHx - pad.left) / chartWi) * (rightEdge - leftEdge);
+    return { hx: rawHx, ht: rawHt, hv: tipV, liveX, candle: null as CandlePoint | null };
+  }
+  const rawHx = clampW(x, pad.left, liveX);
+  const rawHt = leftEdge + ((rawHx - pad.left) / chartWi) * (rightEdge - leftEdge);
+  let best = candles[0]!;
+  let bestD = Math.abs(candles[0]!.time - rawHt);
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i]!;
+    const d = Math.abs(c.time - rawHt);
+    if (d < bestD) {
+      bestD = d;
+      best = c;
+    }
+  }
+  const snappedX =
+    pad.left +
+    ((best.time + candleWidthSecs / 2 - leftEdge) / (rightEdge - leftEdge || 1)) * chartWi;
+  return {
+    hx: clampW(snappedX, pad.left, liveX),
+    ht: best.time,
+    hv: best.close,
+    liveX,
+    candle: best,
+  };
+}
+
+type CandleScrubSample = {
+  hx: number;
+  hv: number;
+  ht: number;
+  liveX: number;
+  candle: CandlePoint | null;
+};
+
+type LineScrubSample = {
+  hx: number;
+  hv: number;
+  ht: number;
+  liveX: number;
+};
+
+/** While candle↔line morph runs (`morphT` 0→1), ease scrub from snap-to-candle toward free line scrub. */
+function candleLineMorphScrubBlend(
+  morphT: number,
+  c: CandleScrubSample,
+  l: LineScrubSample,
+): { hx: number; hv: number; ht: number; liveX: number; cand: CandlePoint | undefined } {
+  'worklet';
+  const w = morphT * morphT * (3 - 2 * morphT);
+  const hx = c.hx + (l.hx - c.hx) * w;
+  const hv = c.hv + (l.hv - c.hv) * w;
+  const ht = c.ht + (l.ht - c.ht) * w;
+  const cand = w < 0.34 && c.candle ? c.candle : undefined;
+  return { hx, hv, ht, liveX: l.liveX, cand };
+}
+
 /* ------------------------------------------------------------------ */
 /*  Grid ticks — upstream pickInterval + dashed grid                   */
 /* ------------------------------------------------------------------ */
@@ -475,8 +569,15 @@ function buildPath(
 
   const cw = w - pad.left - pad.right;
   const ch = h - pad.top - pad.bottom;
-  const rightEdge = tipT + win * buffer;
-  const leftEdge = rightEdge - win;
+  const lastDataT = pts[pts.length - 1]!.time;
+  let rightEdge = tipT + win * buffer;
+  let leftEdge = rightEdge - win;
+  // `svTipT` can ease ahead of the last sample toward wall clock; the default window then
+  // slides past all points (`p.time < leftEdge - 2` skips everything) and the path is empty.
+  if (leftEdge > lastDataT - 2) {
+    rightEdge = lastDataT + win * buffer;
+    leftEdge = rightEdge - win;
+  }
   const span = Math.max(0.0001, hi - lo);
   const floorY = h - pad.bottom;
   const yMin = pad.top;
@@ -703,11 +804,24 @@ export function NativeLiveLineChart({
   formatValue = defaultFmtVal,
   formatTime = defaultFmtTime,
   lerpSpeed = 0.08,
+  mode,
+  candles: candlesProp,
+  liveCandle,
+  candleWidth: candleWidthProp,
+  lineMode = false,
+  lineData,
+  lineValue,
+  onModeChange,
+  onLineModeChange,
+  showBuiltInModeToggle = false,
+  showBuiltInMorphToggle = false,
+  orderbook: orderbookProp,
   style,
   contentInset,
 }: LiveLineChartProps) {
   const buf = windowBuffer(badge);
   const isDark = theme === 'dark';
+  const isCandle = mode === 'candle';
   const ws: LiveLineWindowStyle = windowStyleProp ?? 'default';
   const degenEnabled = degen !== false;
   const degenOptions = typeof degen === 'object' ? degen : undefined;
@@ -718,14 +832,23 @@ export function NativeLiveLineChart({
     [color, theme, lineWidth],
   );
 
+  const [smoothedLive, setSmoothedLive] = useState<CandlePoint | null>(null);
+  const flushSmoothedDisplay = useCallback(
+    (o: number, h: number, l: number, c: number, t: number) => {
+      setSmoothedLive({ time: t, open: o, high: h, low: l, close: c });
+    },
+    [],
+  );
+
   const skiaDefaultNumberFormat = useMemo(
     () => supportsTwoDecimalNumberFlow(formatValue),
     [formatValue],
   );
   const badgeNumFont = useSkiaFont(BADGE_NUMBER_FLOW_FONT_SRC, 11);
   const scrubTipFont = useSkiaFont(BADGE_NUMBER_FLOW_FONT_SRC, 13);
+  const orderbookStreamFont = useSkiaFont(BADGE_NUMBER_FLOW_FONT_SRC, 10);
   const skiaBadgeFlow =
-    badge && badgeNumberFlow !== false && skiaDefaultNumberFormat;
+    badge && badgeNumberFlow !== false && skiaDefaultNumberFormat && badgeNumFont != null;
   const skiaScrubFlow =
     scrub && scrubNumberFlow !== false && skiaDefaultNumberFormat;
   const lineRevealStartRgb = useMemo(() => parseColorRgb(pal.gridLabel), [pal.gridLabel]);
@@ -939,20 +1062,10 @@ export function NativeLiveLineChart({
 
   useEffect(() => {
     if (!loading && data.length >= 2) return;
-    let id: number;
-    let lastEmit = 0;
-    /** ~28fps — enough for the loading path; avoids a full React commit every display frame. */
-    const minStepMs = 1000 / 28;
-    const tick = () => {
-      const t = typeof performance !== 'undefined' ? performance.now() : Date.now();
-      if (t - lastEmit >= minStepMs) {
-        lastEmit = t;
-        setLoadMs(t);
-      }
-      id = requestAnimationFrame(tick);
-    };
-    id = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(id);
+    const tick = () => setLoadMs(typeof performance !== 'undefined' ? performance.now() : Date.now());
+    tick();
+    const id = setInterval(tick, 100);
+    return () => clearInterval(id);
   }, [loading, data.length]);
 
   /* ---- pause snapshot ---- */
@@ -986,15 +1099,77 @@ export function NativeLiveLineChart({
     () => getVisible(effectiveData, axisNow, win, buf),
     [effectiveData, axisNow, win, buf],
   );
-  const rng = useMemo(
-    () => computeRange(vis, effectiveValue, referenceLine?.value, exaggerate),
-    [vis, effectiveValue, referenceLine?.value, exaggerate],
+
+  const morphLineData = useMemo(
+    () => (lineData ?? effectiveData) as LiveLinePoint[],
+    [lineData, effectiveData],
   );
+
+  /* ---- candle mode data ---- */
+  const candleMerged = useMemo(() => {
+    if (!isCandle) return [];
+    const map = new Map<number, CandlePoint>();
+    for (const c of candlesProp ?? []) map.set(c.time, c);
+    if (liveCandle) map.set(liveCandle.time, liveCandle);
+    return [...map.values()].sort((a, b) => a.time - b.time);
+  }, [isCandle, candlesProp, liveCandle]);
+
+  const candleVisible = useMemo(() => {
+    if (!isCandle || candleMerged.length === 0) return [];
+    const { leftEdge, rightEdge } = windowEdges(axisNow, win, buf);
+    return candleMerged.filter((c) => c.time >= leftEdge - 2 && c.time <= rightEdge + 1);
+  }, [isCandle, candleMerged, axisNow, win, buf]);
+
+  const candleWidthSecs = useMemo(
+    () => (isCandle ? inferCandleWidthSecs(candleVisible, win) : 1),
+    [isCandle, candleVisible, win],
+  );
+
+  const candleVisibleForLayout = useMemo(() => {
+    if (!isCandle || candleVisible.length === 0) return [];
+    const last = candleVisible[candleVisible.length - 1];
+    if (
+      smoothedLive &&
+      liveCandle &&
+      last.time === liveCandle.time &&
+      smoothedLive.time === liveCandle.time
+    ) {
+      return [...candleVisible.slice(0, -1), smoothedLive];
+    }
+    return candleVisible;
+  }, [candleVisible, isCandle, liveCandle, smoothedLive]);
+
+  const rng = useMemo(() => {
+    if (isCandle && candleVisible.length > 0) {
+      // OHLC range for candle mode
+      let cMin = Infinity;
+      let cMax = -Infinity;
+      for (const c of candleVisible) {
+        if (c.low < cMin) cMin = c.low;
+        if (c.high > cMax) cMax = c.high;
+      }
+      if (referenceLine?.value !== undefined) {
+        if (referenceLine.value < cMin) cMin = referenceLine.value;
+        if (referenceLine.value > cMax) cMax = referenceLine.value;
+      }
+      if (!isFinite(cMin) || !isFinite(cMax)) return { min: 0, max: 1 };
+      const rawRange = cMax - cMin;
+      const minRange = rawRange * 0.1 || 0.4;
+      if (rawRange < minRange) {
+        const mid = (cMin + cMax) / 2;
+        return { min: mid - minRange / 2, max: mid + minRange / 2 };
+      }
+      const margin = rawRange * 0.12;
+      return { min: cMin - margin, max: cMax + margin };
+    }
+    return computeRange(vis, effectiveValue, referenceLine?.value, exaggerate);
+  }, [isCandle, candleVisible, vis, effectiveValue, referenceLine?.value, exaggerate]);
   const mom = useMemo(() => detectMomentum(vis), [vis]);
   const swMag = useMemo(
     () => computeSwingMagnitude(vis, effectiveValue, rng.min, rng.max),
     [vis, effectiveValue, rng.min, rng.max],
   );
+  const momUi: 0 | 1 | 2 = mom === 'up' ? 1 : mom === 'down' ? 2 : 0;
 
   const chartW = layout.width - pad.left - pad.right;
   const chartH = layout.height - pad.top - pad.bottom;
@@ -1020,6 +1195,21 @@ export function NativeLiveLineChart({
   const trackedGridLabels = useTrackedGridLabels(gridRes.ticks);
   const trackedTimeLabels = useTrackedTimeLabels(tTicks);
   const badgeFlowA11y = useMemo(() => effectiveValue.toFixed(2), [effectiveValue]);
+
+  /** Candle badge / dash tint — prefer smoothed live OHLC when available. */
+  const candleTip =
+    isCandle && smoothedLive && liveCandle && smoothedLive.time === liveCandle.time
+      ? smoothedLive
+      : isCandle && candleMerged.length
+        ? candleMerged[candleMerged.length - 1]!
+        : null;
+  const candleBadgeDashColor = useMemo(() => {
+    if (!candleTip) return pal.dashLine;
+    const isBull = candleTip.close >= candleTip.open;
+    const c = isBull ? LIVELINE_CANDLE_BULL : LIVELINE_CANDLE_BEAR;
+    const [r, g, b] = parseColorRgb(c);
+    return `rgba(${r},${g},${b},0.35)`;
+  }, [candleTip, pal.dashLine]);
 
   /* ---- shared values ---- */
   const svTipT = useSharedValue(now);
@@ -1063,6 +1253,79 @@ export function NativeLiveLineChart({
   const svMom = useSharedValue(0);
   const svMomProp = useSharedValue(1);
   const svBadgeOn = useSharedValue(1);
+
+  /** Candle OHLC targets + smoothed display (worklet lerps → JS merge for Skia layouts). */
+  const svIsCandleFlag = useSharedValue(0);
+  const svTargLiveO = useSharedValue(0);
+  const svTargLiveH = useSharedValue(0);
+  const svTargLiveL = useSharedValue(0);
+  const svTargLiveC = useSharedValue(0);
+  const svSmLiveO = useSharedValue(0);
+  const svSmLiveH = useSharedValue(0);
+  const svSmLiveL = useSharedValue(0);
+  const svSmLiveC = useSharedValue(0);
+  const svLiveBucketTime = useSharedValue(0);
+  const svCandleEmitAcc = useSharedValue(0);
+  const svLineModeProg = useSharedValue(0);
+  /** Morph overlay line tip (tick value), independent of candle-close badge lerp. */
+  const svMorphTipV = useSharedValue(0);
+  const liveCandleBucketRef = useRef<number | null>(null);
+
+  const [lineMorphJs, setLineMorphJs] = useState(0);
+  useAnimatedReaction(
+    () => Math.round(svLineModeProg.value * 50) / 50,
+    (v, prev) => {
+      if (prev !== undefined && v === prev) return;
+      runOnJS(setLineMorphJs)(v);
+    },
+    [],
+  );
+
+  const candleVisibleMorphed = useMemo(() => {
+    if (!isCandle || candleVisibleForLayout.length === 0) return [];
+    const lp = lineMorphJs;
+    if (lp < 0.01) return candleVisibleForLayout;
+    const inv = 1 - lp;
+    return candleVisibleForLayout.map((c) => collapseCandleOHLC(c, inv));
+  }, [candleVisibleForLayout, isCandle, lineMorphJs]);
+
+  const liveCandleTime = liveCandle?.time ?? -1;
+  const candleLayouts = useMemo(() => {
+    if (!isCandle || chartW <= 0 || candleVisibleMorphed.length === 0) return [];
+    const { leftEdge, rightEdge } = windowEdges(axisNow, win, buf);
+    const lo = gridSmooth?.min ?? rng.min;
+    const hi = gridSmooth?.max ?? rng.max;
+    const maxBodyPx = candleWidthProp != null && candleWidthProp >= 12 ? candleWidthProp : undefined;
+    return layoutLivelineCandles(
+      candleVisibleMorphed,
+      liveCandleTime,
+      leftEdge,
+      rightEdge,
+      layout.width,
+      layout.height,
+      pad,
+      lo,
+      hi,
+      candleWidthSecs,
+      maxBodyPx,
+    );
+  }, [
+    isCandle,
+    candleVisibleMorphed,
+    liveCandleTime,
+    axisNow,
+    win,
+    buf,
+    layout.width,
+    layout.height,
+    pad,
+    gridSmooth,
+    rng.min,
+    rng.max,
+    candleWidthSecs,
+    chartW,
+    candleWidthProp,
+  ]);
 
   const [flowPillW, setFlowPillW] = useState(80);
   const [engineActive, setEngineActive] = useState(false);
@@ -1145,8 +1408,69 @@ export function NativeLiveLineChart({
   }, [paused, svPauseTarget]);
 
   useEffect(() => {
-    svRawValue.value = effectiveValue;
-  }, [effectiveValue, svRawValue]);
+    if (isCandle && liveCandle) {
+      svRawValue.value = liveCandle.close;
+    } else {
+      svRawValue.value = effectiveValue;
+    }
+  }, [isCandle, liveCandle, effectiveValue, svRawValue]);
+
+  useEffect(() => {
+    svMorphTipV.value = lineValue ?? effectiveValue;
+  }, [effectiveValue, lineValue, svMorphTipV]);
+
+  useEffect(() => {
+    svIsCandleFlag.value = isCandle ? 1 : 0;
+    if (!isCandle) setLineMorphJs(0);
+  }, [isCandle, svIsCandleFlag]);
+
+  useEffect(() => {
+    cancelAnimation(svLineModeProg);
+    if (!isCandle) {
+      svLineModeProg.value = 0;
+      return;
+    }
+    svLineModeProg.value = withTiming(lineMode ? 1 : 0, {
+      duration: LINE_MORPH_MS,
+      easing: Easing.inOut(Easing.quad),
+    });
+  }, [isCandle, lineMode, svLineModeProg]);
+
+  useEffect(() => {
+    if (!isCandle || !liveCandle) {
+      setSmoothedLive(null);
+      liveCandleBucketRef.current = null;
+      return;
+    }
+    svTargLiveO.value = liveCandle.open;
+    svTargLiveH.value = liveCandle.high;
+    svTargLiveL.value = liveCandle.low;
+    svTargLiveC.value = liveCandle.close;
+    svLiveBucketTime.value = liveCandle.time;
+    if (liveCandleBucketRef.current !== liveCandle.time) {
+      liveCandleBucketRef.current = liveCandle.time;
+      svSmLiveO.value = liveCandle.open;
+      svSmLiveH.value = liveCandle.open;
+      svSmLiveL.value = liveCandle.open;
+      svSmLiveC.value = liveCandle.open;
+    }
+  }, [
+    isCandle,
+    liveCandle?.time,
+    liveCandle?.open,
+    liveCandle?.high,
+    liveCandle?.low,
+    liveCandle?.close,
+    svTargLiveO,
+    svTargLiveH,
+    svTargLiveL,
+    svTargLiveC,
+    svLiveBucketTime,
+    svSmLiveO,
+    svSmLiveH,
+    svSmLiveL,
+    svSmLiveC,
+  ]);
 
   /** Keep data tip time on the UI thread (live dot eases toward wall clock in `onEngineFrame`). */
   useEffect(() => {
@@ -1173,7 +1497,7 @@ export function NativeLiveLineChart({
       svMax.value = rng.max;
       svTargetMin.value = rng.min;
       svTargetMax.value = rng.max;
-      svTipV.value = effectiveValue;
+      svTipV.value = isCandle && liveCandle ? liveCandle.close : effectiveValue;
       setGridSmooth({ min: rng.min, max: rng.max });
       svGridFlushAcc.value = GRID_FLUSH_MS;
       // Initialize badge Y to target (no lerp on first frame)
@@ -1190,7 +1514,20 @@ export function NativeLiveLineChart({
         momColorInitRef.current = true;
       }
     }
-  }, [empty, rng.min, rng.max, effectiveValue, svMin, svMax, svTargetMin, svTargetMax, svTipV, svGridFlushAcc]);
+  }, [
+    empty,
+    rng.min,
+    rng.max,
+    effectiveValue,
+    isCandle,
+    liveCandle,
+    svMin,
+    svMax,
+    svTargetMin,
+    svTargetMax,
+    svTipV,
+    svGridFlushAcc,
+  ]);
 
   useEffect(() => {
     svMom.value = mom === 'up' ? 1 : mom === 'down' ? 2 : 0;
@@ -1241,7 +1578,6 @@ export function NativeLiveLineChart({
     effectiveValue,
     rng.min,
     rng.max,
-    now,
     win,
     paused,
     badge,
@@ -1333,6 +1669,29 @@ export function NativeLiveLineChart({
       let nextDisp = lerpFr(disp, tgt, spd, engineDt);
       if (Math.abs(nextDisp - tgt) < prevR * VALUE_SNAP_THRESHOLD) nextDisp = tgt;
       svTipV.value = nextDisp;
+
+      /* ---- Live candle OHLC smoothing (upstream `CANDLE_LERP_SPEED`) ---- */
+      if (svIsCandleFlag.value === 1) {
+        const spd = CANDLE_OHLC_LERP_SPEED;
+        svSmLiveO.value = lerpFr(svSmLiveO.value, svTargLiveO.value, spd, engineDt);
+        svSmLiveH.value = lerpFr(svSmLiveH.value, svTargLiveH.value, spd, engineDt);
+        svSmLiveL.value = lerpFr(svSmLiveL.value, svTargLiveL.value, spd, engineDt);
+        svSmLiveC.value = lerpFr(svSmLiveC.value, svTargLiveC.value, spd, engineDt);
+        let acc = svCandleEmitAcc.value + dt;
+        if (acc >= CANDLE_SMOOTH_EMIT_MS) {
+          acc = 0;
+          runOnJS(flushSmoothedDisplay)(
+            svSmLiveO.value,
+            svSmLiveH.value,
+            svSmLiveL.value,
+            svSmLiveC.value,
+            svLiveBucketTime.value,
+          );
+        }
+        svCandleEmitAcc.value = acc;
+      } else {
+        svCandleEmitAcc.value = 0;
+      }
 
       /* ---- Range smoothing (SEPARATE speed — upstream 0.15 + 0.2 adaptive) ---- */
       const curRange = dmax0 - dmin0 || 1;
@@ -1476,7 +1835,7 @@ export function NativeLiveLineChart({
         svEngineIdleMs.value = 0;
       }
     },
-    [stopEngine, flushGridSmooth],
+    [stopEngine, flushGridSmooth, flushSmoothedDisplay],
   );
 
   const engineFrame = useFrameCallback(onEngineFrame, false);
@@ -1580,6 +1939,24 @@ export function NativeLiveLineChart({
     [effectiveData, layout.width, layout.height, pad, win, buf],
   );
 
+  const dvMorphLinePath = useDerivedValue(
+    () =>
+      buildPath(
+        morphLineData,
+        svTipT.value,
+        svMorphTipV.value,
+        svMin.value,
+        svMax.value,
+        layout.width,
+        layout.height,
+        pad,
+        win,
+        buf,
+        false,
+      ),
+    [morphLineData, layout.width, layout.height, pad, win, buf],
+  );
+
   // Fill path
   const dvFillPath = useDerivedValue(
     () =>
@@ -1652,13 +2029,14 @@ export function NativeLiveLineChart({
   }, [pulse]);
 
   // Dashed price line Y
-  const dvDashY = useDerivedValue(
-    () => clampW(
-      toScreenY(svTipV.value, svMin.value, svMax.value, layout.height, pad),
-      pad.top, layout.height - pad.bottom,
-    ),
-    [layout.height, pad],
-  );
+  const dvDashY = useDerivedValue(() => {
+    const dashV = svIsCandleFlag.value === 1 ? svSmLiveC.value : svTipV.value;
+    return clampW(
+      toScreenY(dashV, svMin.value, svMax.value, layout.height, pad),
+      pad.top,
+      layout.height - pad.bottom,
+    );
+  }, [layout.height, pad]);
   const dvDashP1 = useDerivedValue(
     () => vec(pad.left, dvDashY.value),
     [pad.left],
@@ -1721,6 +2099,9 @@ export function NativeLiveLineChart({
   }, [pad.left, scrub]);
   const dvHoverY = useDerivedValue(() => {
     if (!scrub || svScrubOp.value <= 0.01 || chartW <= 0) return -100;
+    if (isCandle) {
+      return toScreenY(svScrubHv.value, svMin.value, svMax.value, layout.height, pad);
+    }
     const rightEdge = svTipT.value + win * buf;
     const leftEdge = rightEdge - win;
     const ht =
@@ -1728,7 +2109,7 @@ export function NativeLiveLineChart({
       ((dvHoverX.value - pad.left) / Math.max(1, chartW)) * (rightEdge - leftEdge);
     const hv = interpAtTime(effectiveData, ht, svTipT.value, svTipV.value);
     return toScreenY(hv, svMin.value, svMax.value, layout.height, pad);
-  }, [chartW, win, layout.height, pad, scrub, effectiveData, buf]);
+  }, [chartW, win, layout.height, pad, scrub, effectiveData, buf, isCandle]);
 
   const dvCrossEffectiveOp = useDerivedValue(() => {
     const scrubAmt = svScrubOp.value;
@@ -1829,6 +2210,9 @@ export function NativeLiveLineChart({
   const asBadge = useAnimatedStyle(() => {
     const pillW = svBadgePillW.value;
     const totalW = BADGE_TAIL_LEN + pillW;
+    const badgeX = Math.max(pad.left + 4, layout.width - totalW - 18);
+    const desiredY = svBadgeY.value - pillH / 2;
+    const badgeY = clampW(desiredY, pad.top + 4, layout.height - pad.bottom - pillH - 4);
     // Reveal-gated: badge appears after REVEAL_BADGE_START
     const rev = svReveal.value;
     const revealOp = rev < REVEAL_BADGE_START ? 0 : Math.min(1, (rev - REVEAL_BADGE_START) / (1 - REVEAL_BADGE_START));
@@ -1836,28 +2220,35 @@ export function NativeLiveLineChart({
     return {
       opacity: baseOp,
       width: totalW,
+      height: pillH + 10,
       transform: [
-        { translateX: dvLiveX.value - totalW / 2 - BADGE_TAIL_LEN },
-        // Use lerped badge Y for smooth vertical tracking
-        { translateY: svBadgeY.value - pillH - 12 },
+        { translateX: badgeX },
+        { translateY: badgeY },
       ],
     };
   });
 
   const asBadgeTextWrap = useAnimatedStyle(() => ({
-    width: Math.max(8, svBadgePillW.value - BADGE_TAIL_LEN),
+    width: Math.max(12, svBadgePillW.value - BADGE_TAIL_LEN - 2),
   }));
 
   const [scrubTip, setScrubTip] = useState<{
     hx: number;
     hv: number;
     ht: number;
+    candle?: CandlePoint;
   } | null>(null);
 
-  const scrubFlowA11yLabel = useMemo(
-    () => (scrubTip ? scrubTip.hv.toFixed(2) : undefined),
-    [scrubTip],
-  );
+  const scrubFlowA11yLabel = useMemo(() => {
+    if (!scrubTip) return undefined;
+    if (scrubTip.candle) {
+      const c = scrubTip.candle;
+      return `O ${formatValue(c.open)} H ${formatValue(c.high)} L ${formatValue(c.low)} C ${formatValue(
+        c.close,
+      )} ${formatTime(c.time)}`;
+    }
+    return scrubTip.hv.toFixed(2);
+  }, [scrubTip, formatValue, formatTime]);
 
   const scrubHapticsRef = useRef(scrubHaptics);
   scrubHapticsRef.current = scrubHaptics;
@@ -1875,37 +2266,45 @@ export function NativeLiveLineChart({
     setScrubTip(null);
   }, []);
 
-  const applyScrubTip = useCallback((hx: number, hv: number, ht: number, op: number) => {
-    if (op <= 0.01) {
-      clearScrubTip();
-      return;
-    }
-    if (scrubHapticsRef.current) {
-      const c = Math.round(hv * 100);
-      const prev = lastScrubHapticCentRef.current;
-      const nowMs = Date.now();
-      if (
-        prev !== null &&
-        prev !== c &&
-        nowMs - lastScrubHapticTsRef.current >= SCRUB_HAPTIC_MIN_INTERVAL_MS
-      ) {
-        scrubCentTickHaptic();
-        lastScrubHapticTsRef.current = nowMs;
+  const applyScrubTip = useCallback(
+    (hx: number, hv: number, ht: number, op: number, candle?: CandlePoint) => {
+      if (op <= 0.01) {
+        clearScrubTip();
+        return;
       }
-      lastScrubHapticCentRef.current = c;
-    }
-    setScrubTip((prev) => {
-      if (
-        prev &&
-        Math.abs(prev.hx - hx) < 0.8 &&
-        Math.abs(prev.hv - hv) < 2e-4 &&
-        Math.abs(prev.ht - ht) < 1e-5
-      ) {
-        return prev;
+      if (scrubHapticsRef.current) {
+        const c = Math.round(hv * 100);
+        const prev = lastScrubHapticCentRef.current;
+        const nowMs = Date.now();
+        if (
+          prev !== null &&
+          prev !== c &&
+          nowMs - lastScrubHapticTsRef.current >= SCRUB_HAPTIC_MIN_INTERVAL_MS
+        ) {
+          scrubCentTickHaptic();
+          lastScrubHapticTsRef.current = nowMs;
+        }
+        lastScrubHapticCentRef.current = c;
       }
-      return { hx, hv, ht };
-    });
-  }, [clearScrubTip]);
+      setScrubTip((prev) => {
+        if (
+          prev &&
+          Math.abs(prev.hx - hx) < 0.8 &&
+          Math.abs(prev.hv - hv) < 2e-4 &&
+          Math.abs(prev.ht - ht) < 1e-5 &&
+          prev.candle?.time === candle?.time &&
+          prev.candle?.open === candle?.open &&
+          prev.candle?.high === candle?.high &&
+          prev.candle?.low === candle?.low &&
+          prev.candle?.close === candle?.close
+        ) {
+          return prev;
+        }
+        return candle ? { hx, hv, ht, candle } : { hx, hv, ht };
+      });
+    },
+    [clearScrubTip],
+  );
 
   // Gestures — scrub pan with optional point snapping, plus optional pinch-to-zoom.
   const gesture = useMemo(() => {
@@ -1915,42 +2314,138 @@ export function NativeLiveLineChart({
       .onBegin((e) => {
         'worklet';
         cancelAnimation(svScrubOp);
-        const sample = sampleScrubAtX(
-          e.x,
-          layout.width,
-          pad,
-          win,
-          buf,
-          svTipT.value,
-          svTipV.value,
-          effectiveData,
-          snapToPointScrubbing,
-        );
-        svScrubX.value = sample.hx;
-        svScrubHv.value = sample.hv;
+        let hx: number;
+        let hv: number;
+        let ht: number;
+        let cand: CandlePoint | undefined;
+        if (isCandle && candleVisibleForLayout.length > 0) {
+          const c = sampleCandleScrubAtX(
+            e.x,
+            layout.width,
+            pad,
+            win,
+            buf,
+            svTipT.value,
+            svTipV.value,
+            candleVisibleForLayout,
+            candleWidthSecs,
+          );
+          const morphT = svLineModeProg.value;
+          if (morphT < 1e-4) {
+            hx = c.hx;
+            hv = c.hv;
+            ht = c.ht;
+            cand = c.candle ?? undefined;
+          } else {
+            const l = sampleScrubAtX(
+              e.x,
+              layout.width,
+              pad,
+              win,
+              buf,
+              svTipT.value,
+              svTipV.value,
+              effectiveData,
+              snapToPointScrubbing,
+            );
+            const b = candleLineMorphScrubBlend(morphT, c, l);
+            hx = b.hx;
+            hv = b.hv;
+            ht = b.ht;
+            cand = b.cand;
+          }
+        } else {
+          const sample = sampleScrubAtX(
+            e.x,
+            layout.width,
+            pad,
+            win,
+            buf,
+            svTipT.value,
+            svTipV.value,
+            effectiveData,
+            snapToPointScrubbing,
+          );
+          hx = sample.hx;
+          hv = sample.hv;
+          ht = sample.ht;
+          cand = undefined;
+        }
+        svScrubX.value = hx;
+        svScrubHv.value = hv;
         svScrubOp.value = withTiming(1, { duration: 90, easing: Easing.out(Easing.quad) });
         runOnJS(onScrubPanBeginHaptic)();
-        runOnJS(applyScrubTip)(sample.hx, sample.hv, sample.ht, 1);
+        runOnJS(applyScrubTip)(hx, hv, ht, 1, cand);
       })
       .onUpdate((e) => {
         'worklet';
-        const sample = sampleScrubAtX(
-          e.x,
-          layout.width,
-          pad,
-          win,
-          buf,
-          svTipT.value,
-          svTipV.value,
-          effectiveData,
-          snapToPointScrubbing,
-        );
-        svScrubX.value = sample.hx;
-        svScrubHv.value = sample.hv;
+        let hx: number;
+        let hv: number;
+        let ht: number;
+        let liveX: number;
+        let cand: CandlePoint | undefined;
+        if (isCandle && candleVisibleForLayout.length > 0) {
+          const c = sampleCandleScrubAtX(
+            e.x,
+            layout.width,
+            pad,
+            win,
+            buf,
+            svTipT.value,
+            svTipV.value,
+            candleVisibleForLayout,
+            candleWidthSecs,
+          );
+          const morphT = svLineModeProg.value;
+          if (morphT < 1e-4) {
+            hx = c.hx;
+            hv = c.hv;
+            ht = c.ht;
+            liveX = c.liveX;
+            cand = c.candle ?? undefined;
+          } else {
+            const l = sampleScrubAtX(
+              e.x,
+              layout.width,
+              pad,
+              win,
+              buf,
+              svTipT.value,
+              svTipV.value,
+              effectiveData,
+              snapToPointScrubbing,
+            );
+            const b = candleLineMorphScrubBlend(morphT, c, l);
+            hx = b.hx;
+            hv = b.hv;
+            ht = b.ht;
+            liveX = b.liveX;
+            cand = b.cand;
+          }
+        } else {
+          const sample = sampleScrubAtX(
+            e.x,
+            layout.width,
+            pad,
+            win,
+            buf,
+            svTipT.value,
+            svTipV.value,
+            effectiveData,
+            snapToPointScrubbing,
+          );
+          hx = sample.hx;
+          hv = sample.hv;
+          ht = sample.ht;
+          liveX = sample.liveX;
+          cand = undefined;
+        }
+        svScrubX.value = hx;
+        svScrubHv.value = hv;
 
         const chartWi = Math.max(1, layout.width - pad.left - pad.right);
         const scrubAmt = svScrubOp.value;
-        const dist = sample.liveX - sample.hx;
+        const dist = liveX - hx;
         const fadeStart = Math.min(80, chartWi * 0.3);
         let op = 0;
         if (dist >= CROSSHAIR_FADE_MIN_PX) {
@@ -1961,16 +2456,16 @@ export function NativeLiveLineChart({
                 scrubAmt;
         }
         const ts = Date.now();
-        const hxD = Math.abs(sample.hx - svScrubJsLastHx.value);
+        const hxD = Math.abs(hx - svScrubJsLastHx.value);
         const opD = Math.abs(op - svScrubJsLastOp.value);
         const dtUi = ts - svScrubJsLastTs.value;
         if (op > 0.01 && dtUi < 30 && hxD < 2.25 && opD < 0.045) {
           return;
         }
         svScrubJsLastTs.value = ts;
-        svScrubJsLastHx.value = sample.hx;
+        svScrubJsLastHx.value = hx;
         svScrubJsLastOp.value = op;
-        runOnJS(applyScrubTip)(sample.hx, sample.hv, sample.ht, op);
+        runOnJS(applyScrubTip)(hx, hv, ht, op, cand);
       })
       .onFinalize(() => {
         svScrubOp.value = withTiming(
@@ -2011,7 +2506,10 @@ export function NativeLiveLineChart({
   }, [
     applyScrubTip,
     buf,
+    candleVisibleForLayout,
+    candleWidthSecs,
     clearScrubTip,
+    isCandle,
     layout.width,
     maxPinchWindow,
     onScrubPanBeginHaptic,
@@ -2031,12 +2529,13 @@ export function NativeLiveLineChart({
     svPinchStartWin,
     svTipT,
     svTipV,
+    svLineModeProg,
     effectiveData,
     win,
   ]);
 
   const scrubTipLayout = useMemo(() => {
-    if (!scrubTip || layout.width < 300) return null;
+    if (!scrubTip || layout.width < 300 || scrubTip.candle) return null;
     const v = formatValue(scrubTip.hv);
     const t = formatTime(scrubTip.ht);
     const sep = '  ·  ';
@@ -2052,6 +2551,32 @@ export function NativeLiveLineChart({
     if (left > maxX) left = maxX;
     return { left, v, t, sep };
   }, [scrubTip, layout.width, formatValue, formatTime, axisNow, win, pad, buf, skiaScrubFlow]);
+
+  /** Liveline-style horizontal O H L C + time while scrubbing a candle. */
+  const candleScrubLayout = useMemo(() => {
+    if (!scrubTip?.candle || layout.width < 200) return null;
+    const c = scrubTip.candle;
+    const charW = 7.05;
+    const sep = '  ·  ';
+    const seg = (lab: string, val: string) => lab.length + val.length + 1;
+    const o = formatValue(c.open);
+    const hi = formatValue(c.high);
+    const lo = formatValue(c.low);
+    const cl = formatValue(c.close);
+    const t = formatTime(c.time);
+    const totalW =
+      (seg('O', o) + seg('H', hi) + seg('L', lo) + seg('C', cl)) * charW +
+      sep.length * charW * 4 +
+      t.length * charW;
+    const liveX = toScreenXJs(axisNow, axisNow, win, layout.width, pad, buf);
+    const dotRight = liveX + 7;
+    let left = scrubTip.hx - totalW / 2;
+    const minX = pad.left + 4;
+    const maxX = dotRight - totalW;
+    if (left < minX) left = minX;
+    if (left > maxX) left = maxX;
+    return { left, candle: c };
+  }, [scrubTip, layout.width, formatValue, formatTime, axisNow, win, pad, buf]);
 
   /* ---- computed ---- */
   const baseY = layout.height - pad.bottom;
@@ -2097,6 +2622,12 @@ export function NativeLiveLineChart({
   const dvRevealLineOp = useDerivedValue(() => {
     return Math.min(1, svReveal.value * 2); // 0→0.5 reveal = 0→1 line
   });
+  /** Candle bodies fade out as line morph (`lineModeProg`) approaches 1. */
+  const dvCandleMorphOp = useDerivedValue(
+    () => dvRevealLineOp.value * (1 - svLineModeProg.value),
+  );
+  /** Tick-density morph line fades in with `lineModeProg`. */
+  const dvMorphLineOverlayOp = useDerivedValue(() => dvRevealLineOp.value * svLineModeProg.value);
   /** Particles: fade in only near full reveal to avoid fighting the line draw. */
   const dvRevealParticleOp = useDerivedValue(() => {
     const rev = svReveal.value;
@@ -2162,6 +2693,59 @@ export function NativeLiveLineChart({
         </View>
       ) : null}
 
+      {(showBuiltInModeToggle && onModeChange) || (showBuiltInMorphToggle && isCandle && onLineModeChange) ? (
+        <View style={[styles.winBarWrap, { marginLeft: pad.left, marginTop: 2, gap: 6 }]}>
+          {showBuiltInModeToggle && onModeChange ? (
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: winBarMetrics.gap }}>
+              <WindowBtn
+                active={!isCandle}
+                label="Line"
+                onPress={() => onModeChange('line')}
+                activeColor={winUi.activeTxt}
+                inactiveColor={winUi.inactiveTxt}
+                borderRadius={winBarMetrics.btnRadius}
+                paddingH={winBarMetrics.padH}
+                paddingV={winBarMetrics.padV}
+              />
+              <WindowBtn
+                active={isCandle}
+                label="Candle"
+                onPress={() => onModeChange('candle')}
+                activeColor={winUi.activeTxt}
+                inactiveColor={winUi.inactiveTxt}
+                borderRadius={winBarMetrics.btnRadius}
+                paddingH={winBarMetrics.padH}
+                paddingV={winBarMetrics.padV}
+              />
+            </View>
+          ) : null}
+          {showBuiltInMorphToggle && isCandle && onLineModeChange ? (
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: winBarMetrics.gap }}>
+              <WindowBtn
+                active={!lineMode}
+                label="Bars"
+                onPress={() => onLineModeChange(false)}
+                activeColor={winUi.activeTxt}
+                inactiveColor={winUi.inactiveTxt}
+                borderRadius={winBarMetrics.btnRadius}
+                paddingH={winBarMetrics.padH}
+                paddingV={winBarMetrics.padV}
+              />
+              <WindowBtn
+                active={lineMode}
+                label="Morph"
+                onPress={() => onLineModeChange(true)}
+                activeColor={winUi.activeTxt}
+                inactiveColor={winUi.inactiveTxt}
+                borderRadius={winBarMetrics.btnRadius}
+                paddingH={winBarMetrics.padH}
+                paddingV={winBarMetrics.padV}
+              />
+            </View>
+          ) : null}
+        </View>
+      ) : null}
+
       <GestureDetector gesture={gesture}>
         <View style={[styles.shell, { backgroundColor: pal.surface }]}>
           <View
@@ -2200,49 +2784,139 @@ export function NativeLiveLineChart({
                     pal={pal}
                   />
 
-                  {/* -- Fill gradient (scrub splits like upstream drawLine) — reveal-gated -- */}
-                  {fill && clipRect ? (
-                    <Group clip={clipRect} opacity={dvRevealLineOp}>
-                      <Group clip={dvClipL}>
-                        <Path path={dvFillPath}>
-                          <LinearGradient
-                            start={vec(0, pad.top)}
-                            end={vec(0, layout.height - pad.bottom)}
-                            colors={[pal.accentFillTop, pal.accentFillBottom]}
-                          />
-                        </Path>
-                      </Group>
-                      <Group clip={dvClipR} opacity={dvRightSegOp}>
-                        <Path path={dvFillPath}>
-                          <LinearGradient
-                            start={vec(0, pad.top)}
-                            end={vec(0, layout.height - pad.bottom)}
-                            colors={[pal.accentFillTop, pal.accentFillBottom]}
-                          />
-                        </Path>
-                      </Group>
-                    </Group>
+                  {/* ========== LINE MODE ========== */}
+                  {!isCandle ? (
+                    <>
+                      {/* -- Fill gradient (scrub splits like upstream drawLine) — reveal-gated -- */}
+                      {fill && clipRect ? (
+                        <Group clip={clipRect} opacity={dvRevealLineOp}>
+                          <Group clip={dvClipL}>
+                            <Path path={dvFillPath}>
+                              <LinearGradient
+                                start={vec(0, pad.top)}
+                                end={vec(0, layout.height - pad.bottom)}
+                                colors={[pal.accentFillTop, pal.accentFillBottom]}
+                              />
+                            </Path>
+                          </Group>
+                          <Group clip={dvClipR} opacity={dvRightSegOp}>
+                            <Path path={dvFillPath}>
+                              <LinearGradient
+                                start={vec(0, pad.top)}
+                                end={vec(0, layout.height - pad.bottom)}
+                                colors={[pal.accentFillTop, pal.accentFillBottom]}
+                              />
+                            </Path>
+                          </Group>
+                        </Group>
+                      ) : null}
+
+                      <LinePathLayer
+                        clipRect={clipRect}
+                        leftClip={dvClipL}
+                        rightClip={dvClipR}
+                        rightOpacity={dvRightSegOp}
+                        revealOpacity={dvRevealLineOp}
+                        path={dvLinePath}
+                        layoutHeight={layout.height}
+                        padTop={pad.top}
+                        padRight={pad.right}
+                        layoutWidth={layout.width}
+                        lineWidth={pal.lineWidth}
+                        lineColor={dvLineColor}
+                        trailGlow={lineTrailGlow}
+                        trailGlowColor={pal.accentGlow}
+                        gradientLineColoring={gradientLineColoring}
+                        gradientStartColor={pal.gridLabel}
+                        gradientEndColor={pal.accent}
+                      />
+                    </>
                   ) : null}
 
-                  <LinePathLayer
-                    clipRect={clipRect}
-                    leftClip={dvClipL}
-                    rightClip={dvClipR}
-                    rightOpacity={dvRightSegOp}
-                    revealOpacity={dvRevealLineOp}
-                    path={dvLinePath}
-                    layoutHeight={layout.height}
-                    padTop={pad.top}
-                    padRight={pad.right}
-                    layoutWidth={layout.width}
-                    lineWidth={pal.lineWidth}
-                    lineColor={dvLineColor}
-                    trailGlow={lineTrailGlow}
-                    trailGlowColor={pal.accentGlow}
-                    gradientLineColoring={gradientLineColoring}
-                    gradientStartColor={pal.gridLabel}
-                    gradientEndColor={pal.accent}
-                  />
+                  {/* ========== CANDLE MODE (+ line morph overlay) ========== */}
+                  {isCandle ? (
+                    <>
+                      <Group opacity={dvCandleMorphOp}>
+                        {candleLayouts.map((row) => (
+                          <Group key={row.c.time}>
+                            {row.bodyTop - row.yHigh > 0.5 ? (
+                              <SkiaLine
+                                p1={vec(row.cx, row.bodyTop)}
+                                p2={vec(row.cx, row.yHigh)}
+                                style="stroke"
+                                strokeWidth={row.wickW}
+                                color={row.fill}
+                                strokeCap="round"
+                              />
+                            ) : null}
+                            {row.yLow - row.bodyBottom > 0.5 ? (
+                              <SkiaLine
+                                p1={vec(row.cx, row.bodyBottom)}
+                                p2={vec(row.cx, row.yLow)}
+                                style="stroke"
+                                strokeWidth={row.wickW}
+                                color={row.fill}
+                                strokeCap="round"
+                              />
+                            ) : null}
+                            {row.isLive ? (
+                              <Group>
+                                <RoundedRect
+                                  x={row.cx - row.halfBody - 2}
+                                  y={row.bodyTop - 2}
+                                  width={row.bodyW + 4}
+                                  height={row.bodyH + 4}
+                                  r={row.radius + 1}
+                                  color={row.fill}
+                                  opacity={0.15}
+                                >
+                                  <Shadow dx={0} dy={0} blur={10} color={row.fill} />
+                                </RoundedRect>
+                                <RoundedRect
+                                  x={row.cx - row.halfBody}
+                                  y={row.bodyTop}
+                                  width={row.bodyW}
+                                  height={row.bodyH}
+                                  r={row.radius}
+                                  color={row.fill}
+                                />
+                              </Group>
+                            ) : (
+                              <RoundedRect
+                                x={row.cx - row.halfBody}
+                                y={row.bodyTop}
+                                width={row.bodyW}
+                                height={row.bodyH}
+                                r={row.radius}
+                                color={row.fill}
+                              />
+                            )}
+                          </Group>
+                        ))}
+                      </Group>
+                      <Group opacity={dvMorphLineOverlayOp}>
+                        <LinePathLayer
+                          clipRect={clipRect}
+                          leftClip={dvClipL}
+                          rightClip={dvClipR}
+                          rightOpacity={dvRightSegOp}
+                          revealOpacity={1}
+                          path={dvMorphLinePath}
+                          layoutHeight={layout.height}
+                          padTop={pad.top}
+                          padRight={pad.right}
+                          layoutWidth={layout.width}
+                          lineWidth={pal.lineWidth}
+                          lineColor={dvLineColor}
+                          trailGlow={lineTrailGlow}
+                          trailGlowColor={pal.accentGlow}
+                          gradientLineColoring={gradientLineColoring}
+                          gradientStartColor={pal.gridLabel}
+                          gradientEndColor={pal.accent}
+                        />
+                      </Group>
+                    </>
+                  ) : null}
 
                   {referenceLine ? (
                     <ReferenceLineCanvas
@@ -2261,66 +2935,70 @@ export function NativeLiveLineChart({
                     <SkiaLine
                       p1={dvDashP1}
                       p2={dvDashP2}
-                      color={pal.dashLine}
+                      color={isCandle ? candleBadgeDashColor : pal.dashLine}
                       strokeWidth={1}
                     >
                       <DashPathEffect intervals={[4, 4]} />
                     </SkiaLine>
                   </Group>
 
-                  <ParticlesLayer
-                    enabled={degenEnabled}
-                    particles={particles}
-                    burstLife={svBurstLife}
-                    opacity={dvRevealParticleOp}
-                  />
-
-                  {/* -- Pulse ring — reveal-gated (only after 60%) -- */}
-                  {pulse ? (
-                    <Circle
-                      cx={dvLiveX}
-                      cy={dvLiveY}
-                      r={dvRingR}
-                      color={pal.accent}
-                      style="stroke"
-                      strokeWidth={1.5}
-                      opacity={dvRingOp}
-                    />
-                  ) : null}
-
-                  <LiveDotLayer
-                    revealOpacity={dvRevealDotOp}
-                    liveX={dvLiveX}
-                    liveY={dvLiveY}
-                    glowEnabled={liveDotGlow}
-                    glowColor={liveGlowColor}
-                    outerColor={pal.badgeOuterBg}
-                    outerShadow={pal.badgeOuterShadow}
-                    innerColor={pal.accent}
-                  />
-
-                  {/* -- Momentum chevrons (upstream drawArrows cascade) — reveal-gated -- */}
-                  {momProp ? (
-                    <Group opacity={dvRevealArrowOp}>
-                      <Path
-                        path={dvChev0Path}
-                        style="stroke"
-                        strokeWidth={2.5}
-                        strokeJoin="round"
-                        strokeCap="round"
-                        color={pal.gridLabel}
-                        opacity={dvChev0Op}
+                  {!isCandle ? (
+                    <>
+                      <ParticlesLayer
+                        enabled={degenEnabled}
+                        particles={particles}
+                        burstLife={svBurstLife}
+                        opacity={dvRevealParticleOp}
                       />
-                      <Path
-                        path={dvChev1Path}
-                        style="stroke"
-                        strokeWidth={2.5}
-                        strokeJoin="round"
-                        strokeCap="round"
-                        color={pal.gridLabel}
-                        opacity={dvChev1Op}
+
+                      {/* -- Pulse ring — reveal-gated (only after 60%) -- */}
+                      {pulse ? (
+                        <Circle
+                          cx={dvLiveX}
+                          cy={dvLiveY}
+                          r={dvRingR}
+                          color={pal.accent}
+                          style="stroke"
+                          strokeWidth={1.5}
+                          opacity={dvRingOp}
+                        />
+                      ) : null}
+
+                      <LiveDotLayer
+                        revealOpacity={dvRevealDotOp}
+                        liveX={dvLiveX}
+                        liveY={dvLiveY}
+                        glowEnabled={liveDotGlow}
+                        glowColor={liveGlowColor}
+                        outerColor={pal.badgeOuterBg}
+                        outerShadow={pal.badgeOuterShadow}
+                        innerColor={pal.accent}
                       />
-                    </Group>
+
+                      {/* -- Momentum chevrons (upstream drawArrows cascade) — reveal-gated -- */}
+                      {momProp ? (
+                        <Group opacity={dvRevealArrowOp}>
+                          <Path
+                            path={dvChev0Path}
+                            style="stroke"
+                            strokeWidth={2.5}
+                            strokeJoin="round"
+                            strokeCap="round"
+                            color={pal.gridLabel}
+                            opacity={dvChev0Op}
+                          />
+                          <Path
+                            path={dvChev1Path}
+                            style="stroke"
+                            strokeWidth={2.5}
+                            strokeJoin="round"
+                            strokeCap="round"
+                            color={pal.gridLabel}
+                            opacity={dvChev1Op}
+                          />
+                        </Group>
+                      ) : null}
+                    </>
                   ) : null}
 
                   {/* -- Left edge fade: destination-out gradient (matches upstream) -- */}
@@ -2353,18 +3031,31 @@ export function NativeLiveLineChart({
                 </Canvas>
                 </Animated.View>
 
-                <ScrubTooltip
-                  layout={scrub && scrubTipLayout ? scrubTipLayout : null}
-                  top={pad.top + tooltipY + 10}
-                  opacity={svScrubOp}
-                  tooltipOutline={tooltipOutline}
-                  skiaScrubFlow={skiaScrubFlow}
-                  scrubFlowA11yLabel={scrubFlowA11yLabel}
-                  scrubTipFont={scrubTipFont}
-                  scrubValue={dvScrubValueStr}
-                  pal={pal}
-                  textStyle={styles.scrubTipText}
-                />
+                {scrub && candleScrubLayout ? (
+                  <CandleScrubOHLCTooltip
+                    layout={candleScrubLayout}
+                    top={pad.top + tooltipY + 10}
+                    opacity={svScrubOp}
+                    formatValue={formatValue}
+                    formatTime={formatTime}
+                    pal={pal}
+                    textStyle={styles.scrubTipText}
+                    tooltipOutline={tooltipOutline}
+                  />
+                ) : (
+                  <ScrubTooltip
+                    layout={scrub && scrubTipLayout ? scrubTipLayout : null}
+                    top={pad.top + tooltipY + 10}
+                    opacity={svScrubOp}
+                    tooltipOutline={tooltipOutline}
+                    skiaScrubFlow={skiaScrubFlow}
+                    scrubFlowA11yLabel={scrubFlowA11yLabel}
+                    scrubTipFont={scrubTipFont}
+                    scrubValue={dvScrubValueStr}
+                    pal={pal}
+                    textStyle={styles.scrubTipText}
+                  />
+                )}
 
                 <AxisLabels
                   grid={grid}
@@ -2410,6 +3101,26 @@ export function NativeLiveLineChart({
                   pal={pal}
                   badgeTextStyle={styles.badgeTxt}
                 />
+
+                {orderbookProp ? (
+                  <View
+                    pointerEvents="none"
+                    collapsable={false}
+                    style={[StyleSheet.absoluteFill, { zIndex: 40, elevation: 40 }]}
+                  >
+                    <OrderbookStreamOverlay
+                      orderbook={orderbookProp}
+                      layoutWidth={layout.width}
+                      layoutHeight={layout.height}
+                      pad={pad}
+                      paused={paused}
+                      empty={empty}
+                      momUi={momUi}
+                      swingMag={swMag}
+                      font={orderbookStreamFont}
+                    />
+                  </View>
+                ) : null}
               </>
             )}
           </View>
@@ -2446,7 +3157,7 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '400',
   },
-  badgeTxt: { fontFamily: mono, fontSize: 11, fontWeight: '500' },
+  badgeTxt: { fontFamily: mono, fontSize: 12, fontWeight: '600', letterSpacing: 0.15 },
   referenceLabel: { fontFamily: mono, fontSize: 11, fontWeight: '500' },
   yLabel: { position: 'absolute', fontSize: 11, fontWeight: '400', fontFamily: mono },
   tLabel: { position: 'absolute', fontSize: 11, fontWeight: '400', fontFamily: mono, textAlign: 'center' },

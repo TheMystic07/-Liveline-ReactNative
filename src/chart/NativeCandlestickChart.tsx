@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import {
   Canvas,
@@ -6,6 +6,8 @@ import {
   DashPathEffect,
   Group,
   Line as SkiaLine,
+  LinearGradient,
+  Rect,
   RoundedRect,
   Shadow,
   vec,
@@ -13,10 +15,12 @@ import {
 import { useSkiaFont } from 'number-flow-react-native/skia';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
+  cancelAnimation,
   Easing,
   runOnJS,
   useAnimatedStyle,
   useSharedValue,
+  withRepeat,
   withTiming,
 } from 'react-native-reanimated';
 
@@ -24,6 +28,7 @@ import { BADGE_NUMBER_FLOW_FONT_SRC } from './BadgeSkiaNumberFlow';
 import { supportsTwoDecimalNumberFlow } from './chartNumberFlow';
 import {
   BADGE_LINE_H,
+  BADGE_PAD_X,
   BADGE_PAD_Y,
   BADGE_TAIL_LEN,
   BADGE_TAIL_SPREAD,
@@ -32,8 +37,8 @@ import {
 import {
   inferCandleWidthSecs,
   layoutLivelineCandles,
-  LIVELINE_CANDLE_BEAR,
   LIVELINE_CANDLE_BULL,
+  LIVELINE_CANDLE_BEAR,
 } from './draw/livelineCandlestick';
 import { parseColorRgb, resolvePalette } from './theme';
 import { GridCanvas } from './render/GridCanvas';
@@ -53,6 +58,23 @@ import {
   toScreenXJs,
   toScreenYJs,
 } from './nativeChartUtils';
+
+/* ------------------------------------------------------------------ */
+/*  Constants — matching upstream / NativeLiveLineChart                 */
+/* ------------------------------------------------------------------ */
+
+/** Matches upstream `WINDOW_BUFFER` / `WINDOW_BUFFER_NO_BADGE`. */
+const WINDOW_BUFFER_BADGE = 0.05;
+const WINDOW_BUFFER_NO_BADGE = 0.015;
+const FADE_EDGE_WIDTH = 40;
+
+function windowBuffer(showBadge: boolean) {
+  return showBadge ? WINDOW_BUFFER_BADGE : WINDOW_BUFFER_NO_BADGE;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Helpers                                                            */
+/* ------------------------------------------------------------------ */
 
 function mergeCandles(history: CandlePoint[] | undefined, live?: CandlePoint): CandlePoint[] {
   const map = new Map<number, CandlePoint>();
@@ -89,7 +111,6 @@ function candleYRange(candles: CandlePoint[], referenceValue?: number) {
   return { min: min - margin, max: max + margin };
 }
 
-const BADGE_PILL_BODY_W = 78;
 const mono = Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' });
 
 function nearestCandle(candles: CandlePoint[], t: number): CandlePoint | null {
@@ -106,6 +127,31 @@ function nearestCandle(candles: CandlePoint[], t: number): CandlePoint | null {
   }
   return best;
 }
+
+/* ------------------------------------------------------------------ */
+/*  Live candle glow pulse (matching upstream livePulse)                */
+/* ------------------------------------------------------------------ */
+
+function useLivePulse() {
+  const pulse = useSharedValue(0.12);
+  useEffect(() => {
+    pulse.value = 0.12;
+    pulse.value = withRepeat(
+      withTiming(0.2, { duration: 520, easing: Easing.inOut(Easing.sin) }),
+      -1,
+      true,
+    );
+    return () => {
+      cancelAnimation(pulse);
+      pulse.value = 0.12;
+    };
+  }, [pulse]);
+  return pulse;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Component                                                          */
+/* ------------------------------------------------------------------ */
 
 export function NativeCandlestickChart({
   candles: candlesProp,
@@ -142,6 +188,12 @@ export function NativeCandlestickChart({
   const [scrubX, setScrubX] = useState<number | null>(null);
   const [pinchWindow, setPinchWindow] = useState<number | null>(null);
 
+  /** Badge-aware window buffer — matches NativeLiveLineChart. */
+  const buf = windowBuffer(badge);
+
+  /** Live candle pulse glow — matches upstream `livePulse = 0.12 + sin(now*0.004)*0.08`. */
+  const livePulse = useLivePulse();
+
   const resolvedWin = useMemo(() => {
     if (!windows?.length) return controlledWin;
     if (windows.some((entry) => entry.secs === controlledWin)) return controlledWin;
@@ -162,7 +214,8 @@ export function NativeCandlestickChart({
   const merged = useMemo(() => mergeCandles(candlesProp, liveCandle), [candlesProp, liveCandle]);
 
   const latestTime = merged.length ? merged[merged.length - 1].time : 0;
-  const rightEdge = latestTime + activeWindow * 0.015;
+  /** Right/left edges — badge-aware buffer so candles don't overlap badge. */
+  const rightEdge = latestTime + activeWindow * buf;
   const leftEdge = rightEdge - activeWindow;
 
   const visible = useMemo(
@@ -245,14 +298,21 @@ export function NativeCandlestickChart({
   }, [badgeFillColor]);
 
   const pillH = BADGE_LINE_H + BADGE_PAD_Y * 2;
+
+  /* ---- Badge pill width (dynamic, matching liveline) ---- */
+  const [badgeMeasuredTextW, setBadgeMeasuredTextW] = useState(28);
+  const badgePillW = useMemo(() => {
+    return Math.max(40, badgeMeasuredTextW + BADGE_PAD_X * 2);
+  }, [badgeMeasuredTextW]);
+
   const badgeBgPath = useMemo(
-    () => badgeSvgPath(BADGE_PILL_BODY_W, pillH, BADGE_TAIL_LEN, BADGE_TAIL_SPREAD),
-    [pillH],
+    () => badgeSvgPath(badgePillW, pillH, BADGE_TAIL_LEN, BADGE_TAIL_SPREAD),
+    [pillH, badgePillW],
   );
   const badgeInnerPath = useMemo(
     () =>
-      badgeSvgPath(BADGE_PILL_BODY_W - 4, pillH - 4, BADGE_TAIL_LEN - 1, BADGE_TAIL_SPREAD - 0.5),
-    [pillH],
+      badgeSvgPath(badgePillW - 4, pillH - 4, BADGE_TAIL_LEN - 1, BADGE_TAIL_SPREAD - 0.5),
+    [pillH, badgePillW],
   );
   const badgeInnerRgb = useMemo(() => {
     const [r, g, b] = parseColorRgb(badgeFillColor);
@@ -262,8 +322,15 @@ export function NativeCandlestickChart({
   const svBadgeLiveX = useSharedValue(0);
   const svBadgeLiveY = useSharedValue(0);
   const svBadgeValue = useSharedValue(0);
+  const svScrubDim = useSharedValue(0);
+  /** Track whether badge position was initialized so we can skip the animation on first place. */
+  const badgeInitRef = useRef(false);
+
   useEffect(() => {
-    if (!tipCandle || empty) return;
+    if (!tipCandle || empty) {
+      badgeInitRef.current = false;
+      return;
+    }
     const cx = toScreenXJs(
       tipCandle.time + candleWidthSecs / 2,
       leftEdge,
@@ -272,8 +339,16 @@ export function NativeCandlestickChart({
       pad,
     );
     const cy = toScreenYJs(tipCandle.close, range.min, range.max, layout.height, pad);
-    svBadgeLiveX.value = withTiming(cx, { duration: 110, easing: Easing.out(Easing.quad) });
-    svBadgeLiveY.value = withTiming(cy, { duration: 110, easing: Easing.out(Easing.quad) });
+
+    if (!badgeInitRef.current) {
+      // First placement — snap immediately (no animation from 0,0)
+      badgeInitRef.current = true;
+      svBadgeLiveX.value = cx;
+      svBadgeLiveY.value = cy;
+    } else {
+      svBadgeLiveX.value = withTiming(cx, { duration: 110, easing: Easing.out(Easing.quad) });
+      svBadgeLiveY.value = withTiming(cy, { duration: 110, easing: Easing.out(Easing.quad) });
+    }
   }, [
     tipCandle,
     empty,
@@ -307,21 +382,36 @@ export function NativeCandlestickChart({
       ? toScreenYJs(tipCandle.close, range.min, range.max, layout.height, pad)
       : 0;
 
+  /** Badge animated style — dims during scrub, matches liveline. */
   const asBadge = useAnimatedStyle(() => {
-    const totalW = BADGE_TAIL_LEN + BADGE_PILL_BODY_W;
+    const totalW = BADGE_TAIL_LEN + badgePillW;
+    const badgeX = Math.max(pad.left + 4, layout.width - totalW - 18);
+    const badgeY = Math.min(
+      Math.max(svBadgeLiveY.value - pillH / 2, pad.top + 4),
+      layout.height - pad.bottom - pillH - 4,
+    );
+    const scrubDim = svScrubDim.value;
+    const baseOp = badge ? (1 - scrubDim) : 0;
     return {
-      opacity: 1,
+      opacity: baseOp,
       width: totalW,
+      height: pillH + 10,
       transform: [
-        { translateX: svBadgeLiveX.value - totalW / 2 - BADGE_TAIL_LEN },
-        { translateY: svBadgeLiveY.value - pillH - 12 },
+        { translateX: badgeX },
+        { translateY: badgeY },
       ],
     };
   });
   const asBadgeTextWrap = useAnimatedStyle(() => ({
-    width: Math.max(8, BADGE_PILL_BODY_W - BADGE_TAIL_LEN),
+    width: Math.max(8, badgePillW - BADGE_TAIL_LEN),
   }));
-  const noopBadgeLayout = useCallback(() => {}, []);
+
+  const onBadgeTemplateLayout = useCallback(
+    (e: { nativeEvent: { layout: { width: number } } }) => {
+      setBadgeMeasuredTextW(e.nativeEvent.layout.width);
+    },
+    [],
+  );
 
   const scrubInfo = useMemo(() => {
     if (scrubX == null || chartWidth <= 0 || visible.length === 0) return null;
@@ -354,6 +444,15 @@ export function NativeCandlestickChart({
     visible,
   ]);
 
+  /** Track scrub dimming shared value for badge opacity. */
+  useEffect(() => {
+    if (scrubX != null) {
+      svScrubDim.value = withTiming(1, { duration: 90, easing: Easing.out(Easing.quad) });
+    } else {
+      svScrubDim.value = withTiming(0, { duration: 120, easing: Easing.out(Easing.quad) });
+    }
+  }, [scrubX, svScrubDim]);
+
   const gesture = useMemo(() => {
     const pan = Gesture.Pan()
       .enabled(scrub)
@@ -374,6 +473,9 @@ export function NativeCandlestickChart({
 
     return Gesture.Simultaneous(pan, pinch);
   }, [pinchToZoom, resolvedWin, scrub]);
+
+  /** Dash line dimming during scrub — matches liveline. */
+  const dashLineOpacity = scrubX != null ? 0.8 : 1;
 
   return (
     <View style={[styles.root, { height }, style]}>
@@ -440,6 +542,7 @@ export function NativeCandlestickChart({
                   <Group>
                     {candleLayouts.map((row) => (
                       <Group key={row.c.time}>
+                        {/* Upper wick */}
                         {row.bodyTop - row.yHigh > 0.5 ? (
                           <SkiaLine
                             p1={vec(row.cx, row.bodyTop)}
@@ -450,6 +553,7 @@ export function NativeCandlestickChart({
                             strokeCap="round"
                           />
                         ) : null}
+                        {/* Lower wick */}
                         {row.yLow - row.bodyBottom > 0.5 ? (
                           <SkiaLine
                             p1={vec(row.cx, row.bodyBottom)}
@@ -460,19 +564,22 @@ export function NativeCandlestickChart({
                             strokeCap="round"
                           />
                         ) : null}
+                        {/* Body — live candle gets animated pulse glow */}
                         {row.isLive ? (
                           <Group>
+                            {/* Pulse glow layer — upstream: opacity cycles with sin wave */}
                             <RoundedRect
-                              x={row.cx - row.halfBody}
-                              y={row.bodyTop}
-                              width={row.bodyW}
-                              height={row.bodyH}
-                              r={row.radius}
+                              x={row.cx - row.halfBody - 2}
+                              y={row.bodyTop - 2}
+                              width={row.bodyW + 4}
+                              height={row.bodyH + 4}
+                              r={row.radius + 1}
                               color={row.fill}
-                              opacity={0.22}
+                              opacity={livePulse}
                             >
-                              <Shadow dx={0} dy={0} blur={8} color={row.fill} />
+                              <Shadow dx={0} dy={0} blur={10} color={row.fill} />
                             </RoundedRect>
+                            {/* Solid body */}
                             <RoundedRect
                               x={row.cx - row.halfBody}
                               y={row.bodyTop}
@@ -496,16 +603,35 @@ export function NativeCandlestickChart({
                     ))}
                   </Group>
 
+                  {/* Dashed close-price line */}
                   {badge && tipCandle && !empty ? (
-                    <SkiaLine
-                      p1={vec(pad.left, badgeDashY)}
-                      p2={vec(layout.width - pad.right, badgeDashY)}
-                      color={badgeDashColor}
-                      strokeWidth={1}
-                    >
-                      <DashPathEffect intervals={[4, 4]} />
-                    </SkiaLine>
+                    <Group opacity={dashLineOpacity}>
+                      <SkiaLine
+                        p1={vec(pad.left, badgeDashY)}
+                        p2={vec(layout.width - pad.right, badgeDashY)}
+                        color={badgeDashColor}
+                        strokeWidth={1}
+                      >
+                        <DashPathEffect intervals={[4, 4]} />
+                      </SkiaLine>
+                    </Group>
                   ) : null}
+
+                  {/* -- Left edge fade: destination-out gradient (matches liveline) -- */}
+                  <Group blendMode="dstOut">
+                    <Rect
+                      x={0}
+                      y={0}
+                      width={pad.left + FADE_EDGE_WIDTH}
+                      height={layout.height}
+                    >
+                      <LinearGradient
+                        start={vec(pad.left, 0)}
+                        end={vec(pad.left + FADE_EDGE_WIDTH, 0)}
+                        colors={['rgba(0,0,0,1)', 'rgba(0,0,0,0)']}
+                      />
+                    </Rect>
+                  </Group>
 
                   {scrubInfo ? (
                     <>
@@ -585,7 +711,7 @@ export function NativeCandlestickChart({
                     badgeFlowA11yLabel={badgeStr}
                     badgeNumFont={badgeNumFont}
                     badgeValue={svBadgeValue}
-                    flowPillW={BADGE_PILL_BODY_W}
+                    flowPillW={badgePillW}
                     badgeStr={badgeStr}
                     badgeStyle={asBadge}
                     badgeTextWrapStyle={asBadgeTextWrap}
@@ -593,7 +719,7 @@ export function NativeCandlestickChart({
                     innerPath={badgeInnerPath}
                     innerColor={badgeInnerRgb}
                     pillH={pillH}
-                    onBadgeTemplateLayout={noopBadgeLayout}
+                    onBadgeTemplateLayout={onBadgeTemplateLayout}
                     pal={palette}
                     badgeTextStyle={styles.badgeTxt}
                   />
@@ -606,6 +732,10 @@ export function NativeCandlestickChart({
     </View>
   );
 }
+
+/* ------------------------------------------------------------------ */
+/*  Sub-components                                                     */
+/* ------------------------------------------------------------------ */
 
 function ControlPill({
   active,
@@ -633,6 +763,10 @@ function ControlPill({
     </Pressable>
   );
 }
+
+/* ------------------------------------------------------------------ */
+/*  Styles                                                             */
+/* ------------------------------------------------------------------ */
 
 const styles = StyleSheet.create({
   root: { gap: 6 },

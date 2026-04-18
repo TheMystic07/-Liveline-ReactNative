@@ -21,12 +21,14 @@ export function Chip({
   active,
   label,
   onPress,
+  disabled = false,
   theme = 'dark',
   accent = '#3b82f6',
 }: {
   active: boolean;
   label: string;
   onPress: () => void;
+  disabled?: boolean;
   theme?: 'dark' | 'light';
   accent?: string;
 }) {
@@ -39,6 +41,7 @@ export function Chip({
 
   return (
     <Pressable
+      disabled={disabled}
       onPress={onPress}
       style={({ pressed }) => [
         styles.chip,
@@ -53,6 +56,7 @@ export function Chip({
               borderColor: activeBorder,
             }
           : null,
+        disabled && styles.chipDisabled,
         pressed && styles.chipPressed,
       ]}
     >
@@ -62,6 +66,7 @@ export function Chip({
           { color: baseText },
           active && styles.chipLabelActive,
           active ? { color: accent } : null,
+          disabled && styles.chipLabelDisabled,
         ]}
       >
         {label}
@@ -103,10 +108,16 @@ const styles = StyleSheet.create({
   chipPressed: {
     opacity: 0.85,
   },
+  chipDisabled: {
+    opacity: 0.35,
+  },
   chipLabel: {
     fontSize: 11,
     fontWeight: '500',
   },
   chipLabelActive: {
+  },
+  chipLabelDisabled: {
+    color: 'rgba(255,255,255,0.3)',
   },
 });

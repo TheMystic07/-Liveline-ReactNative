@@ -2,18 +2,15 @@ import { Platform, StyleSheet, Text, View } from 'react-native';
 
 import { resolvePalette } from './theme';
 import { NativeLiveLineChart } from './NativeLiveLineChart';
-import { NativeCandlestickChart } from './NativeCandlestickChart';
 import { NativeMultiSeriesChart } from './NativeMultiSeriesChart';
 import type { LiveLineChartProps } from './types';
 
 export function LiveLineChart(props: LiveLineChartProps) {
   if (Platform.OS !== 'web') {
-    if (props.mode === 'candle') {
-      return <NativeCandlestickChart {...props} />;
-    }
     if (props.series && props.series.length > 0) {
       return <NativeMultiSeriesChart {...props} />;
     }
+    // NativeLiveLineChart handles both line and candle modes via its animation engine
     return <NativeLiveLineChart {...props} />;
   }
 

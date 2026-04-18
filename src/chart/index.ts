@@ -14,6 +14,8 @@ export type {
   HoverPoint,
   LiveLineSeries,
   CandlePoint,
+  LiveOrderbookSnapshot,
+  OrderbookPriceSize,
 } from './types';
 export { LivelineTransition } from './LivelineTransition';
 export type { LivelineTransitionProps } from './LivelineTransition';

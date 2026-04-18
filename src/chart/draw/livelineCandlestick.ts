@@ -8,6 +8,18 @@ import { toScreenXJs, toScreenYJs } from '../nativeChartUtils';
 export const LIVELINE_CANDLE_BULL = '#22c55e';
 export const LIVELINE_CANDLE_BEAR = '#ef4444';
 
+/** Collapse OHLC toward close for line↔candle morph (`inv` = residual candle strength, 0 = flat line). */
+export function collapseCandleOHLC(c: CandlePoint, inv: number): CandlePoint {
+  if (inv >= 0.99) return c;
+  return {
+    time: c.time,
+    open: c.close + (c.open - c.close) * inv,
+    high: c.close + (c.high - c.close) * inv,
+    low: c.close + (c.low - c.close) * inv,
+    close: c.close,
+  };
+}
+
 export function inferCandleWidthSecs(visible: CandlePoint[], windowSpanSecs: number): number {
   if (visible.length >= 2) {
     const gaps: number[] = [];
@@ -31,9 +43,9 @@ export function candleDimsFromLayout(
 ): { bodyW: number; wickW: number; radius: number } {
   const pxPerSec = chartWidthPx / Math.max(1e-9, windowSpanSecs);
   const candlePxW = candleWidthSecs * pxPerSec;
-  const bodyW = Math.max(1, candlePxW * 0.7);
-  const wickW = Math.max(0.8, Math.min(2, bodyW * 0.15));
-  const radius = bodyW > 6 ? 1.5 : 0;
+  const bodyW = Math.max(4, candlePxW * 0.7);
+  const wickW = Math.max(1.2, Math.min(2.5, bodyW * 0.18));
+  const radius = bodyW > 4 ? Math.min(2, bodyW * 0.15) : 0;
   return { bodyW, wickW, radius };
 }
 
@@ -94,7 +106,7 @@ export function layoutLivelineCandles(
     const yClose = toScreenYJs(c.close, rangeMin, rangeMax, layoutHeight, pad);
     const bodyTop = Math.min(yOpen, yClose);
     const bodyBottom = Math.max(yOpen, yClose);
-    const bodyH = Math.max(1, bodyBottom - bodyTop);
+    const bodyH = Math.max(2, bodyBottom - bodyTop);
     const bullish = c.close >= c.open;
     const isLive = liveCandleTime >= 0 && c.time === liveCandleTime;
     const fill = bullish ? LIVELINE_CANDLE_BULL : LIVELINE_CANDLE_BEAR;

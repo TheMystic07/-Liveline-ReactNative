@@ -51,6 +51,29 @@ export interface CandlePoint {
   close: number;
 }
 
+/** One orderbook level: `[price, size]`. */
+export type OrderbookPriceSize = readonly [price: number, size: number];
+
+/** Snapshot of bids and asks for the Kalshi-style stream (sizes float upward behind the line). */
+export interface LiveOrderbookSnapshot {
+  bids: readonly OrderbookPriceSize[];
+  asks: readonly OrderbookPriceSize[];
+}
+
+/** Single drifting label for internal stream rendering (`size` drives SkiaNumberFlow value mode). */
+export interface OrderbookStreamLabel {
+  id: number;
+  x: number;
+  y: number;
+  /** Raw level size for SkiaNumberFlow `value` (avoids shared/scrubbing path inside Canvas). */
+  size: number;
+  rgb: readonly [number, number, number];
+  baseAlpha: number;
+  /** Row opacity 0–1 (fade in / drift out). */
+  opacity: number;
+  lastTs: number;
+}
+
 export interface ChartPadding {
   top: number;
   right: number;
@@ -183,10 +206,24 @@ export interface LiveLineChartProps {
    */
   candleWidth?: number;
   liveCandle?: CandlePoint;
+  /** When `mode === 'candle'`, morph toward a tick-density line (upstream `lineMode`). */
   lineMode?: boolean;
+  /** Optional tick stream for the morph line (defaults to `data`). */
   lineData?: LiveLinePoint[];
+  /** Live tick value for morph line tip (defaults to `value`). */
   lineValue?: number;
   onModeChange?: (mode: 'line' | 'candle') => void;
+  onLineModeChange?: (lineMode: boolean) => void;
+  /** Renders Line / Candle pills above the chart (calls `onModeChange`). */
+  showBuiltInModeToggle?: boolean;
+  /** When `mode === 'candle'`, renders Bars / Morph pills (calls `onLineModeChange`). */
+  showBuiltInMorphToggle?: boolean;
+  /**
+   * Optional orderbook: bid/ask levels as `[price, size]` tuples. When set, a Liveline-style
+   * stream of `+size` labels drifts upward behind the series (green bids, red asks); speed reacts
+   * to chart momentum and to how fast total bid/ask depth is changing.
+   */
+  orderbook?: LiveOrderbookSnapshot;
   onSeriesToggle?: (id: string, visible: boolean) => void;
   seriesToggleCompact?: boolean;
   /**

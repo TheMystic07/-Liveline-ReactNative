@@ -35,10 +35,10 @@ export function BadgeSkiaNumberFlow({
   pillBodyWidth,
 }: BadgeSkiaNumberFlowProps) {
   const dvStr = useDerivedValue(() => formatPriceCentsWorklet(svTipV.value));
-  const innerPad = 4;
-  const textW = Math.max(8, pillBodyWidth - BADGE_TAIL_LEN - innerPad * 2);
+  const innerPad = 6;
+  const textW = Math.max(12, pillBodyWidth - BADGE_TAIL_LEN - innerPad * 2);
   const x = BADGE_TAIL_LEN + innerPad;
-  const y = pillH * 0.72;
+  const y = pillH * 0.74;
 
   return (
     <SkiaNumberFlow
