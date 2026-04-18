@@ -12,11 +12,12 @@ import {
   Rect,
   Shadow,
   rect,
-  useClock,
   vec,
 } from '@shopify/react-native-skia';
+import { useSkiaFont } from 'number-flow-react-native/skia';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
+  cancelAnimation,
   Easing,
   runOnJS,
   useAnimatedReaction,
@@ -28,9 +29,15 @@ import Animated, {
   withTiming,
 } from 'react-native-reanimated';
 
-import { resolvePalette, parseColorRgb } from './theme';
+import { parseColorRgb, resolvePalette } from './theme';
 import { lerp as lerpFr } from './math/lerp';
-import type { ChartPadding, LiveLineChartProps, LiveLinePoint, LiveLineWindowStyle } from './types';
+import type {
+  ChartPadding,
+  DegenOptions,
+  LiveLineChartProps,
+  LiveLinePoint,
+  LiveLineWindowStyle,
+} from './types';
 import { computeRange } from './math/range';
 import { detectMomentum, computeSwingMagnitude } from './math/momentum';
 import type { Momentum } from './math/momentum';
@@ -47,6 +54,22 @@ import {
   BADGE_TAIL_SPREAD,
   BADGE_LINE_H,
 } from './draw/badge';
+import { BADGE_NUMBER_FLOW_FONT_SRC } from './BadgeSkiaNumberFlow';
+import { formatPriceCentsWorklet, supportsTwoDecimalNumberFlow } from './chartNumberFlow';
+import { SCRUB_TIP_FLOW_W } from './ScrubSkiaNumberFlow';
+import { AxisLabels } from './render/AxisLabels';
+import { BadgeOverlay } from './render/BadgeOverlay';
+import { CrosshairCanvas } from './render/CrosshairCanvas';
+import { EmptyState } from './render/EmptyState';
+import { GridCanvas } from './render/GridCanvas';
+import { LiveDotLayer } from './render/LiveDotLayer';
+import { LinePathLayer } from './render/LinePathLayer';
+import { type ParticleSpec, ParticlesLayer } from './render/ParticlesLayer';
+import { ReferenceLineCanvas } from './render/ReferenceLineCanvas';
+import { ReferenceLineLabel } from './render/ReferenceLineLabel';
+import { ScrubTooltip } from './render/ScrubTooltip';
+import { useTrackedGridLabels, useTrackedTimeLabels } from './render/useTrackedAxisLabels';
+import { scrubCentTickHaptic, scrubPanBeginHaptic } from './scrubHaptics';
 import {
   loadingY,
   loadingBreath,
@@ -59,17 +82,6 @@ import { monotoneSplinePath } from './math/spline';
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
 /* ------------------------------------------------------------------ */
-
-interface ParticleSpec {
-  id: number;
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  life: number;
-  size: number;
-  color: string;
-}
 
 interface GridTick {
   value: number;
@@ -92,13 +104,14 @@ interface TimeTick {
 
 const DEFAULT_HEIGHT = 300;
 const FADE_EDGE_WIDTH = 40;
-const PULSE_INTERVAL = 1500;
 const PULSE_DURATION = 900;
 /** Matches upstream `WINDOW_BUFFER` / `WINDOW_BUFFER_NO_BADGE`. */
 const WINDOW_BUFFER_BADGE = 0.05;
 const WINDOW_BUFFER_NO_BADGE = 0.015;
 const CROSSHAIR_FADE_MIN_PX = 5;
-const MAX_PARTICLES = 80;
+/** Max particles per burst (single shared animation driver — keep low for UI thread). */
+const MAX_PARTICLE_BURST = 14;
+const PARTICLE_LIFE_MS = 920;
 const PARTICLE_COOLDOWN_MS = 400;
 const MAGNITUDE_THRESHOLD = 0.08;
 const MAX_BURSTS = 3;
@@ -107,10 +120,19 @@ const ADAPTIVE_SPEED_BOOST = 0.2;
 /** Upstream `VALUE_SNAP_THRESHOLD`. */
 const VALUE_SNAP_THRESHOLD = 0.001;
 /** Throttle grid label refresh while range lerps (ms, worklet accumulator). */
-const GRID_FLUSH_MS = 24;
+const GRID_FLUSH_MS = 110;
+/** Wall-clock tick for time axis when the last sample time lags (ms, JS interval). */
+const LIVE_AXIS_WALL_MS = 220;
+/** How fast `svTipT` eases toward wall clock between ticks (scaled by `engineDt`). */
+const LIVE_TIP_CLOCK_CATCHUP = 0.42;
 /** Upstream `BADGE_WIDTH_LERP` — badge pill width eases toward measured text. */
 const BADGE_WIDTH_LERP = 0.15;
 const MAX_DELTA_MS = 50;
+const ENGINE_IDLE_STOP_MS = 120;
+const ARROW_WAVE_DURATION_MS = 680;
+const SCRUB_HAPTIC_MIN_INTERVAL_MS = 48;
+const PINCH_WINDOW_MIN_SECS = 5;
+const PINCH_WINDOW_MAX_MULTIPLIER = 6;
 
 /* -- Upstream constants for smoother animation -- */
 /** Range lerp base speed (upstream uses 0.15, separate from value lerp 0.08). */
@@ -120,6 +142,8 @@ const RANGE_ADAPTIVE_BOOST = 0.2;
 /** Badge Y position lerp speed (upstream 0.35, faster during window transitions). */
 const BADGE_Y_LERP = 0.35;
 const BADGE_Y_LERP_TRANSITION = 0.5;
+/** Pause progress easing — 0 playing, 1 fully paused. */
+const PAUSE_PROGRESS_SPEED = 0.12;
 /** Momentum color blend speed (0.12 per 16.67ms frame). */
 const MOMENTUM_COLOR_SPEED = 0.12;
 /** Chart reveal speed: loading→chart (upstream 0.14 reverse, 0.09 forward). */
@@ -143,10 +167,6 @@ const GRID_LABEL_FADE_OUT = 0.12;
 /* ------------------------------------------------------------------ */
 /*  Pure helpers                                                       */
 /* ------------------------------------------------------------------ */
-
-function clamp(v: number, lo: number, hi: number) {
-  return Math.min(hi, Math.max(lo, v));
-}
 
 function clampW(v: number, lo: number, hi: number) {
   'worklet';
@@ -276,6 +296,65 @@ function interpAtTime(
     return last.value + (tipV - last.value) * ((target - last.time) / span);
   }
   return tipV;
+}
+
+function nearestPointAtTime(
+  pts: readonly LiveLinePoint[],
+  target: number,
+  tipT: number,
+  tipV: number,
+) {
+  'worklet';
+  if (pts.length === 0) return { time: tipT, value: tipV };
+  let lo = 0;
+  let hi = pts.length - 1;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (pts[mid].time < target) lo = mid + 1;
+    else hi = mid;
+  }
+  const upper = pts[lo];
+  const lower = lo > 0 ? pts[lo - 1] : upper;
+  let nearest = Math.abs(upper.time - target) < Math.abs(lower.time - target) ? upper : lower;
+  if (Math.abs(tipT - target) < Math.abs(nearest.time - target)) {
+    nearest = { time: tipT, value: tipV };
+  }
+  return nearest;
+}
+
+/** Scrub sample at pointer X — used in pan worklets (onBegin / onUpdate). */
+function sampleScrubAtX(
+  x: number,
+  chartW: number,
+  pad: ChartPadding,
+  win: number,
+  buf: number,
+  tipT: number,
+  tipV: number,
+  pts: readonly LiveLinePoint[],
+  snapToPoint: boolean,
+) {
+  'worklet';
+  const chartWi = Math.max(1, chartW - pad.left - pad.right);
+  const rightEdge = tipT + win * buf;
+  const leftEdge = rightEdge - win;
+  const liveX =
+    pad.left + ((tipT - leftEdge) / (rightEdge - leftEdge || 1)) * chartWi;
+  const rawHx = clampW(x, pad.left, liveX);
+  const rawHt = leftEdge + ((rawHx - pad.left) / chartWi) * (rightEdge - leftEdge);
+  if (!snapToPoint) {
+    const hv = interpAtTime(pts, rawHt, tipT, tipV);
+    return { hx: rawHx, ht: rawHt, hv, liveX };
+  }
+  const nearest = nearestPointAtTime(pts, rawHt, tipT, tipV);
+  const snappedX =
+    pad.left + ((nearest.time - leftEdge) / (rightEdge - leftEdge || 1)) * chartWi;
+  return {
+    hx: clampW(snappedX, pad.left, liveX),
+    ht: nearest.time,
+    hv: nearest.value,
+    liveX,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -509,13 +588,16 @@ function spawnBurst(
   accent: string,
   mag: number,
   ids: { current: number },
+  options?: DegenOptions,
 ): ParticleSpec[] {
+  if (mom === 'down' && options?.downMomentum !== true) return [];
   const isUp = mom === 'up';
   const mg = Math.min(mag * 5, 1);
-  const count = Math.round(12 + mg * 20);
-  const speedMul = 1 + mg * 0.8;
+  const scale = options?.scale ?? 1;
+  const count = Math.round((6 + mg * 8) * scale);
+  const speedMul = 1 + mg * 0.55;
   const out: ParticleSpec[] = [];
-  for (let i = 0; i < count && out.length < MAX_PARTICLES; i++) {
+  for (let i = 0; i < count && out.length < MAX_PARTICLE_BURST; i++) {
     const base = isUp ? -Math.PI / 2 : Math.PI / 2;
     const angle = base + (Math.random() - 0.5) * Math.PI * 1.2;
     const spd = (60 + Math.random() * 100) * speedMul;
@@ -525,8 +607,8 @@ function spawnBurst(
       y: dy + (Math.random() - 0.5) * 8,
       vx: Math.cos(angle) * spd,
       vy: Math.sin(angle) * spd,
-      life: 1000,
-      size: 1 + Math.random() * 1.2,
+      life: PARTICLE_LIFE_MS,
+      size: (1 + Math.random() * 1.2) * scale,
       color: accent,
     });
   }
@@ -580,42 +662,6 @@ function WindowBtn({
   );
 }
 
-function Particle({
-  p,
-  onDone,
-}: {
-  p: ParticleSpec;
-  onDone: (id: number) => void;
-}) {
-  const t = useSharedValue(0);
-  useEffect(() => {
-    t.value = withTiming(1, { duration: p.life, easing: Easing.linear }, (ok) => {
-      if (ok) runOnJS(onDone)(p.id);
-    });
-  }, [onDone, p.id, p.life, t]);
-
-  // Upstream physics: x += vx*dt; vx *= 0.95 each frame (60fps)
-  // Closed-form integral of geometric decay:
-  // displacement = v0 * (1 - 0.95^n) / (1 - 0.95) * dt
-  // where n = t * 60 (frame count over lifetime)
-  const cx = useDerivedValue(() => {
-    const progress = t.value;
-    const frames = progress * 60;
-    const disp = p.vx * (1 - Math.pow(0.95, frames)) / 0.05 / 60;
-    return p.x + disp;
-  });
-  const cy = useDerivedValue(() => {
-    const progress = t.value;
-    const frames = progress * 60;
-    const disp = p.vy * (1 - Math.pow(0.95, frames)) / 0.05 / 60;
-    return p.y + disp;
-  });
-  const op = useDerivedValue(() => (1 - t.value) * 0.55);
-  const r = useDerivedValue(() => p.size * (0.5 + (1 - t.value) * 0.5));
-
-  return <Circle cx={cx} cy={cy} r={r} color={p.color} opacity={op} />;
-}
-
 /* ================================================================== */
 /*  Main Component                                                     */
 /* ================================================================== */
@@ -633,10 +679,21 @@ export function NativeLiveLineChart({
   grid = true,
   fill = true,
   badge = true,
+  badgeVariant = 'default',
+  paused = false,
+  badgeNumberFlow = true,
   pulse = true,
   scrub = true,
+  scrubNumberFlow = true,
+  snapToPointScrubbing = false,
+  pinchToZoom = false,
+  scrubHaptics = true,
   momentum: momProp = true,
   degen = false,
+  referenceLine,
+  liveDotGlow = true,
+  lineTrailGlow = true,
+  gradientLineColoring = false,
   exaggerate = false,
   tooltipY = 14,
   tooltipOutline = true,
@@ -652,12 +709,27 @@ export function NativeLiveLineChart({
   const buf = windowBuffer(badge);
   const isDark = theme === 'dark';
   const ws: LiveLineWindowStyle = windowStyleProp ?? 'default';
+  const degenEnabled = degen !== false;
+  const degenOptions = typeof degen === 'object' ? degen : undefined;
 
   /* ---- palette ---- */
   const pal = useMemo(
     () => resolvePalette(color, theme, lineWidth),
     [color, theme, lineWidth],
   );
+
+  const skiaDefaultNumberFormat = useMemo(
+    () => supportsTwoDecimalNumberFlow(formatValue),
+    [formatValue],
+  );
+  const badgeNumFont = useSkiaFont(BADGE_NUMBER_FLOW_FONT_SRC, 11);
+  const scrubTipFont = useSkiaFont(BADGE_NUMBER_FLOW_FONT_SRC, 13);
+  const skiaBadgeFlow =
+    badge && badgeNumberFlow !== false && skiaDefaultNumberFormat;
+  const skiaScrubFlow =
+    scrub && scrubNumberFlow !== false && skiaDefaultNumberFormat;
+  const lineRevealStartRgb = useMemo(() => parseColorRgb(pal.gridLabel), [pal.gridLabel]);
+  const lineRevealEndRgb = useMemo(() => parseColorRgb(pal.accent), [pal.accent]);
 
   const winUi = useMemo(
     () => ({
@@ -734,6 +806,12 @@ export function NativeLiveLineChart({
     if (windows.some((w) => w.secs === controlledWin)) return controlledWin;
     return windows[0].secs;
   }, [windows, controlledWin]);
+  const [pinchWindow, setPinchWindow] = useState<number | null>(null);
+  const baseWin = pinchWindow ?? resolvedWin;
+  const maxPinchWindow = useMemo(() => {
+    const largestWindow = windows?.length ? Math.max(...windows.map((entry) => entry.secs)) : resolvedWin;
+    return Math.max(largestWindow, resolvedWin) * PINCH_WINDOW_MAX_MULTIPLIER;
+  }, [windows, resolvedWin]);
 
   /** Window transition state — tracks animated window secs via worklet frame callback. */
   const winTransRef = useRef<{
@@ -741,35 +819,39 @@ export function NativeLiveLineChart({
     to: number;
     startMs: number;
     active: boolean;
-  }>({ from: resolvedWin, to: resolvedWin, startMs: 0, active: false });
-  const svWinFrom = useSharedValue(resolvedWin);
-  const svWinTo = useSharedValue(resolvedWin);
+  }>({ from: baseWin, to: baseWin, startMs: 0, active: false });
+  const svWinFrom = useSharedValue(baseWin);
+  const svWinTo = useSharedValue(baseWin);
   const svWinProgress = useSharedValue(1); // 0=from, 1=to (done)
   const svWinTransActive = useSharedValue(0);
   /** Current effective window secs (animated). Used by rendering. */
-  const [effectiveWin, setEffectiveWin] = useState(resolvedWin);
+  const [effectiveWin, setEffectiveWin] = useState(baseWin);
 
   const flushEffectiveWin = useCallback((v: number) => {
     setEffectiveWin(v);
   }, []);
 
-  /** Trigger a smooth window transition when resolvedWin changes. */
-  const prevResolvedWin = useRef(resolvedWin);
+  /** Trigger a smooth window transition when the target render window changes. */
+  const prevResolvedWin = useRef(baseWin);
   useEffect(() => {
-    if (prevResolvedWin.current === resolvedWin) return;
+    if (prevResolvedWin.current === baseWin) return;
     const from = prevResolvedWin.current;
-    prevResolvedWin.current = resolvedWin;
+    prevResolvedWin.current = baseWin;
     winTransRef.current = {
       from,
-      to: resolvedWin,
+      to: baseWin,
       startMs: performance.now(),
       active: true,
     };
     svWinFrom.value = from;
-    svWinTo.value = resolvedWin;
+    svWinTo.value = baseWin;
     svWinProgress.value = 0;
     svWinTransActive.value = 1;
-  }, [resolvedWin, svWinFrom, svWinTo, svWinProgress, svWinTransActive]);
+  }, [baseWin, svWinFrom, svWinTo, svWinProgress, svWinTransActive]);
+
+  useEffect(() => {
+    setPinchWindow(null);
+  }, [resolvedWin]);
 
   /** Compute effective window: animated if in transition, else target. */
   const win = effectiveWin;
@@ -854,35 +936,69 @@ export function NativeLiveLineChart({
   /** Y-range used for grid / labels — tracks smoothed `svMin`/`svMax` from the UI thread. */
   const [gridSmooth, setGridSmooth] = useState<{ min: number; max: number } | null>(null);
   const didRangeInitRef = useRef(false);
-  const flushGridRef = useRef<(lo: number, hi: number) => void>(() => {});
 
   useEffect(() => {
     if (!loading && data.length >= 2) return;
     let id: number;
+    let lastEmit = 0;
+    /** ~28fps — enough for the loading path; avoids a full React commit every display frame. */
+    const minStepMs = 1000 / 28;
     const tick = () => {
-      setLoadMs(performance.now());
+      const t = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      if (t - lastEmit >= minStepMs) {
+        lastEmit = t;
+        setLoadMs(t);
+      }
       id = requestAnimationFrame(tick);
     };
     id = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(id);
   }, [loading, data.length]);
 
+  /* ---- pause snapshot ---- */
+  const pausedSnapshotRef = useRef<{ data: LiveLinePoint[]; value: number } | null>(null);
+  if (paused) {
+    if (pausedSnapshotRef.current === null && data.length >= 2) {
+      pausedSnapshotRef.current = {
+        data: data.slice(),
+        value,
+      };
+    }
+  } else if (pausedSnapshotRef.current !== null) {
+    pausedSnapshotRef.current = null;
+  }
+
   /* ---- derived data ---- */
-  const now = data[data.length - 1]?.time ?? Date.now() / 1000;
-  const vis = useMemo(() => getVisible(data, now, win, buf), [data, now, win, buf]);
+  const effectiveData = pausedSnapshotRef.current?.data ?? data;
+  const effectiveValue = pausedSnapshotRef.current?.value ?? value;
+  const now = effectiveData[effectiveData.length - 1]?.time ?? Date.now() / 1000;
+  const [axisWallSec, setAxisWallSec] = useState(() => Date.now() / 1000);
+  useEffect(() => {
+    setAxisWallSec((w) => (now > w ? now : w));
+  }, [now]);
+  useEffect(() => {
+    if (layout.width <= 0 || effectiveData.length < 2 || loading || paused) return;
+    const id = setInterval(() => setAxisWallSec(Date.now() / 1000), LIVE_AXIS_WALL_MS);
+    return () => clearInterval(id);
+  }, [layout.width, effectiveData.length, loading, paused]);
+  const axisNow = Math.max(now, axisWallSec);
+  const vis = useMemo(
+    () => getVisible(effectiveData, axisNow, win, buf),
+    [effectiveData, axisNow, win, buf],
+  );
   const rng = useMemo(
-    () => computeRange(vis, value, exaggerate),
-    [vis, value, exaggerate],
+    () => computeRange(vis, effectiveValue, referenceLine?.value, exaggerate),
+    [vis, effectiveValue, referenceLine?.value, exaggerate],
   );
   const mom = useMemo(() => detectMomentum(vis), [vis]);
   const swMag = useMemo(
-    () => computeSwingMagnitude(vis, value, rng.min, rng.max),
-    [vis, value, rng.min, rng.max],
+    () => computeSwingMagnitude(vis, effectiveValue, rng.min, rng.max),
+    [vis, effectiveValue, rng.min, rng.max],
   );
 
   const chartW = layout.width - pad.left - pad.right;
   const chartH = layout.height - pad.top - pad.bottom;
-  const empty = layout.width <= 0 || data.length < 2 || loading;
+  const empty = layout.width <= 0 || effectiveData.length < 2 || loading;
 
   /* ---- grid ticks ---- */
   const gridRes = useMemo(() => {
@@ -898,30 +1014,44 @@ export function NativeLiveLineChart({
 
   /* ---- time ticks ---- */
   const tTicks = useMemo(
-    () => calcTimeTicks(now, win, layout.width, pad, formatTime, buf),
-    [now, win, layout.width, pad, formatTime, buf],
+    () => calcTimeTicks(axisNow, win, layout.width, pad, formatTime, buf),
+    [axisNow, win, layout.width, pad, formatTime, buf],
   );
+  const trackedGridLabels = useTrackedGridLabels(gridRes.ticks);
+  const trackedTimeLabels = useTrackedTimeLabels(tTicks);
+  const badgeFlowA11y = useMemo(() => effectiveValue.toFixed(2), [effectiveValue]);
 
   /* ---- shared values ---- */
   const svTipT = useSharedValue(now);
-  const svTipV = useSharedValue(value);
+  /** Last sample timestamp from props — `svTipT` eases toward max(this, wall clock) when the feed gaps. */
+  const svDataTipT = useSharedValue(now);
+  const svTipV = useSharedValue(effectiveValue);
   const svMin = useSharedValue(rng.min);
   const svMax = useSharedValue(rng.max);
   const svTargetMin = useSharedValue(rng.min);
   const svTargetMax = useSharedValue(rng.max);
-  const svRawValue = useSharedValue(value);
+  const svRawValue = useSharedValue(effectiveValue);
   const svChartH = useSharedValue(Math.max(1, chartH));
   const svLerpSpeed = useSharedValue(lerpSpeed);
   const svGridFlushAcc = useSharedValue(0);
   const svGridOn = useSharedValue(grid ? 1 : 0);
+  const svPinchStartWin = useSharedValue(baseWin);
+  const svPauseTarget = useSharedValue(paused ? 1 : 0);
+  const svPauseProgress = useSharedValue(paused ? 1 : 0);
   const svScrubX = useSharedValue(-1);
+  /** Interpolated Y value at crosshair — updated every pan frame for SkiaNumberFlow. */
+  const svScrubHv = useSharedValue(0);
   const svScrubOp = useSharedValue(0);
   /** Throttle scrub tooltip runOnJS — line/crosshair still follow every frame via svScrubX. */
   const svScrubJsLastTs = useSharedValue(0);
   const svScrubJsLastHx = useSharedValue(-1e9);
   const svScrubJsLastOp = useSharedValue(-1);
   const svBurst = useSharedValue(0);
-  const clock = useClock();
+  /** Single 0→1 timeline for all particles in the current burst (one `withTiming` instead of N). */
+  const svBurstLife = useSharedValue(0);
+  const svPulseWave = useSharedValue(1);
+  const svArrowWave = useSharedValue(1);
+  const svEngineIdleMs = useSharedValue(0);
   /** Upstream `arrowState` — cross-fade up/down before fading in new direction. */
   const svArrowUp = useSharedValue(0);
   const svArrowDown = useSharedValue(0);
@@ -934,7 +1064,40 @@ export function NativeLiveLineChart({
   const svMomProp = useSharedValue(1);
   const svBadgeOn = useSharedValue(1);
 
-  const [badgeStr, setBadgeStr] = useState(() => formatValue(value));
+  const [flowPillW, setFlowPillW] = useState(80);
+  const [engineActive, setEngineActive] = useState(false);
+  const setPinchWindowStable = useCallback((nextWindow: number | null) => {
+    setPinchWindow((prev) => {
+      if (prev === nextWindow) return prev;
+      if (prev !== null && nextWindow !== null && Math.abs(prev - nextWindow) < 0.05) return prev;
+      return nextWindow;
+    });
+  }, []);
+  const startEngine = useCallback(() => {
+    setEngineActive(true);
+  }, []);
+  const stopEngine = useCallback(() => {
+    setEngineActive(false);
+  }, []);
+  const setFlowPillWStable = useCallback((w: number) => {
+    setFlowPillW((prev) => (prev === w ? prev : w));
+  }, []);
+  useAnimatedReaction(
+    () => Math.round(svBadgePillW.value),
+    (w, prev) => {
+      'worklet';
+      if (prev !== undefined && w === prev) return;
+      runOnJS(setFlowPillWStable)(w);
+    },
+    [setFlowPillWStable],
+  );
+
+  const dvScrubValueStr = useDerivedValue(() => {
+    'worklet';
+    return formatPriceCentsWorklet(svScrubHv.value);
+  });
+
+  const [badgeStr, setBadgeStr] = useState(() => formatValue(effectiveValue));
   const badgeQuantMul = formatValue === defaultFmtVal ? 100 : 10_000;
 
   /** Sync badge label only when quantized display changes (avoids runOnJS every frame). */
@@ -965,8 +1128,6 @@ export function NativeLiveLineChart({
       return { min: lo, max: hi };
     });
   }, []);
-  flushGridRef.current = flushGridSmooth;
-
   useEffect(() => {
     svLerpSpeed.value = lerpSpeed;
   }, [lerpSpeed, svLerpSpeed]);
@@ -980,13 +1141,17 @@ export function NativeLiveLineChart({
   }, [grid, svGridOn]);
 
   useEffect(() => {
-    svRawValue.value = value;
-  }, [value, svRawValue]);
+    svPauseTarget.value = paused ? 1 : 0;
+  }, [paused, svPauseTarget]);
 
-  /** Live dot X tracks data time (upstream: no horizontal ease between ticks). */
   useEffect(() => {
-    svTipT.value = now;
-  }, [now, svTipT]);
+    svRawValue.value = effectiveValue;
+  }, [effectiveValue, svRawValue]);
+
+  /** Keep data tip time on the UI thread (live dot eases toward wall clock in `onEngineFrame`). */
+  useEffect(() => {
+    svDataTipT.value = now;
+  }, [now, svDataTipT]);
 
   useEffect(() => {
     if (empty) return;
@@ -1008,13 +1173,13 @@ export function NativeLiveLineChart({
       svMax.value = rng.max;
       svTargetMin.value = rng.min;
       svTargetMax.value = rng.max;
-      svTipV.value = value;
+      svTipV.value = effectiveValue;
       setGridSmooth({ min: rng.min, max: rng.max });
       svGridFlushAcc.value = GRID_FLUSH_MS;
       // Initialize badge Y to target (no lerp on first frame)
       if (!svBadgeYInit.current && layout.height > 0) {
         svBadgeYInit.current = true;
-        svBadgeY.value = toScreenY(value, rng.min, rng.max, layout.height, pad);
+        svBadgeY.value = toScreenY(effectiveValue, rng.min, rng.max, layout.height, pad);
       }
       // Initialize momentum color to accent
       if (!momColorInitRef.current) {
@@ -1025,7 +1190,7 @@ export function NativeLiveLineChart({
         momColorInitRef.current = true;
       }
     }
-  }, [empty, rng.min, rng.max, value, svMin, svMax, svTargetMin, svTargetMax, svTipV, svGridFlushAcc]);
+  }, [empty, rng.min, rng.max, effectiveValue, svMin, svMax, svTargetMin, svTargetMax, svTipV, svGridFlushAcc]);
 
   useEffect(() => {
     svMom.value = mom === 'up' ? 1 : mom === 'down' ? 2 : 0;
@@ -1062,12 +1227,77 @@ export function NativeLiveLineChart({
     }
   }, [empty, svReveal]);
 
+  useEffect(() => {
+    if (empty) {
+      svEngineIdleMs.value = 0;
+      setEngineActive(false);
+      return;
+    }
+    svEngineIdleMs.value = 0;
+    startEngine();
+  }, [
+    empty,
+    startEngine,
+    effectiveValue,
+    rng.min,
+    rng.max,
+    now,
+    win,
+    paused,
+    badge,
+    grid,
+    mom,
+  ]);
+
+  useEffect(() => {
+    cancelAnimation(svPulseWave);
+    if (!pulse || empty || paused) {
+      svPulseWave.value = 1;
+      return;
+    }
+    svPulseWave.value = 0;
+    svPulseWave.value = withTiming(1, {
+      duration: PULSE_DURATION,
+      easing: Easing.linear,
+    });
+  }, [pulse, empty, paused, now, svPulseWave]);
+
+  useEffect(() => {
+    cancelAnimation(svArrowWave);
+    if (!momProp || empty || paused || mom === 'flat') {
+      svArrowWave.value = 1;
+      return;
+    }
+    svArrowWave.value = 0;
+    svArrowWave.value = withTiming(1, {
+      duration: ARROW_WAVE_DURATION_MS,
+      easing: Easing.linear,
+    });
+  }, [momProp, empty, paused, mom, now, svArrowWave]);
+
   /** Stable worklet — avoids re-registering the frame callback every render. */
   const onEngineFrame = useCallback(
     (frameInfo: { timeSincePreviousFrame: number | null }) => {
       'worklet';
       const rawDt = frameInfo.timeSincePreviousFrame;
       const dt = Math.min(MAX_DELTA_MS, rawDt == null ? 16.67 : rawDt);
+      const pauseTarget = svPauseTarget.value;
+      let pauseProgress = lerpFr(svPauseProgress.value, pauseTarget, PAUSE_PROGRESS_SPEED, dt);
+      if (pauseProgress < 0.005) pauseProgress = 0;
+      if (pauseProgress > 0.995) pauseProgress = 1;
+      svPauseProgress.value = pauseProgress;
+      const engineDt = dt * (1 - pauseProgress);
+
+      /* ---- Live tip time: glide on wall clock when samples are sparse / delayed ---- */
+      if (pauseProgress < 0.995) {
+        const wall = Date.now() / 1000;
+        const dataT = svDataTipT.value;
+        const targetT = wall > dataT ? wall : dataT;
+        let tipT = svTipT.value;
+        tipT = lerpFr(tipT, targetT, LIVE_TIP_CLOCK_CATCHUP, Math.max(engineDt, 0.0001));
+        if (Math.abs(tipT - targetT) < 0.002) tipT = targetT;
+        svTipT.value = tipT;
+      }
 
       /* ---- Window transition (log-space cosine easing) ---- */
       if (svWinTransActive.value === 1) {
@@ -1100,7 +1330,7 @@ export function NativeLiveLineChart({
       const ls = svLerpSpeed.value;
       const spd = computeAdaptiveSpeed(tgt, disp, dmin0, dmax0, ls);
       const prevR = dmax0 - dmin0 || 1;
-      let nextDisp = lerpFr(disp, tgt, spd, dt);
+      let nextDisp = lerpFr(disp, tgt, spd, engineDt);
       if (Math.abs(nextDisp - tgt) < prevR * VALUE_SNAP_THRESHOLD) nextDisp = tgt;
       svTipV.value = nextDisp;
 
@@ -1111,8 +1341,8 @@ export function NativeLiveLineChart({
       const rangeGap = Math.abs((tmax - tmin) - curRange);
       const rangeRatio = Math.min(rangeGap / curRange, 1);
       const rangeLerpSpd = RANGE_LERP_SPEED + (1 - rangeRatio) * RANGE_ADAPTIVE_BOOST;
-      let nextMin = lerpFr(dmin0, tmin, rangeLerpSpd, dt);
-      let nextMax = lerpFr(dmax0, tmax, rangeLerpSpd, dt);
+      let nextMin = lerpFr(dmin0, tmin, rangeLerpSpd, engineDt);
+      let nextMax = lerpFr(dmax0, tmax, rangeLerpSpd, engineDt);
       const pxTh = (0.5 * curRange) / ch || 0.001;
       if (Math.abs(nextMin - tmin) < pxTh) nextMin = tmin;
       if (Math.abs(nextMax - tmax) < pxTh) nextMax = tmax;
@@ -1127,7 +1357,7 @@ export function NativeLiveLineChart({
         const targetBY = toScreenY(svTipV.value, svMin.value, svMax.value, fullH, padApprox);
         const bySpeed = svWinTransActive.value === 1 ? BADGE_Y_LERP_TRANSITION : BADGE_Y_LERP;
         let by = svBadgeY.value;
-        by = lerpFr(by, targetBY, bySpeed, dt);
+        by = lerpFr(by, targetBY, bySpeed, engineDt);
         if (Math.abs(by - targetBY) < 0.3) by = targetBY;
         svBadgeY.value = by;
       }
@@ -1150,18 +1380,18 @@ export function NativeLiveLineChart({
           // Only re-target accent when flat (stays at current until flat)
         }
         if (momentum !== 0) {
-          svMomColorR.value = lerpFr(svMomColorR.value, tR, MOMENTUM_COLOR_SPEED, dt);
-          svMomColorG.value = lerpFr(svMomColorG.value, tG, MOMENTUM_COLOR_SPEED, dt);
-          svMomColorB.value = lerpFr(svMomColorB.value, tB, MOMENTUM_COLOR_SPEED, dt);
+          svMomColorR.value = lerpFr(svMomColorR.value, tR, MOMENTUM_COLOR_SPEED, engineDt);
+          svMomColorG.value = lerpFr(svMomColorG.value, tG, MOMENTUM_COLOR_SPEED, engineDt);
+          svMomColorB.value = lerpFr(svMomColorB.value, tB, MOMENTUM_COLOR_SPEED, engineDt);
         }
       }
 
       /* ---- Grid flush ---- */
       if (svGridOn.value === 1) {
-        svGridFlushAcc.value += dt;
+        svGridFlushAcc.value += engineDt;
         if (svGridFlushAcc.value >= GRID_FLUSH_MS) {
           svGridFlushAcc.value = 0;
-          runOnJS(flushGridRef.current)(svMin.value, svMax.value);
+          runOnJS(flushGridSmooth)(svMin.value, svMax.value);
         }
       }
 
@@ -1176,8 +1406,8 @@ export function NativeLiveLineChart({
         let down = svArrowDown.value;
         const upSpeed = upTarget > up ? 0.08 : 0.04;
         const downSpeed = downTarget > down ? 0.08 : 0.04;
-        up = lerpFr(up, canFadeInUp ? upTarget : 0, upSpeed, dt);
-        down = lerpFr(down, canFadeInDown ? downTarget : 0, downSpeed, dt);
+        up = lerpFr(up, canFadeInUp ? upTarget : 0, upSpeed, engineDt);
+        down = lerpFr(down, canFadeInDown ? downTarget : 0, downSpeed, engineDt);
         if (up < 0.01) up = 0;
         if (down < 0.01) down = 0;
         if (up > 0.99) up = 1;
@@ -1195,58 +1425,102 @@ export function NativeLiveLineChart({
         const targetPillW = textTw + BADGE_PAD_X * 2;
         let w = svBadgePillW.value;
         if (w < 4) w = targetPillW;
-        w = lerpFr(w, targetPillW, BADGE_WIDTH_LERP, dt);
+        w = lerpFr(w, targetPillW, BADGE_WIDTH_LERP, engineDt);
         if (Math.abs(w - targetPillW) < 0.3) w = targetPillW;
         svBadgePillW.value = w;
       }
 
       /* ---- Chart shake decay (degen mode) ---- */
       if (svShakeX.value !== 0 || svShakeY.value !== 0) {
-        svShakeX.value = decayShake(svShakeX.value, dt);
-        svShakeY.value = decayShake(svShakeY.value, dt);
+        svShakeX.value = decayShake(svShakeX.value, engineDt);
+        svShakeY.value = decayShake(svShakeY.value, engineDt);
+      }
+
+      const displayRange = Math.max(0.0001, svMax.value - svMin.value);
+      const valueSettled = Math.abs(svTipV.value - svRawValue.value) < displayRange * VALUE_SNAP_THRESHOLD;
+      const rangeSettled =
+        Math.abs(svMin.value - svTargetMin.value) < displayRange * 0.002 &&
+        Math.abs(svMax.value - svTargetMax.value) < displayRange * 0.002;
+      const revealSettled = svReveal.value >= 0.995;
+      const pauseSettled = Math.abs(svPauseProgress.value - svPauseTarget.value) < 0.01;
+      const badgeSettled =
+        svBadgeOn.value === 0 ||
+        Math.abs(svBadgePillW.value - (Math.max(8, svBadgeTargetTextW.value) + BADGE_PAD_X * 2)) < 0.4;
+      const arrowSettled =
+        svMomProp.value === 0 ||
+        (svMom.value === 1
+          ? Math.abs(svArrowUp.value - 1) < 0.02 && svArrowDown.value < 0.02
+          : svMom.value === 2
+            ? Math.abs(svArrowDown.value - 1) < 0.02 && svArrowUp.value < 0.02
+            : svArrowUp.value < 0.02 && svArrowDown.value < 0.02);
+      const shakeSettled = Math.abs(svShakeX.value) < 0.02 && Math.abs(svShakeY.value) < 0.02;
+
+      if (
+        valueSettled &&
+        rangeSettled &&
+        revealSettled &&
+        pauseSettled &&
+        badgeSettled &&
+        arrowSettled &&
+        shakeSettled &&
+        svScrubOp.value <= 0.01 &&
+        svWinTransActive.value === 0
+      ) {
+        const nextIdle = svEngineIdleMs.value + dt;
+        svEngineIdleMs.value = nextIdle;
+        if (nextIdle >= ENGINE_IDLE_STOP_MS) {
+          svEngineIdleMs.value = -1e9;
+          runOnJS(stopEngine)();
+        }
+      } else {
+        svEngineIdleMs.value = 0;
       }
     },
-    [],
+    [stopEngine, flushGridSmooth],
   );
 
   const engineFrame = useFrameCallback(onEngineFrame, false);
 
   useEffect(() => {
-    const run = !empty;
-    engineFrame.setActive(run);
+    engineFrame.setActive(!empty && engineActive);
     if (empty) {
       svArrowUp.value = 0;
       svArrowDown.value = 0;
       svShakeX.value = 0;
       svShakeY.value = 0;
     }
-  }, [empty, engineFrame, svArrowUp, svArrowDown, svShakeX, svShakeY]);
+  }, [empty, engineActive, engineFrame, svArrowUp, svArrowDown, svShakeX, svShakeY]);
 
   /* ---- degen burst ---- */
   const spawnPt = useMemo(
     () => ({
-      x: toScreenXJs(now, now, win, layout.width, pad, buf),
+      x: toScreenXJs(axisNow, axisNow, win, layout.width, pad, buf),
       y: toScreenY(
-        value,
+        effectiveValue,
         gridSmooth?.min ?? rng.min,
         gridSmooth?.max ?? rng.max,
         layout.height,
         pad,
       ),
     }),
-    [now, win, layout.width, layout.height, pad, buf, value, rng.min, rng.max, gridSmooth],
+    [axisNow, win, layout.width, layout.height, pad, buf, effectiveValue, rng.min, rng.max, gridSmooth],
   );
 
+  const clearBurstParticles = useCallback(() => {
+    cancelAnimation(svBurstLife);
+    setParticles([]);
+  }, [svBurstLife]);
+
   useEffect(() => {
-    if (!degen || layout.width <= 0 || mom === 'flat') return;
+    if (!degenEnabled || layout.width <= 0 || mom === 'flat') return;
     if (swMag < MAGNITUDE_THRESHOLD) {
       burstRef.current.burstCount = 0;
       return;
     }
     if (burstRef.current.burstCount >= MAX_BURSTS) return;
-    const t = Date.now();
-    if (t - burstRef.current.cooldown < PARTICLE_COOLDOWN_MS) return;
-    burstRef.current.cooldown = t;
+    const nowMs = Date.now();
+    if (nowMs - burstRef.current.cooldown < PARTICLE_COOLDOWN_MS) return;
+    burstRef.current.cooldown = nowMs;
     burstRef.current.burstCount++;
 
     svBurst.value = withSequence(
@@ -1261,11 +1535,23 @@ export function NativeLiveLineChart({
     svShakeX.value = shake.x;
     svShakeY.value = shake.y;
 
-    setParticles((c) => [
-      ...c.slice(-56),
-      ...spawnBurst(spawnPt.x, spawnPt.y, mom, pal.accent, swMag, idRef),
-    ]);
-  }, [degen, layout.width, mom, swMag, spawnPt, pal.accent, svBurst, svShakeX, svShakeY, value]);
+    svBurstLife.value = 0;
+    setParticles(spawnBurst(spawnPt.x, spawnPt.y, mom, pal.accent, swMag, idRef, degenOptions));
+    svBurstLife.value = withTiming(
+      1,
+      { duration: PARTICLE_LIFE_MS, easing: Easing.linear },
+      (finished) => {
+        if (finished) runOnJS(clearBurstParticles)();
+      },
+    );
+  }, [degenEnabled, degenOptions, layout.width, mom, swMag, spawnPt, pal.accent, effectiveValue, svBurstLife, clearBurstParticles]);
+
+  useEffect(() => {
+    if (!degenEnabled || empty || mom === 'flat') {
+      cancelAnimation(svBurstLife);
+      setParticles([]);
+    }
+  }, [degenEnabled, empty, mom, svBurstLife]);
 
   /* ================================================================ */
   /*  ALL derived values (hooks) — BEFORE return                      */
@@ -1277,16 +1563,40 @@ export function NativeLiveLineChart({
 
   // Line path
   const dvLinePath = useDerivedValue(
-    () => buildPath(vis, svTipT.value, svTipV.value, svMin.value, svMax.value,
-      layout.width, layout.height, pad, win, buf, false),
-    [vis, layout.width, layout.height, pad, win, buf],
+    () =>
+      buildPath(
+        effectiveData,
+        svTipT.value,
+        svTipV.value,
+        svMin.value,
+        svMax.value,
+        layout.width,
+        layout.height,
+        pad,
+        win,
+        buf,
+        false,
+      ),
+    [effectiveData, layout.width, layout.height, pad, win, buf],
   );
 
   // Fill path
   const dvFillPath = useDerivedValue(
-    () => buildPath(vis, svTipT.value, svTipV.value, svMin.value, svMax.value,
-      layout.width, layout.height, pad, win, buf, true),
-    [vis, layout.width, layout.height, pad, win, buf],
+    () =>
+      buildPath(
+        effectiveData,
+        svTipT.value,
+        svTipV.value,
+        svMin.value,
+        svMax.value,
+        layout.width,
+        layout.height,
+        pad,
+        win,
+        buf,
+        true,
+      ),
+    [effectiveData, layout.width, layout.height, pad, win, buf],
   );
 
   // Live dot position
@@ -1301,8 +1611,8 @@ export function NativeLiveLineChart({
 
   // Pulse ring (upstream: 1500ms interval, 900ms duration)
   const dvRingProgress = useDerivedValue(
-    () => (pulse ? (clock.value % PULSE_INTERVAL) / PULSE_DURATION : 2),
-    [clock, pulse],
+    () => (pulse ? svPulseWave.value : 1),
+    [pulse, svPulseWave],
   );
   const dvRingR = useDerivedValue(() => {
     const p = dvRingProgress.value;
@@ -1336,8 +1646,9 @@ export function NativeLiveLineChart({
     const revealScale = Math.min(1, (rev - 0.6) / 0.4);
     const base = 0.35 * (1 - p) * revealScale;
     const dim = dvDotDim.value;
-    if (dim < 0.3) return base * (1 - dim * 3);
-    return base;
+    const pauseScale = 1 - svPauseProgress.value;
+    if (dim < 0.3) return base * (1 - dim * 3) * pauseScale;
+    return base * pauseScale;
   }, [pulse]);
 
   // Dashed price line Y
@@ -1381,6 +1692,28 @@ export function NativeLiveLineChart({
     return Math.max(0, 1 - svScrubOp.value * 0.6);
   });
 
+  const dvLineColor = useDerivedValue(() => {
+    const t = Math.min(1, svReveal.value * 3);
+    const r = Math.round(lineRevealStartRgb[0] + (lineRevealEndRgb[0] - lineRevealStartRgb[0]) * t);
+    const g = Math.round(lineRevealStartRgb[1] + (lineRevealEndRgb[1] - lineRevealStartRgb[1]) * t);
+    const b = Math.round(lineRevealStartRgb[2] + (lineRevealEndRgb[2] - lineRevealStartRgb[2]) * t);
+    return `rgb(${r},${g},${b})`;
+  }, [lineRevealStartRgb, lineRevealEndRgb]);
+
+  const liveGlowColor = useMemo(() => {
+    if (mom === 'up') return pal.glowUp;
+    if (mom === 'down') return pal.glowDown;
+    return pal.glowFlat;
+  }, [mom, pal.glowDown, pal.glowFlat, pal.glowUp]);
+
+  const dvReferenceY = useDerivedValue(
+    () =>
+      referenceLine
+        ? toScreenY(referenceLine.value, svMin.value, svMax.value, layout.height, pad)
+        : -100,
+    [referenceLine, layout.height, pad],
+  );
+
   // Crosshair
   const dvHoverX = useDerivedValue(() => {
     if (!scrub || svScrubOp.value <= 0.01) return -100;
@@ -1393,9 +1726,9 @@ export function NativeLiveLineChart({
     const ht =
       leftEdge +
       ((dvHoverX.value - pad.left) / Math.max(1, chartW)) * (rightEdge - leftEdge);
-    const hv = interpAtTime(vis, ht, svTipT.value, svTipV.value);
+    const hv = interpAtTime(effectiveData, ht, svTipT.value, svTipV.value);
     return toScreenY(hv, svMin.value, svMax.value, layout.height, pad);
-  }, [chartW, win, layout.height, pad, scrub, vis, buf]);
+  }, [chartW, win, layout.height, pad, scrub, effectiveData, buf]);
 
   const dvCrossEffectiveOp = useDerivedValue(() => {
     const scrubAmt = svScrubOp.value;
@@ -1447,7 +1780,7 @@ export function NativeLiveLineChart({
     if (!momProp || mom === 'flat') return 0;
     const opacity = mom === 'up' ? svArrowUp.value : svArrowDown.value;
     if (opacity < 0.01) return 0;
-    const cycle = (clock.value % 1400) / 1400;
+    const cycle = svArrowWave.value;
     const i = 0;
     const start = i * 0.2;
     const dur = 0.35;
@@ -1456,13 +1789,13 @@ export function NativeLiveLineChart({
       localT >= 0 && localT < dur ? Math.sin((localT / dur) * Math.PI) : 0;
     const pulse = 0.3 + 0.7 * wave;
     return opacity * pulse;
-  }, [momProp, mom, clock]);
+  }, [momProp, mom, svArrowWave]);
 
   const dvChev1Op = useDerivedValue(() => {
     if (!momProp || mom === 'flat') return 0;
     const opacity = mom === 'up' ? svArrowUp.value : svArrowDown.value;
     if (opacity < 0.01) return 0;
-    const cycle = (clock.value % 1400) / 1400;
+    const cycle = svArrowWave.value;
     const i = 1;
     const start = i * 0.2;
     const dur = 0.35;
@@ -1471,7 +1804,7 @@ export function NativeLiveLineChart({
       localT >= 0 && localT < dur ? Math.sin((localT / dur) * Math.PI) : 0;
     const pulse = 0.3 + 0.7 * wave;
     return opacity * pulse;
-  }, [momProp, mom, clock]);
+  }, [momProp, mom, svArrowWave]);
 
   const dvBadgeBgPath = useDerivedValue(() =>
     badgeSvgPath(svBadgePillW.value, pillH, BADGE_TAIL_LEN, BADGE_TAIL_SPREAD),
@@ -1499,7 +1832,7 @@ export function NativeLiveLineChart({
     // Reveal-gated: badge appears after REVEAL_BADGE_START
     const rev = svReveal.value;
     const revealOp = rev < REVEAL_BADGE_START ? 0 : Math.min(1, (rev - REVEAL_BADGE_START) / (1 - REVEAL_BADGE_START));
-    const baseOp = badge ? (1 - svScrubOp.value) * revealOp : 0;
+    const baseOp = badge ? (1 - svScrubOp.value) * revealOp * (1 - svPauseProgress.value) : 0;
     return {
       opacity: baseOp,
       width: totalW,
@@ -1519,99 +1852,198 @@ export function NativeLiveLineChart({
     hx: number;
     hv: number;
     ht: number;
-    op: number;
   } | null>(null);
+
+  const scrubFlowA11yLabel = useMemo(
+    () => (scrubTip ? scrubTip.hv.toFixed(2) : undefined),
+    [scrubTip],
+  );
+
+  const scrubHapticsRef = useRef(scrubHaptics);
+  scrubHapticsRef.current = scrubHaptics;
+  const lastScrubHapticCentRef = useRef<number | null>(null);
+  const lastScrubHapticTsRef = useRef(0);
+
+  const onScrubPanBeginHaptic = useCallback(() => {
+    if (!scrubHapticsRef.current) return;
+    scrubPanBeginHaptic();
+  }, []);
+
+  const clearScrubTip = useCallback(() => {
+    lastScrubHapticCentRef.current = null;
+    lastScrubHapticTsRef.current = 0;
+    setScrubTip(null);
+  }, []);
 
   const applyScrubTip = useCallback((hx: number, hv: number, ht: number, op: number) => {
     if (op <= 0.01) {
-      setScrubTip(null);
+      clearScrubTip();
       return;
     }
-    setScrubTip({ hx, hv, ht, op });
-  }, []);
+    if (scrubHapticsRef.current) {
+      const c = Math.round(hv * 100);
+      const prev = lastScrubHapticCentRef.current;
+      const nowMs = Date.now();
+      if (
+        prev !== null &&
+        prev !== c &&
+        nowMs - lastScrubHapticTsRef.current >= SCRUB_HAPTIC_MIN_INTERVAL_MS
+      ) {
+        scrubCentTickHaptic();
+        lastScrubHapticTsRef.current = nowMs;
+      }
+      lastScrubHapticCentRef.current = c;
+    }
+    setScrubTip((prev) => {
+      if (
+        prev &&
+        Math.abs(prev.hx - hx) < 0.8 &&
+        Math.abs(prev.hv - hv) < 2e-4 &&
+        Math.abs(prev.ht - ht) < 1e-5
+      ) {
+        return prev;
+      }
+      return { hx, hv, ht };
+    });
+  }, [clearScrubTip]);
 
-  // Gesture — hover X clamps to live tip; tooltip opacity uses distance fade like upstream.
-  const gesture = useMemo(
-    () =>
-      Gesture.Pan()
-        .enabled(scrub)
-        .minDistance(0)
-        .onBegin((e) => {
-          svScrubX.value = e.x;
-          svScrubOp.value = withTiming(1, { duration: 90, easing: Easing.out(Easing.quad) });
-        })
-        .onUpdate((e) => {
-          'worklet';
-          svScrubX.value = e.x;
+  // Gestures — scrub pan with optional point snapping, plus optional pinch-to-zoom.
+  const gesture = useMemo(() => {
+    const panGesture = Gesture.Pan()
+      .enabled(scrub)
+      .minDistance(0)
+      .onBegin((e) => {
+        'worklet';
+        cancelAnimation(svScrubOp);
+        const sample = sampleScrubAtX(
+          e.x,
+          layout.width,
+          pad,
+          win,
+          buf,
+          svTipT.value,
+          svTipV.value,
+          effectiveData,
+          snapToPointScrubbing,
+        );
+        svScrubX.value = sample.hx;
+        svScrubHv.value = sample.hv;
+        svScrubOp.value = withTiming(1, { duration: 90, easing: Easing.out(Easing.quad) });
+        runOnJS(onScrubPanBeginHaptic)();
+        runOnJS(applyScrubTip)(sample.hx, sample.hv, sample.ht, 1);
+      })
+      .onUpdate((e) => {
+        'worklet';
+        const sample = sampleScrubAtX(
+          e.x,
+          layout.width,
+          pad,
+          win,
+          buf,
+          svTipT.value,
+          svTipV.value,
+          effectiveData,
+          snapToPointScrubbing,
+        );
+        svScrubX.value = sample.hx;
+        svScrubHv.value = sample.hv;
 
-          const w = layout.width;
-          const chartWi = Math.max(1, w - pad.left - pad.right);
-          const rightEdge = svTipT.value + win * buf;
-          const leftEdge = rightEdge - win;
-          const liveX =
-            pad.left +
-            ((svTipT.value - leftEdge) / (rightEdge - leftEdge || 1)) * chartWi;
-          const hx = clampW(e.x, pad.left, liveX);
-          const ht =
-            leftEdge + ((hx - pad.left) / chartWi) * (rightEdge - leftEdge);
-          const hv = interpAtTime(vis, ht, svTipT.value, svTipV.value);
+        const chartWi = Math.max(1, layout.width - pad.left - pad.right);
+        const scrubAmt = svScrubOp.value;
+        const dist = sample.liveX - sample.hx;
+        const fadeStart = Math.min(80, chartWi * 0.3);
+        let op = 0;
+        if (dist >= CROSSHAIR_FADE_MIN_PX) {
+          op =
+            dist >= fadeStart
+              ? scrubAmt
+              : ((dist - CROSSHAIR_FADE_MIN_PX) / (fadeStart - CROSSHAIR_FADE_MIN_PX)) *
+                scrubAmt;
+        }
+        const ts = Date.now();
+        const hxD = Math.abs(sample.hx - svScrubJsLastHx.value);
+        const opD = Math.abs(op - svScrubJsLastOp.value);
+        const dtUi = ts - svScrubJsLastTs.value;
+        if (op > 0.01 && dtUi < 30 && hxD < 2.25 && opD < 0.045) {
+          return;
+        }
+        svScrubJsLastTs.value = ts;
+        svScrubJsLastHx.value = sample.hx;
+        svScrubJsLastOp.value = op;
+        runOnJS(applyScrubTip)(sample.hx, sample.hv, sample.ht, op);
+      })
+      .onFinalize(() => {
+        svScrubOp.value = withTiming(
+          0,
+          { duration: 120, easing: Easing.out(Easing.quad) },
+          (finished) => {
+            if (finished) runOnJS(clearScrubTip)();
+          },
+        );
+        svScrubJsLastTs.value = 0;
+        svScrubJsLastHx.value = -1e9;
+        svScrubJsLastOp.value = -1;
+      });
 
-          const scrubAmt = svScrubOp.value;
-          const dist = liveX - hx;
-          const fadeStart = Math.min(80, chartWi * 0.3);
-          let op = 0;
-          if (dist >= CROSSHAIR_FADE_MIN_PX) {
-            op =
-              dist >= fadeStart
-                ? scrubAmt
-                : ((dist - CROSSHAIR_FADE_MIN_PX) / (fadeStart - CROSSHAIR_FADE_MIN_PX)) *
-                  scrubAmt;
-          }
-          const ts = Date.now();
-          const hxD = Math.abs(hx - svScrubJsLastHx.value);
-          const opD = Math.abs(op - svScrubJsLastOp.value);
-          const dtUi = ts - svScrubJsLastTs.value;
-          if (op > 0.01 && dtUi < 22 && hxD < 1.5 && opD < 0.035) {
-            // skip React state update; scrub geometry already updated above
-          } else {
-            svScrubJsLastTs.value = ts;
-            svScrubJsLastHx.value = hx;
-            svScrubJsLastOp.value = op;
-            runOnJS(applyScrubTip)(hx, hv, ht, op);
-          }
-        })
-        .onFinalize(() => {
-          svScrubOp.value = withTiming(0, { duration: 120, easing: Easing.out(Easing.quad) });
-          svScrubJsLastTs.value = 0;
-          runOnJS(applyScrubTip)(0, 0, 0, 0);
-        }),
-    [
-      applyScrubTip,
-      buf,
-      layout.width,
-      pad.left,
-      pad.right,
-      scrub,
-      svScrubJsLastHx,
-      svScrubJsLastOp,
-      svScrubJsLastTs,
-      svScrubOp,
-      svScrubX,
-      svTipT,
-      svTipV,
-      vis,
-      win,
-    ],
-  );
+    const pinchGesture = Gesture.Pinch()
+      .enabled(pinchToZoom)
+      .onBegin(() => {
+        'worklet';
+        svPinchStartWin.value = pinchWindow ?? resolvedWin;
+      })
+      .onUpdate((e) => {
+        'worklet';
+        const nextWindow = clampW(
+          svPinchStartWin.value / Math.max(0.5, Math.min(2.5, e.scale)),
+          PINCH_WINDOW_MIN_SECS,
+          maxPinchWindow,
+        );
+        runOnJS(setPinchWindowStable)(nextWindow);
+      })
+      .onEnd(() => {
+        'worklet';
+        if (pinchWindow != null && Math.abs(pinchWindow - resolvedWin) < 0.5) {
+          runOnJS(setPinchWindowStable)(null);
+        }
+      });
+
+    return Gesture.Simultaneous(panGesture, pinchGesture);
+  }, [
+    applyScrubTip,
+    buf,
+    clearScrubTip,
+    layout.width,
+    maxPinchWindow,
+    onScrubPanBeginHaptic,
+    pad,
+    pinchToZoom,
+    pinchWindow,
+    resolvedWin,
+    scrub,
+    setPinchWindowStable,
+    snapToPointScrubbing,
+    svScrubHv,
+    svScrubJsLastHx,
+    svScrubJsLastOp,
+    svScrubJsLastTs,
+    svScrubOp,
+    svScrubX,
+    svPinchStartWin,
+    svTipT,
+    svTipV,
+    effectiveData,
+    win,
+  ]);
 
   const scrubTipLayout = useMemo(() => {
-    if (!scrubTip || layout.width < 300 || scrubTip.op < 0.1) return null;
+    if (!scrubTip || layout.width < 300) return null;
     const v = formatValue(scrubTip.hv);
     const t = formatTime(scrubTip.ht);
     const sep = '  ·  ';
     const charW = 7.85;
-    const totalW = (v.length + sep.length + t.length) * charW;
-    const liveX = toScreenXJs(now, now, win, layout.width, pad, buf);
+    const valueSlotW = skiaScrubFlow ? SCRUB_TIP_FLOW_W : v.length * charW;
+    const totalW = valueSlotW + sep.length * charW + t.length * charW;
+    const liveX = toScreenXJs(axisNow, axisNow, win, layout.width, pad, buf);
     const dotRight = liveX + 7;
     let left = scrubTip.hx - totalW / 2;
     const minX = pad.left + 4;
@@ -1619,12 +2051,7 @@ export function NativeLiveLineChart({
     if (left < minX) left = minX;
     if (left > maxX) left = maxX;
     return { left, v, t, sep };
-  }, [scrubTip, layout.width, formatValue, formatTime, now, win, pad, buf]);
-
-  const rmParticle = useCallback(
-    (id: number) => setParticles((c) => c.filter((p) => p.id !== id)),
-    [],
-  );
+  }, [scrubTip, layout.width, formatValue, formatTime, axisNow, win, pad, buf, skiaScrubFlow]);
 
   /* ---- computed ---- */
   const baseY = layout.height - pad.bottom;
@@ -1669,6 +2096,12 @@ export function NativeLiveLineChart({
   /** Line opacity ramps with reveal. */
   const dvRevealLineOp = useDerivedValue(() => {
     return Math.min(1, svReveal.value * 2); // 0→0.5 reveal = 0→1 line
+  });
+  /** Particles: fade in only near full reveal to avoid fighting the line draw. */
+  const dvRevealParticleOp = useDerivedValue(() => {
+    const rev = svReveal.value;
+    if (rev < REVEAL_PARTICLES_START) return 0;
+    return Math.min(1, (rev - REVEAL_PARTICLES_START) / (1 - REVEAL_PARTICLES_START));
   });
 
   /* ---- Shake animated style (wraps the Canvas for degen mode) ---- */
@@ -1740,70 +2173,32 @@ export function NativeLiveLineChart({
           >
             {/* =================== EMPTY / LOADING =================== */}
             {empty ? (
-              <View style={styles.emptyWrap}>
-                {layout.width > 0 ? (
-                  <Canvas style={StyleSheet.absoluteFill}>
-                    <Path
-                      path={loadPath}
-                      style="stroke"
-                      strokeWidth={pal.lineWidth}
-                      strokeJoin="round"
-                      strokeCap="round"
-                      color={pal.gridLabel}
-                      opacity={loadAlpha}
-                    />
-                  </Canvas>
-                ) : null}
-                {!loading ? (
-                  <Text style={[styles.emptyTxt, { color: pal.gridLabel, opacity: 0.35 }]}>
-                    {emptyText}
-                  </Text>
-                ) : null}
-              </View>
+              <EmptyState
+                layoutWidth={layout.width}
+                layoutHeight={layout.height}
+                pad={pad}
+                loadPath={loadPath}
+                loadAlpha={loadAlpha}
+                loading={loading}
+                emptyText={emptyText}
+                pal={pal}
+              />
             ) : (
               /* =================== CHART =================== */
               <>
                 <Animated.View style={[StyleSheet.absoluteFill, asShake]}>
                 <Canvas style={StyleSheet.absoluteFill}>
 
-                  {/* -- Grid lines (dashed [1,3], upstream style) — reveal-gated with fine label fading -- */}
-                  {grid ? (
-                    <Group opacity={dvRevealGridOp}>
-                      {gridRes.ticks.map((tk) => (
-                        <Group key={`g${tk.value}`} opacity={tk.fineOp}>
-                          <SkiaLine
-                            p1={vec(pad.left, tk.y)}
-                            p2={vec(layout.width - pad.right, tk.y)}
-                            color={pal.gridLine}
-                            strokeWidth={1}
-                          >
-                            <DashPathEffect intervals={[1, 3]} />
-                          </SkiaLine>
-                        </Group>
-                      ))}
-                    </Group>
-                  ) : null}
-
-                  {/* -- Axis baseline — reveal-gated -- */}
-                  <Group opacity={dvRevealGridOp}>
-                    <SkiaLine
-                      p1={vec(pad.left, baseY)}
-                      p2={vec(layout.width - pad.right, baseY)}
-                      color={pal.axisLine}
-                      strokeWidth={1}
-                    />
-
-                    {/* -- Time tick marks -- */}
-                    {tTicks.map((tk) => (
-                      <SkiaLine
-                        key={`t${tk.time}`}
-                        p1={vec(tk.x, baseY)}
-                        p2={vec(tk.x, baseY + 5)}
-                        color={pal.gridLine}
-                        strokeWidth={1}
-                      />
-                    ))}
-                  </Group>
+                  <GridCanvas
+                    grid={grid}
+                    gridLabels={trackedGridLabels}
+                    timeLabels={trackedTimeLabels}
+                    pad={pad}
+                    layoutWidth={layout.width}
+                    baseY={baseY}
+                    opacity={dvRevealGridOp}
+                    pal={pal}
+                  />
 
                   {/* -- Fill gradient (scrub splits like upstream drawLine) — reveal-gated -- */}
                   {fill && clipRect ? (
@@ -1829,30 +2224,36 @@ export function NativeLiveLineChart({
                     </Group>
                   ) : null}
 
-                  {/* -- Main line — reveal-gated -- */}
-                  {clipRect ? (
-                    <Group clip={clipRect} opacity={dvRevealLineOp}>
-                      <Group clip={dvClipL}>
-                        <Path
-                          path={dvLinePath}
-                          style="stroke"
-                          strokeWidth={pal.lineWidth}
-                          strokeJoin="round"
-                          strokeCap="round"
-                          color={pal.accent}
-                        />
-                      </Group>
-                      <Group clip={dvClipR} opacity={dvRightSegOp}>
-                        <Path
-                          path={dvLinePath}
-                          style="stroke"
-                          strokeWidth={pal.lineWidth}
-                          strokeJoin="round"
-                          strokeCap="round"
-                          color={pal.accent}
-                        />
-                      </Group>
-                    </Group>
+                  <LinePathLayer
+                    clipRect={clipRect}
+                    leftClip={dvClipL}
+                    rightClip={dvClipR}
+                    rightOpacity={dvRightSegOp}
+                    revealOpacity={dvRevealLineOp}
+                    path={dvLinePath}
+                    layoutHeight={layout.height}
+                    padTop={pad.top}
+                    padRight={pad.right}
+                    layoutWidth={layout.width}
+                    lineWidth={pal.lineWidth}
+                    lineColor={dvLineColor}
+                    trailGlow={lineTrailGlow}
+                    trailGlowColor={pal.accentGlow}
+                    gradientLineColoring={gradientLineColoring}
+                    gradientStartColor={pal.gridLabel}
+                    gradientEndColor={pal.accent}
+                  />
+
+                  {referenceLine ? (
+                    <ReferenceLineCanvas
+                      label={referenceLine.label}
+                      y={dvReferenceY}
+                      opacity={dvRevealGridOp}
+                      padLeft={pad.left}
+                      padRight={pad.right}
+                      layoutWidth={layout.width}
+                      lineColor={pal.refLine}
+                    />
                   ) : null}
 
                   {/* -- Dashed price line [4,4] -- */}
@@ -1867,10 +2268,12 @@ export function NativeLiveLineChart({
                     </SkiaLine>
                   </Group>
 
-                  {/* -- Particles (only after reveal > 90%) -- */}
-                  {degen ? particles.map((pp) => (
-                    <Particle key={pp.id} p={pp} onDone={rmParticle} />
-                  )) : null}
+                  <ParticlesLayer
+                    enabled={degenEnabled}
+                    particles={particles}
+                    burstLife={svBurstLife}
+                    opacity={dvRevealParticleOp}
+                  />
 
                   {/* -- Pulse ring — reveal-gated (only after 60%) -- */}
                   {pulse ? (
@@ -1885,15 +2288,16 @@ export function NativeLiveLineChart({
                     />
                   ) : null}
 
-                  {/* -- Outer dot (bg color + shadow) — reveal-gated -- */}
-                  <Group opacity={dvRevealDotOp}>
-                    <Circle cx={dvLiveX} cy={dvLiveY} r={6.5} color={pal.badgeOuterBg}>
-                      <Shadow dx={0} dy={1} blur={6} color={pal.badgeOuterShadow} />
-                    </Circle>
-
-                    {/* -- Inner dot (accent; matches upstream drawDot fill) -- */}
-                    <Circle cx={dvLiveX} cy={dvLiveY} r={3.5} color={pal.accent} />
-                  </Group>
+                  <LiveDotLayer
+                    revealOpacity={dvRevealDotOp}
+                    liveX={dvLiveX}
+                    liveY={dvLiveY}
+                    glowEnabled={liveDotGlow}
+                    glowColor={liveGlowColor}
+                    outerColor={pal.badgeOuterBg}
+                    outerShadow={pal.badgeOuterShadow}
+                    innerColor={pal.accent}
+                  />
 
                   {/* -- Momentum chevrons (upstream drawArrows cascade) — reveal-gated -- */}
                   {momProp ? (
@@ -1935,129 +2339,77 @@ export function NativeLiveLineChart({
                     </Rect>
                   </Group>
 
-                  {/* -- Crosshair (drawn after fade, like upstream) -- */}
-                  <SkiaLine
-                    p1={dvCrossP1}
-                    p2={dvCrossP2}
-                    color={pal.crosshair}
-                    strokeWidth={1}
-                    opacity={dvCrossLineOp}
-                  />
-
-                  <Circle
-                    cx={dvHoverX}
-                    cy={dvHoverY}
-                    r={dvCrossDotR}
-                    color={pal.accent}
-                    opacity={dvCrossDotOp}
+                  <CrosshairCanvas
+                    lineP1={dvCrossP1}
+                    lineP2={dvCrossP2}
+                    lineOpacity={dvCrossLineOp}
+                    dotX={dvHoverX}
+                    dotY={dvHoverY}
+                    dotRadius={dvCrossDotR}
+                    dotOpacity={dvCrossDotOp}
+                    lineColor={pal.crosshair}
+                    dotColor={pal.accent}
                   />
                 </Canvas>
                 </Animated.View>
 
-                {/* -- Scrub tooltip (matches upstream drawCrosshair top label) -- */}
-                {scrub && scrubTipLayout ? (
-                  <View
-                    pointerEvents="none"
-                    style={[
-                      styles.scrubTipWrap,
-                      {
-                        left: scrubTipLayout.left,
-                        top: pad.top + tooltipY + 10,
-                        opacity: scrubTip?.op ?? 0,
-                      },
-                    ]}
-                  >
-                    <Text
-                      style={[
-                        styles.scrubTipText,
-                        tooltipOutline && {
-                          textShadowColor: pal.tooltipBg,
-                          textShadowOffset: { width: 0, height: 0 },
-                          textShadowRadius: 3,
-                        },
-                      ]}
-                    >
-                      <Text style={{ color: pal.tooltipText }}>{scrubTipLayout.v}</Text>
-                      <Text style={{ color: pal.gridLabel }}>
-                        {`${scrubTipLayout.sep}${scrubTipLayout.t}`}
-                      </Text>
-                    </Text>
-                  </View>
+                <ScrubTooltip
+                  layout={scrub && scrubTipLayout ? scrubTipLayout : null}
+                  top={pad.top + tooltipY + 10}
+                  opacity={svScrubOp}
+                  tooltipOutline={tooltipOutline}
+                  skiaScrubFlow={skiaScrubFlow}
+                  scrubFlowA11yLabel={scrubFlowA11yLabel}
+                  scrubTipFont={scrubTipFont}
+                  scrubValue={dvScrubValueStr}
+                  pal={pal}
+                  textStyle={styles.scrubTipText}
+                />
+
+                <AxisLabels
+                  grid={grid}
+                  gridLabels={trackedGridLabels}
+                  timeLabels={trackedTimeLabels}
+                  pad={pad}
+                  layoutWidth={layout.width}
+                  baseY={baseY}
+                  pal={pal}
+                  styles={{ yLabel: styles.yLabel, tLabel: styles.tLabel }}
+                />
+
+                {referenceLine?.label ? (
+                  <ReferenceLineLabel
+                    label={referenceLine.label}
+                    y={dvReferenceY}
+                    opacity={dvRevealGridOp}
+                    padLeft={pad.left}
+                    padRight={pad.right}
+                    layoutWidth={layout.width}
+                    color={pal.refLabel}
+                    textStyle={styles.referenceLabel}
+                  />
                 ) : null}
 
-                {/* -- Y-axis labels (right, monospace, upstream font) — fine labels with fading -- */}
-                {grid ? gridRes.ticks.filter((tk) => tk.fineOp > 0.02).map((tk) => (
-                  <Text
-                    key={`yl${tk.value}`}
-                    style={[
-                      styles.yLabel,
-                      {
-                        left: layout.width - pad.right + 8,
-                        top: tk.y - 6,
-                        color: pal.gridLabel,
-                        opacity: tk.fineOp,
-                        fontWeight: tk.isCoarse ? ('500' as const) : ('400' as const),
-                      },
-                    ]}
-                  >
-                    {tk.text}
-                  </Text>
-                )) : null}
-
-                {/* -- Time labels -- */}
-                {tTicks.map((tk) => (
-                  <Text
-                    key={`tl${tk.time}`}
-                    style={[
-                      styles.tLabel,
-                      {
-                        left: clamp(tk.x - 24, pad.left, layout.width - pad.right - 48),
-                        top: baseY + 14,
-                        width: 48,
-                        color: pal.timeLabel,
-                      },
-                    ]}
-                  >
-                    {tk.text}
-                  </Text>
-                ))}
-
-                {/* -- Badge width template (upstream: digits -> '8' for stable measure) -- */}
-                {badge && !empty ? (
-                  <Text
-                    pointerEvents="none"
-                    onLayout={onBadgeTemplateLayout}
-                    style={[styles.badgeTxt, styles.badgeMeasureGhost]}
-                  >
-                    {badgeStr.replace(/[0-9]/g, '8')}
-                  </Text>
-                ) : null}
-
-                {/* -- Badge with curved SVG tail + lerped width + momentum color + smooth value -- */}
-                {badge ? (
-                  <Animated.View pointerEvents="none" style={[styles.badgeWrap, asBadge]}>
-                    <Canvas style={StyleSheet.absoluteFill}>
-                      <Path path={dvBadgeBgPath} color={pal.badgeOuterBg}>
-                        <Shadow dx={0} dy={2} blur={8} color={pal.badgeOuterShadow} />
-                      </Path>
-                      <Group transform={[{ translateX: 2 }, { translateY: 2 }]}>
-                        {/* Inner badge uses momentum-blended color */}
-                        <Path path={dvBadgeInnerPath} color={dvBadgeInnerColor} />
-                      </Group>
-                    </Canvas>
-                    <Animated.View
-                      style={[
-                        styles.badgeTxtWrap,
-                        { height: pillH, left: BADGE_TAIL_LEN + 2 },
-                        asBadgeTextWrap,
-                      ]}
-                    >
-                      <Text style={[styles.badgeTxt, { color: pal.badgeText }]} numberOfLines={1}>
-                        {badgeStr}
-                      </Text>
-                    </Animated.View>
-                  </Animated.View>
-                ) : null}
+                <BadgeOverlay
+                  badge={badge}
+                  empty={empty}
+                  variant={badgeVariant}
+                  skiaBadgeFlow={skiaBadgeFlow}
+                  badgeFlowA11yLabel={badgeFlowA11y}
+                  badgeNumFont={badgeNumFont}
+                  badgeValue={svTipV}
+                  flowPillW={flowPillW}
+                  badgeStr={badgeStr}
+                  badgeStyle={asBadge}
+                  badgeTextWrapStyle={asBadgeTextWrap}
+                  backgroundPath={dvBadgeBgPath}
+                  innerPath={dvBadgeInnerPath}
+                  innerColor={dvBadgeInnerColor}
+                  pillH={pillH}
+                  onBadgeTemplateLayout={onBadgeTemplateLayout}
+                  pal={pal}
+                  badgeTextStyle={styles.badgeTxt}
+                />
               </>
             )}
           </View>
@@ -2089,23 +2441,13 @@ const styles = StyleSheet.create({
   },
   shell: { flex: 1, borderRadius: 12, padding: 0 },
   plot: { flex: 1, borderRadius: 12, overflow: 'hidden' },
-  scrubTipWrap: { position: 'absolute' },
   scrubTipText: {
     fontFamily: mono,
     fontSize: 13,
     fontWeight: '400',
   },
-  emptyWrap: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  emptyTxt: { fontSize: 12, fontWeight: '400' },
-  badgeWrap: { position: 'absolute', overflow: 'hidden' },
-  badgeTxtWrap: { position: 'absolute', alignItems: 'center', justifyContent: 'center' },
   badgeTxt: { fontFamily: mono, fontSize: 11, fontWeight: '500' },
-  badgeMeasureGhost: {
-    position: 'absolute',
-    left: -4000,
-    top: 0,
-    opacity: 0,
-  },
+  referenceLabel: { fontFamily: mono, fontSize: 11, fontWeight: '500' },
   yLabel: { position: 'absolute', fontSize: 11, fontWeight: '400', fontFamily: mono },
   tLabel: { position: 'absolute', fontSize: 11, fontWeight: '400', fontFamily: mono, textAlign: 'center' },
 });

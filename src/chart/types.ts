@@ -9,10 +9,46 @@ export type LiveLineTheme = 'dark' | 'light';
 
 /** Segmented control look for the time-window row (matches upstream Liveline). */
 export type LiveLineWindowStyle = 'default' | 'rounded' | 'text';
+export type BadgeVariant = 'default' | 'minimal';
 
 export interface WindowOption {
   label: string;
   secs: number;
+}
+
+export interface ReferenceLine {
+  value: number;
+  label?: string;
+}
+
+export interface DegenOptions {
+  /** Multiplier for particle count and size (default 1). */
+  scale?: number;
+  /** Allow degen bursts on down-momentum swings (default false). */
+  downMomentum?: boolean;
+}
+
+export interface HoverPoint {
+  time: number;
+  value: number;
+  x: number;
+  y: number;
+}
+
+export interface LiveLineSeries {
+  id: string;
+  data: LiveLinePoint[];
+  value: number;
+  color: string;
+  label?: string;
+}
+
+export interface CandlePoint {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
 }
 
 export interface ChartPadding {
@@ -61,6 +97,8 @@ export interface ChartPalette {
 
   // Dash line
   dashLine: string;
+  refLine: string;
+  refLabel: string;
 
   // Crosshair
   crosshair: string;
@@ -84,6 +122,7 @@ export interface ChartPalette {
 export interface LiveLineChartProps {
   data: LiveLinePoint[];
   value: number;
+  series?: LiveLineSeries[];
   theme?: LiveLineTheme;
   color?: string;
   /** Stroke width of the main line in pixels (default 2, matches upstream Liveline). */
@@ -96,10 +135,34 @@ export interface LiveLineChartProps {
   grid?: boolean;
   fill?: boolean;
   badge?: boolean;
+  badgeVariant?: BadgeVariant;
+  /** Freeze the chart at the current visible snapshot without dropping the live feed. */
+  paused?: boolean;
+  /**
+   * Use SkiaNumberFlow for the live badge value (digit transitions, UI-thread updates).
+   * When `formatValue` is not the default `toFixed(2)`, falls back to plain text.
+   * @see https://number-flow-react-native.awingender.com/docs/components/skia-number-flow
+   */
+  badgeNumberFlow?: boolean;
   pulse?: boolean;
   scrub?: boolean;
+  /**
+   * Use SkiaNumberFlow for the scrub tooltip price while panning (digit roll, UI-thread updates).
+   * Requires default `formatValue` (same rule as `badgeNumberFlow`).
+   */
+  scrubNumberFlow?: boolean;
+  /** Snap the scrub crosshair to the nearest actual data point instead of interpolating between points. */
+  snapToPointScrubbing?: boolean;
+  /** Allow pinch gestures to temporarily zoom the active time window without changing the selected button. */
+  pinchToZoom?: boolean;
+  /** Light haptics when scrubbing starts and when the displayed price crosses another cent (default true). */
+  scrubHaptics?: boolean;
   momentum?: boolean;
-  degen?: boolean;
+  degen?: boolean | DegenOptions;
+  referenceLine?: ReferenceLine;
+  liveDotGlow?: boolean;
+  lineTrailGlow?: boolean;
+  gradientLineColoring?: boolean;
   /** Tighter Y-axis padding (matches upstream `exaggerate`). */
   exaggerate?: boolean;
   /** Vertical offset for the scrub tooltip from the top padding (default 14). */
@@ -111,6 +174,21 @@ export interface LiveLineChartProps {
   emptyText?: string;
   formatValue?: (value: number) => string;
   formatTime?: (time: number) => string;
+  onHover?: (point: HoverPoint | null) => void;
+  mode?: 'line' | 'candle';
+  candles?: CandlePoint[];
+  /**
+   * Optional max candle **body** width in px (≥ 12). Width is otherwise derived from time spacing
+   * like upstream Liveline (`candleDims`). Small values are ignored so demos do not squash candles.
+   */
+  candleWidth?: number;
+  liveCandle?: CandlePoint;
+  lineMode?: boolean;
+  lineData?: LiveLinePoint[];
+  lineValue?: number;
+  onModeChange?: (mode: 'line' | 'candle') => void;
+  onSeriesToggle?: (id: string, visible: boolean) => void;
+  seriesToggleCompact?: boolean;
   /**
    * Base smoothing speed for live value + Y-axis (fraction per ~16.67ms frame at 60fps).
    * Matches upstream Liveline default `0.08`.

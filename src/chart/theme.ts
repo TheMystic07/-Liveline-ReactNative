@@ -108,6 +108,8 @@ export function resolvePalette(
 
     // Dash line
     dashLine: rgba(r, g, b, 0.4),
+    refLine: isDark ? 'rgba(255, 255, 255, 0.12)' : 'rgba(0, 0, 0, 0.12)',
+    refLabel: isDark ? 'rgba(255, 255, 255, 0.42)' : 'rgba(0, 0, 0, 0.38)',
 
     // Crosshair
     crosshair: isDark ? 'rgba(255, 255, 255, 0.2)' : 'rgba(0, 0, 0, 0.12)',
