@@ -31,6 +31,8 @@ export type ChartConfig = {
   setShowReferenceLine: (v: boolean) => void;
   candleLineMorph: boolean;
   setCandleLineMorph: (v: boolean) => void;
+  staticChart: boolean;
+  setStaticChart: (v: boolean) => void;
 };
 
 const DEFAULT_ACCENT = '#3b82f6';
@@ -49,6 +51,7 @@ export function useChartConfig(): ChartConfig {
   const [showOrderbookStream, setShowOrderbookStream] = useState<boolean>(false);
   const [showReferenceLine, setShowReferenceLine] = useState<boolean>(false);
   const [candleLineMorph, setCandleLineMorph] = useState<boolean>(false);
+  const [staticChart, setStaticChart] = useState<boolean>(false);
 
   return {
     theme,
@@ -77,5 +80,7 @@ export function useChartConfig(): ChartConfig {
     setShowReferenceLine,
     candleLineMorph,
     setCandleLineMorph,
+    staticChart,
+    setStaticChart,
   };
 }

@@ -233,6 +233,13 @@ export interface LiveLineChartProps {
   lerpSpeed?: number;
   style?: ViewStyle;
   contentInset?: Partial<ChartPadding>;
+  /**
+   * Render a static chart variant that skips the live animation engine
+   * (no per-tick smoothing, no particle bursts, no pulse rings).
+   * Identical visuals for line and candlestick modes, but without
+   * the continuous `useFrameCallback` overhead.
+   */
+  static?: boolean;
 }
 
 export interface ScreenPoint {

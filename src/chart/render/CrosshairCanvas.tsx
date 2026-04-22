@@ -1,4 +1,6 @@
 import { Circle, Line as SkiaLine } from '@shopify/react-native-skia';
+import { memo } from 'react';
+
 type Vec2 = { x: number; y: number };
 
 type CrosshairCanvasProps = {
@@ -13,7 +15,7 @@ type CrosshairCanvasProps = {
   dotColor: string;
 };
 
-export function CrosshairCanvas({
+function CrosshairCanvasImpl({
   lineP1,
   lineP2,
   lineOpacity,
@@ -44,3 +46,5 @@ export function CrosshairCanvas({
     </>
   );
 }
+
+export const CrosshairCanvas = memo(CrosshairCanvasImpl);

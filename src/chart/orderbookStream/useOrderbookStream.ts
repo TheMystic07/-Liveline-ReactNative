@@ -210,9 +210,10 @@ export function useOrderbookStream({
   momUi,
   swingMag,
 }: OrderbookStreamInputs): readonly OrderbookStreamSlot[] {
-  const slotsRef = useRef<OrderbookStreamSlotState[]>(
-    Array.from({ length: MAX_FLOATERS }, (_, index) => createSlot(index + 1)),
-  );
+  const slotsRef = useRef<OrderbookStreamSlotState[] | null>(null);
+  if (slotsRef.current === null) {
+    slotsRef.current = Array.from({ length: MAX_FLOATERS }, (_, index) => createSlot(index + 1));
+  }
   const orderbookRef = useRef(orderbook);
   orderbookRef.current = orderbook;
   const momUiRef = useRef(momUi);
@@ -372,7 +373,7 @@ export function useOrderbookStream({
     return () => {
       clearLoop();
     };
-  }, [empty, paused, layoutWidth, layoutHeight, pad.top, pad.bottom, pad.left, slots]);
+  }, [empty, paused, layoutWidth, layoutHeight, pad.top, pad.bottom, pad.left]);
 
   return slots;
 }

@@ -1,4 +1,5 @@
 export { LiveLineChart } from './LiveLineChart';
+export { NativeStaticLineChart } from './NativeStaticLineChart';
 export { BadgeSkiaNumberFlow, BADGE_NUMBER_FLOW_FONT_SRC } from './BadgeSkiaNumberFlow';
 export { ScrubSkiaNumberFlow, SCRUB_TIP_FLOW_H, SCRUB_TIP_FLOW_W } from './ScrubSkiaNumberFlow';
 export type {

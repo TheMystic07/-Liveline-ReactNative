@@ -153,6 +153,7 @@ export default function App() {
               </Text>
 
               <LiveLineChart
+                static={chart.staticChart}
                 data={liveFeed.data}
                 value={liveFeed.value}
                 theme={chart.theme}
@@ -230,6 +231,9 @@ export default function App() {
                 </Text>
                 <Text style={[styles.statusText, { color: muted }]}>
                   badge: <Text style={{ color: headline }}>{chart.showBadge ? 'on' : 'off'}</Text>
+                </Text>
+                <Text style={[styles.statusText, { color: muted }]}>
+                  engine: <Text style={{ color: headline }}>{chart.staticChart ? 'static' : 'live'}</Text>
                 </Text>
               </View>
             </View>

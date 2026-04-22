@@ -4,6 +4,7 @@ import {
   Path,
   vec,
 } from '@shopify/react-native-skia';
+import { memo } from 'react';
 import {
   useAnimatedReaction,
   useSharedValue,
@@ -35,7 +36,7 @@ type LinePathLayerProps = {
 
 type RangeTransform = Array<{ translateY: number } | { scaleY: number }>;
 
-export function LinePathLayer({
+function LinePathLayerImpl({
   clipRect,
   leftClip,
   rightClip,
@@ -141,3 +142,5 @@ export function LinePathLayer({
     </Group>
   );
 }
+
+export const LinePathLayer = memo(LinePathLayerImpl);

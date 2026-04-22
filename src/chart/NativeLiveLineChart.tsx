@@ -1064,11 +1064,14 @@ export function NativeLiveLineChart({
 
   useEffect(() => {
     if (!loading && data.length >= 2) return;
-    const tick = () => setLoadMs(typeof performance !== 'undefined' ? performance.now() : Date.now());
+    const tick = () => {
+      if (paused) return;
+      setLoadMs(typeof performance !== 'undefined' ? performance.now() : Date.now());
+    };
     tick();
     const id = setInterval(tick, 100);
     return () => clearInterval(id);
-  }, [loading, data.length]);
+  }, [loading, data.length, paused]);
 
   /* ---- pause snapshot ---- */
   const pausedSnapshotRef = useRef<{ data: LiveLinePoint[]; value: number } | null>(null);
@@ -1108,12 +1111,37 @@ export function NativeLiveLineChart({
   );
 
   /* ---- candle mode data ---- */
+  const candleMergedRef = useRef<CandlePoint[]>([]);
   const candleMerged = useMemo(() => {
-    if (!isCandle) return [];
+    if (!isCandle) {
+      candleMergedRef.current = [];
+      return [];
+    }
+    const cp = candlesProp ?? [];
+    const lc = liveCandle;
+    const prev = candleMergedRef.current;
+
+    // Fast path: only the live candle changed (most common at high tick rates)
+    if (
+      prev.length > 0 &&
+      lc &&
+      cp.length > 0 &&
+      prev.length === cp.length + 1 &&
+      prev[prev.length - 2].time === cp[cp.length - 1].time &&
+      prev[prev.length - 1].time === lc.time
+    ) {
+      const next = prev.slice();
+      next[next.length - 1] = lc;
+      candleMergedRef.current = next;
+      return next;
+    }
+
     const map = new Map<number, CandlePoint>();
-    for (const c of candlesProp ?? []) map.set(c.time, c);
-    if (liveCandle) map.set(liveCandle.time, liveCandle);
-    return [...map.values()].sort((a, b) => a.time - b.time);
+    for (const c of cp) map.set(c.time, c);
+    if (lc) map.set(lc.time, lc);
+    const next = [...map.values()].sort((a, b) => a.time - b.time);
+    candleMergedRef.current = next;
+    return next;
   }, [isCandle, candlesProp, liveCandle]);
 
   const candleVisible = useMemo(() => {
@@ -1293,6 +1321,12 @@ export function NativeLiveLineChart({
   const svMorphDataCount = useSharedValue(0);
   const liveCandleBucketRef = useRef<number | null>(null);
 
+  /** Full point arrays stored in SharedValues so worklets can read them without host-array deps. */
+  const svEffectiveDataArr = useSharedValue<LiveLinePoint[]>([]);
+  const svMorphLineDataArr = useSharedValue<LiveLinePoint[]>([]);
+  const svCandleVisibleArr = useSharedValue<CandlePoint[]>([]);
+  const svCandleWidthSecs = useSharedValue(1);
+
   const [lineMorphJs, setLineMorphJs] = useState(0);
   useAnimatedReaction(
     () => ({
@@ -1376,6 +1410,7 @@ export function NativeLiveLineChart({
     tipV: 0,
     morphTipV: 0,
   });
+
   const setPinchWindowStable = useCallback((nextWindow: number | null) => {
     setPinchWindow((prev) => {
       if (prev === nextWindow) return prev;
@@ -1960,6 +1995,19 @@ export function NativeLiveLineChart({
     }
   }, [morphLineData, svLastMorphDataT, svLastMorphDataV, svMorphDataCount]);
 
+  useEffect(() => {
+    svEffectiveDataArr.value = effectiveData;
+    svMorphLineDataArr.value = morphLineData;
+  }, [effectiveData, morphLineData, svEffectiveDataArr, svMorphLineDataArr]);
+
+  useEffect(() => {
+    svCandleVisibleArr.value = candleVisibleForLayout;
+  }, [candleVisibleForLayout, svCandleVisibleArr]);
+
+  useEffect(() => {
+    svCandleWidthSecs.value = candleWidthSecs;
+  }, [candleWidthSecs, svCandleWidthSecs]);
+
   /* ---- degen burst ---- */
   const spawnPt = useMemo(
     () => ({
@@ -2350,9 +2398,9 @@ export function NativeLiveLineChart({
     const ht =
       leftEdge +
       ((dvHoverX.value - pad.left) / Math.max(1, chartW)) * (rightEdge - leftEdge);
-    const hv = interpAtTime(effectiveData, ht, svTipT.value, svTipV.value);
+    const hv = interpAtTime(svEffectiveDataArr.value, ht, svTipT.value, svTipV.value);
     return toScreenY(hv, svMin.value, svMax.value, layout.height, pad);
-  }, [chartW, win, layout.height, pad, scrub, effectiveData, buf, isCandle]);
+  }, [chartW, win, layout.height, pad, scrub, buf, isCandle]);
 
   const dvCrossEffectiveOp = useDerivedValue(() => {
     const scrubAmt = svScrubOp.value;
@@ -2464,10 +2512,7 @@ export function NativeLiveLineChart({
       opacity: baseOp,
       width: totalW,
       height: pillH + 10,
-      transform: [
-        { translateX: badgeX },
-        { translateY: badgeY },
-      ],
+      transform: [{ translateX: badgeX }, { translateY: badgeY }],
     };
   });
 
@@ -2550,6 +2595,7 @@ export function NativeLiveLineChart({
   );
 
   // Gestures — scrub pan with optional point snapping, plus optional pinch-to-zoom.
+  // Arrays are read from SharedValues so the gesture memo stays stable across ticks.
   const gesture = useMemo(() => {
     const panGesture = Gesture.Pan()
       .enabled(scrub)
@@ -2561,7 +2607,9 @@ export function NativeLiveLineChart({
         let hv: number;
         let ht: number;
         let cand: CandlePoint | undefined;
-        if (isCandle && candleVisibleForLayout.length > 0) {
+        const candleVis = svCandleVisibleArr.value;
+        const effData = svEffectiveDataArr.value;
+        if (isCandle && candleVis.length > 0) {
           const c = sampleCandleScrubAtX(
             e.x,
             layout.width,
@@ -2570,8 +2618,8 @@ export function NativeLiveLineChart({
             buf,
             svTipT.value,
             svTipV.value,
-            candleVisibleForLayout,
-            candleWidthSecs,
+            candleVis,
+            svCandleWidthSecs.value,
           );
           const morphT = svLineModeProg.value;
           if (morphT < 1e-4) {
@@ -2588,7 +2636,7 @@ export function NativeLiveLineChart({
               buf,
               svTipT.value,
               svTipV.value,
-              effectiveData,
+              effData,
               snapToPointScrubbing,
             );
             const b = candleLineMorphScrubBlend(morphT, c, l);
@@ -2606,7 +2654,7 @@ export function NativeLiveLineChart({
             buf,
             svTipT.value,
             svTipV.value,
-            effectiveData,
+            effData,
             snapToPointScrubbing,
           );
           hx = sample.hx;
@@ -2627,7 +2675,9 @@ export function NativeLiveLineChart({
         let ht: number;
         let liveX: number;
         let cand: CandlePoint | undefined;
-        if (isCandle && candleVisibleForLayout.length > 0) {
+        const candleVis = svCandleVisibleArr.value;
+        const effData = svEffectiveDataArr.value;
+        if (isCandle && candleVis.length > 0) {
           const c = sampleCandleScrubAtX(
             e.x,
             layout.width,
@@ -2636,8 +2686,8 @@ export function NativeLiveLineChart({
             buf,
             svTipT.value,
             svTipV.value,
-            candleVisibleForLayout,
-            candleWidthSecs,
+            candleVis,
+            svCandleWidthSecs.value,
           );
           const morphT = svLineModeProg.value;
           if (morphT < 1e-4) {
@@ -2655,7 +2705,7 @@ export function NativeLiveLineChart({
               buf,
               svTipT.value,
               svTipV.value,
-              effectiveData,
+              effData,
               snapToPointScrubbing,
             );
             const b = candleLineMorphScrubBlend(morphT, c, l);
@@ -2674,7 +2724,7 @@ export function NativeLiveLineChart({
             buf,
             svTipT.value,
             svTipV.value,
-            effectiveData,
+            effData,
             snapToPointScrubbing,
           );
           hx = sample.hx;
@@ -2749,8 +2799,6 @@ export function NativeLiveLineChart({
   }, [
     applyScrubTip,
     buf,
-    candleVisibleForLayout,
-    candleWidthSecs,
     clearScrubTip,
     isCandle,
     layout.width,
@@ -2773,8 +2821,10 @@ export function NativeLiveLineChart({
     svTipT,
     svTipV,
     svLineModeProg,
-    effectiveData,
     win,
+    svCandleVisibleArr,
+    svCandleWidthSecs,
+    svEffectiveDataArr,
   ]);
 
   const scrubTipLayout = useMemo(() => {

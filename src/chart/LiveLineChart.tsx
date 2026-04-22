@@ -2,6 +2,7 @@ import { Platform, StyleSheet, Text, View } from 'react-native';
 
 import { resolvePalette } from './theme';
 import { NativeLiveLineChart } from './NativeLiveLineChart';
+import { NativeStaticLineChart } from './NativeStaticLineChart';
 import { NativeMultiSeriesChart } from './NativeMultiSeriesChart';
 import type { LiveLineChartProps } from './types';
 
@@ -9,6 +10,10 @@ export function LiveLineChart(props: LiveLineChartProps) {
   if (Platform.OS !== 'web') {
     if (props.series && props.series.length > 0) {
       return <NativeMultiSeriesChart {...props} />;
+    }
+    if (props.static) {
+      // Static variant: identical visuals, no live animation engine overhead
+      return <NativeStaticLineChart {...props} />;
     }
     // NativeLiveLineChart handles both line and candle modes via its animation engine
     return <NativeLiveLineChart {...props} />;

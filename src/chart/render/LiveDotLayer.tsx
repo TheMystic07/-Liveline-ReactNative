@@ -1,4 +1,5 @@
 import { Circle, Group, Shadow } from '@shopify/react-native-skia';
+import { memo } from 'react';
 
 type LiveDotLayerProps = {
   revealOpacity: number | any;
@@ -11,7 +12,7 @@ type LiveDotLayerProps = {
   innerColor: string;
 };
 
-export function LiveDotLayer({
+function LiveDotLayerImpl({
   revealOpacity,
   liveX,
   liveY,
@@ -35,3 +36,5 @@ export function LiveDotLayer({
     </Group>
   );
 }
+
+export const LiveDotLayer = memo(LiveDotLayerImpl);

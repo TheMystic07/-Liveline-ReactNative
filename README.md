@@ -31,7 +31,7 @@ npm start
 Once published:
 
 ```bash
-npm install @themystic07/liveline-native
+npm install @gurshabad90/liveline-native
 ```
 
 Required peer dependencies in the consuming app:
@@ -53,7 +53,7 @@ import { LiveLineChart, type LiveLinePoint } from './src/chart';
 From the published package:
 
 ```tsx
-import { LiveLineChart, type LiveLinePoint } from '@themystic07/liveline-native';
+import { LiveLineChart, type LiveLinePoint } from '@gurshabad90/liveline-native';
 ```
 
 ## Minimal Example
@@ -328,7 +328,7 @@ npm publish --access public
 Before the first publish, verify:
 
 - the package name in [package.json](/D:/Code/YEET/LivelineRewriteCODEX/liveline-native/package.json:1) is available on npm
-- the npm account has access to the `@themystic07` scope, or change the package name to one you control
+- the npm account has access to the `@gurshabad90` scope, or change the package name to one you control
 
 ## Demo Reference
 

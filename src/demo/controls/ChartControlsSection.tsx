@@ -51,6 +51,11 @@ function ChartControlsSectionInner({
         <Chip active={config.chartView === 'candle'} label="Candle" onPress={() => config.setChartView('candle')} theme={theme} accent={accent} />
       </ControlRow>
 
+      <ControlRow label="Engine" labelColor={muted}>
+        <Chip active={!config.staticChart} label="Live" onPress={() => config.setStaticChart(false)} theme={theme} accent={accent} />
+        <Chip active={config.staticChart} label="Static" onPress={() => config.setStaticChart(true)} theme={theme} accent={accent} />
+      </ControlRow>
+
       <ControlRow label="Effects" labelColor={muted}>
         <Chip
           active={chartViewSupportsOrderbook && config.showOrderbookStream}

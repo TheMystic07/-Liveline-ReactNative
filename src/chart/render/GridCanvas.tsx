@@ -4,6 +4,7 @@ import {
   Line as SkiaLine,
   vec,
 } from '@shopify/react-native-skia';
+import { memo } from 'react';
 import type { SharedValue } from 'react-native-reanimated';
 
 import type { ChartPadding, ChartPalette } from '../types';
@@ -20,7 +21,7 @@ type GridCanvasProps = {
   pal: Pick<ChartPalette, 'gridLine' | 'axisLine'>;
 };
 
-export function GridCanvas({
+function GridCanvasImpl({
   grid,
   gridLabels,
   timeLabels,
@@ -71,3 +72,5 @@ export function GridCanvas({
     </>
   );
 }
+
+export const GridCanvas = memo(GridCanvasImpl);
