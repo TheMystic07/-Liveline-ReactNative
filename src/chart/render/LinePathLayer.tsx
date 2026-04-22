@@ -6,8 +6,7 @@ import {
 } from '@shopify/react-native-skia';
 import { memo } from 'react';
 import {
-  useAnimatedReaction,
-  useSharedValue,
+  useDerivedValue,
   type SharedValue,
 } from 'react-native-reanimated';
 
@@ -35,10 +34,6 @@ type LinePathLayerProps = {
   tipPath?: SharedValue<string>;
 };
 
-type RangeTransform = Array<
-  { translateX: number } | { translateY: number } | { scaleY: number }
->;
-
 function LinePathLayerImpl({
   clipRect,
   leftClip,
@@ -62,22 +57,13 @@ function LinePathLayerImpl({
   rangeTranslateY,
   tipPath,
 }: LinePathLayerProps) {
-  const rangeTransform = useSharedValue<RangeTransform>([
-    { translateX: 0 },
-    { translateY: 0 },
-    { scaleY: 1 },
-  ]);
-
-  useAnimatedReaction(
-    () => ({
-      translateX: rangeTranslateX.value,
-      translateY: rangeTranslateY.value,
-      scaleY: rangeScaleY.value,
-    }),
-    ({ translateX, translateY, scaleY }) => {
-      rangeTransform.value = [{ translateX }, { translateY }, { scaleY }];
-    },
-    [rangeTranslateX, rangeTranslateY, rangeScaleY],
+  const rangeTransform = useDerivedValue(
+    () => [
+      { translateX: rangeTranslateX.value },
+      { translateY: rangeTranslateY.value },
+      { scaleY: rangeScaleY.value },
+    ],
+    [rangeTranslateX, rangeScaleY, rangeTranslateY],
   );
 
   if (!clipRect) return null;

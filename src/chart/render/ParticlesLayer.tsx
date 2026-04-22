@@ -48,7 +48,7 @@ type ParticlesLayerProps = {
   opacity: number | SharedValue<number>;
 };
 
-export function ParticlesLayer({
+function ParticlesLayerImpl({
   enabled,
   particles,
   burstLife,
@@ -64,3 +64,5 @@ export function ParticlesLayer({
     </Group>
   );
 }
+
+export const ParticlesLayer = React.memo(ParticlesLayerImpl);

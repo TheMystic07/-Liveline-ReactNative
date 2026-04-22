@@ -81,7 +81,7 @@ export function calcGridTicksJs(
   const ppu = chartHeight / range;
   const coarse = pickValueInterval(range, ppu, 36, 1);
   const fine = coarse / 2;
-  const ticks: Array<{ key: number; value: number; y: number; text: string; alpha: number; isCoarse: boolean }> = [];
+  const ticks: Array<{ key: number; value: number; y: number; text: string; alpha: number; isCoarse: boolean; fineOp: number }> = [];
   const first = Math.ceil(min / fine) * fine;
   for (let value = first; value <= max; value += fine) {
     const y = toScreenYJs(value, min, max, height, pad);
@@ -93,6 +93,7 @@ export function calcGridTicksJs(
       text: formatValue(value),
       alpha: isCoarse ? 1 : 0.7,
       isCoarse,
+      fineOp: isCoarse ? 1 : 0.7,
     });
   }
   return ticks;
@@ -108,11 +109,12 @@ export function calcTimeTicksJs(
   const chartWidth = width - pad.left - pad.right;
   const interval = niceTimeInterval(rightEdge - leftEdge);
   const first = Math.ceil(leftEdge / interval) * interval;
-  const ticks: Array<{ key: number; x: number; text: string; alpha: number; width: number }> = [];
+  const ticks: Array<{ key: number; time: number; x: number; text: string; alpha: number; width: number }> = [];
   for (let time = first; time <= rightEdge && ticks.length < 30; time += interval) {
     const text = formatTime(time);
     ticks.push({
       key: Math.round(time * 100),
+      time,
       x: toScreenXJs(time, leftEdge, rightEdge, width, pad),
       text,
       alpha: 1,

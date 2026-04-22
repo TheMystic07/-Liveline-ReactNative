@@ -10,6 +10,9 @@ import type { SharedValue } from 'react-native-reanimated';
 import type { ChartPadding, ChartPalette } from '../types';
 import type { TrackedGridLabel, TrackedTimeLabel } from './useTrackedAxisLabels';
 
+/** Extracted to module scope to avoid per-render array allocations. */
+const GRID_DASH_INTERVALS = [1, 3] as const;
+
 type GridCanvasProps = {
   grid: boolean;
   gridLabels: readonly TrackedGridLabel[];
@@ -43,7 +46,7 @@ function GridCanvasImpl({
                 color={pal.gridLine}
                 strokeWidth={1}
               >
-                <DashPathEffect intervals={[1, 3]} />
+                <DashPathEffect intervals={GRID_DASH_INTERVALS} />
               </SkiaLine>
             </Group>
           ))}

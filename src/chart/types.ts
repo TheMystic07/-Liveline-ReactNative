@@ -231,6 +231,12 @@ export interface LiveLineChartProps {
    * Matches upstream Liveline default `0.08`.
    */
   lerpSpeed?: number;
+  /**
+   * Artificial stream delay in seconds. When set to `1` or `3`, the chart renders
+   * data from that many seconds ago and linearly interpolates between historical
+   * points so the line stays flowy even with sparse ticks.
+   */
+  streamDelay?: 0 | 1 | 3;
   style?: ViewStyle;
   contentInset?: Partial<ChartPadding>;
 }

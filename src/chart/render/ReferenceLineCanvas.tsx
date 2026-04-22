@@ -13,6 +13,7 @@ type ReferenceLineCanvasProps = {
 
 const LABEL_GAP = 10;
 const LABEL_CHAR_W = 7;
+const REF_DASH_INTERVALS: readonly [number, number] = [4, 4];
 
 function readWorklet(v: number | SharedValue<number>): number {
   'worklet';
@@ -51,7 +52,7 @@ export function ReferenceLineCanvas({
         </>
       ) : (
         <SkiaLine p1={p1Full} p2={p2Full} color={lineColor} strokeWidth={1}>
-          <DashPathEffect intervals={[4, 4]} />
+          <DashPathEffect intervals={REF_DASH_INTERVALS} />
         </SkiaLine>
       )}
     </Group>

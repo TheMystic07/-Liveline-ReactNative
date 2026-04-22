@@ -19,3 +19,5 @@ export type {
 } from './types';
 export { LivelineTransition } from './LivelineTransition';
 export type { LivelineTransitionProps } from './LivelineTransition';
+export { StaticChart } from './StaticChart';
+export type { StaticChartProps } from './staticTypes';

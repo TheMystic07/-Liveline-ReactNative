@@ -11,4 +11,10 @@ config.resolver = {
   assetExts: (config.resolver.assetExts ?? []).filter((ext) => ext !== 'cjs'),
 };
 
+// Improve startup time by deferring module evaluation until first use
+config.transformer = {
+  ...config.transformer,
+  inlineRequires: true,
+};
+
 module.exports = config;

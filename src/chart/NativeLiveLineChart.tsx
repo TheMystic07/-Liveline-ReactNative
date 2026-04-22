@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { LayoutChangeEvent } from 'react-native';
 import { Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import {
@@ -14,6 +14,7 @@ import {
   rect,
   vec,
 } from '@shopify/react-native-skia';
+import type { SkPath } from '@shopify/react-native-skia';
 import { useSkiaFont } from 'number-flow-react-native/skia';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
@@ -86,7 +87,7 @@ import {
   LOADING_AMPLITUDE_RATIO,
   LOADING_SCROLL_SPEED,
 } from './draw/loadingShape';
-import { buildPath, buildSplinePath } from './draw/buildLiveLinePath';
+import { buildPath, buildSplinePath, buildPathToSkPath, buildSplinePathToSkPath } from './draw/buildLiveLinePath';
 import { decayShake, randomShakeOffset, shakeAmplitude } from './draw/shake';
 import { monotoneSplinePath } from './math/spline';
 
@@ -143,6 +144,8 @@ const MAX_DELTA_MS = 50;
 const CANDLE_OHLC_LERP_SPEED = 0.25;
 /** Upstream `LINE_MORPH_MS` — line↔candle morph duration. */
 const LINE_MORPH_MS = 500;
+/** Extracted to module scope to avoid per-render array allocations. */
+const PRICE_DASH_INTERVALS: readonly [number, number] = [4, 4];
 /** Throttle JS merges while OHLC lerps on the UI thread (ms). */
 const CANDLE_SMOOTH_EMIT_MS = 32;
 const ENGINE_IDLE_STOP_MS = 60;
@@ -182,6 +185,10 @@ const GRID_LABEL_FADE_IN = 0.18;
 const GRID_LABEL_FADE_OUT = 0.12;
 const LIVE_TAIL_HISTORY_POINTS = 3;
 
+/** Pre-allocated flat buffers for tail path — avoids per-frame GC (max ~5 points). */
+const _tailX = new Float64Array(8);
+const _tailY = new Float64Array(8);
+
 type RangeTransform = Array<
   { translateX: number } | { translateY: number } | { scaleY: number }
 >;
@@ -208,6 +215,30 @@ function computeAdaptiveSpeed(
   const prevRange = displayMax - displayMin || 1;
   const gapRatio = Math.min(valGap / prevRange, 1);
   return lerpSpeed + (1 - gapRatio) * ADAPTIVE_SPEED_BOOST;
+}
+
+/** Linearly interpolate a value from a time-sorted `LiveLinePoint` array at time `t`. */
+function interpolateValueAtTime(
+  pts: readonly LiveLinePoint[],
+  t: number,
+  fallback: number,
+): number {
+  'worklet';
+  if (pts.length === 0) return fallback;
+  if (pts.length === 1) return pts[0]!.value;
+  if (t <= pts[0]!.time) return pts[0]!.value;
+  const last = pts[pts.length - 1]!;
+  if (t >= last.time) return last.value;
+  // Scan backwards — t is usually near the end
+  for (let i = pts.length - 1; i > 0; i--) {
+    const p1 = pts[i - 1]!;
+    const p2 = pts[i]!;
+    if (t >= p1.time && t <= p2.time) {
+      const ratio = (t - p1.time) / (p2.time - p1.time || 1);
+      return p1.value + (p2.value - p1.value) * ratio;
+    }
+  }
+  return fallback;
 }
 
 function defaultFmtVal(v: number) {
@@ -585,7 +616,7 @@ function buildAnimatedTailPath(
   const yMax = h - pad.bottom;
   const clampY = (y: number) => Math.max(yMin, Math.min(yMax, y));
 
-  const screenPoints: Array<{ x: number; y: number }> = [];
+  let spCount = 0;
   const tailStart = Math.max(0, pts.length - LIVE_TAIL_HISTORY_POINTS);
   for (let i = tailStart; i < pts.length; i++) {
     const point = pts[i]!;
@@ -594,22 +625,102 @@ function buildAnimatedTailPath(
       pad.left + ((point.time - leftEdgeBuild) / (rightEdgeBuild - leftEdgeBuild || 1)) * cw + dx;
     const yBuild = pad.top + (1 - (value - buildMin) / buildSpan) * ch;
     const y = clampY(yBuild * scaleY + translateY);
-    screenPoints.push({ x, y });
+    _tailX[spCount] = x;
+    _tailY[spCount] = y;
+    spCount++;
   }
 
-  if (screenPoints.length === 0) return '';
+  if (spCount === 0) return '';
 
   const tipX =
     pad.left + ((tipT - leftEdgeCurrent) / (rightEdgeCurrent - leftEdgeCurrent || 1)) * cw;
   const tipY = clampY(pad.top + (1 - (tipV - currentMin) / currentSpan) * ch);
-  const last = screenPoints[screenPoints.length - 1]!;
-  if (Math.abs(last.x - tipX) < 0.5) {
-    screenPoints[screenPoints.length - 1] = { x: tipX, y: tipY };
+  if (Math.abs(_tailX[spCount - 1]! - tipX) < 0.5) {
+    _tailX[spCount - 1] = tipX;
+    _tailY[spCount - 1] = tipY;
   } else {
-    screenPoints.push({ x: tipX, y: tipY });
+    _tailX[spCount] = tipX;
+    _tailY[spCount] = tipY;
+    spCount++;
   }
 
+  const screenPoints: Array<{ x: number; y: number }> = new Array(spCount);
+  for (let i = 0; i < spCount; i++) {
+    screenPoints[i] = { x: _tailX[i]!, y: _tailY[i]! };
+  }
   return buildSplinePath(screenPoints);
+}
+
+function buildAnimatedTailPathToSkPath(
+  path: SkPath,
+  pts: readonly LiveLinePoint[],
+  tipT: number,
+  tipV: number,
+  buildTipT: number,
+  buildMin: number,
+  buildMax: number,
+  currentMin: number,
+  currentMax: number,
+  w: number,
+  h: number,
+  pad: ChartPadding,
+  win: number,
+  buf: number,
+) {
+  'worklet';
+  path.reset();
+  if (pts.length === 0 || w <= 0 || h <= 0) return;
+
+  const ch = Math.max(1, h - pad.top - pad.bottom);
+  const cw = Math.max(1, w - pad.left - pad.right);
+  const buildSpan = Math.max(1e-4, buildMax - buildMin);
+  const currentSpan = Math.max(1e-4, currentMax - currentMin);
+  const rightEdgeBuild = buildTipT + win * buf;
+  const leftEdgeBuild = rightEdgeBuild - win;
+  const rightEdgeCurrent = tipT + win * buf;
+  const leftEdgeCurrent = rightEdgeCurrent - win;
+  const dx = -((tipT - buildTipT) / Math.max(win, 1e-4)) * cw;
+  const scaleY = buildSpan / currentSpan;
+  const translateY =
+    (pad.top + ch) * (1 - scaleY) + ((currentMin - buildMin) / buildSpan) * ch * scaleY;
+  const yMin = pad.top;
+  const yMax = h - pad.bottom;
+  const clampY = (y: number) => Math.max(yMin, Math.min(yMax, y));
+
+  // Use tiny fixed-size flat arrays (LIVE_TAIL_HISTORY_POINTS = 3, so max ~5 points)
+  let spCount = 0;
+  const tailStart = Math.max(0, pts.length - LIVE_TAIL_HISTORY_POINTS);
+  for (let i = tailStart; i < pts.length; i++) {
+    const point = pts[i]!;
+    const value = i === pts.length - 1 ? tipV : point.value;
+    const x =
+      pad.left + ((point.time - leftEdgeBuild) / (rightEdgeBuild - leftEdgeBuild || 1)) * cw + dx;
+    const yBuild = pad.top + (1 - (value - buildMin) / buildSpan) * ch;
+    const y = clampY(yBuild * scaleY + translateY);
+    _tailX[spCount] = x;
+    _tailY[spCount] = y;
+    spCount++;
+  }
+
+  if (spCount === 0) return;
+
+  const tipX =
+    pad.left + ((tipT - leftEdgeCurrent) / (rightEdgeCurrent - leftEdgeCurrent || 1)) * cw;
+  const tipY = clampY(pad.top + (1 - (tipV - currentMin) / currentSpan) * ch);
+  if (Math.abs(_tailX[spCount - 1]! - tipX) < 0.5) {
+    _tailX[spCount - 1] = tipX;
+    _tailY[spCount - 1] = tipY;
+  } else {
+    _tailX[spCount] = tipX;
+    _tailY[spCount] = tipY;
+    spCount++;
+  }
+
+  const screenPoints: Array<{ x: number; y: number }> = new Array(spCount);
+  for (let i = 0; i < spCount; i++) {
+    screenPoints[i] = { x: _tailX[i]!, y: _tailY[i]! };
+  }
+  buildSplinePathToSkPath(path, screenPoints);
 }
 
 /* ------------------------------------------------------------------ */
@@ -677,7 +788,7 @@ function spawnBurst(
 /*  Sub-components                                                     */
 /* ================================================================== */
 
-function WindowBtn({
+const WindowBtn = React.memo(function WindowBtn({
   active,
   label,
   onPress,
@@ -718,7 +829,7 @@ function WindowBtn({
       </Text>
     </Pressable>
   );
-}
+});
 
 /* ================================================================== */
 /*  Main Component                                                     */
@@ -761,6 +872,7 @@ export function NativeLiveLineChart({
   formatValue = defaultFmtVal,
   formatTime = defaultFmtTime,
   lerpSpeed = 0.08,
+  streamDelay = 0,
   mode,
   candles: candlesProp,
   liveCandle,
@@ -1199,7 +1311,10 @@ export function NativeLiveLineChart({
   }, [candleTip, pal.dashLine]);
 
   /* ---- shared values ---- */
-  const svTipT = useSharedValue(now);
+  const initialTipT = streamDelay > 0 && effectiveData.length > 0
+    ? Math.max(effectiveData[0]!.time, now - streamDelay)
+    : now;
+  const svTipT = useSharedValue(initialTipT);
   /** Last sample timestamp from props — `svTipT` eases toward max(this, wall clock) when the feed gaps. */
   const svDataTipT = useSharedValue(now);
   const svTipV = useSharedValue(effectiveValue);
@@ -1210,6 +1325,7 @@ export function NativeLiveLineChart({
   const svRawValue = useSharedValue(effectiveValue);
   const svChartH = useSharedValue(Math.max(1, chartH));
   const svLerpSpeed = useSharedValue(lerpSpeed);
+  const svStreamDelay = useSharedValue(streamDelay);
   const svGridFlushAcc = useSharedValue(0);
   const svGridOn = useSharedValue(grid ? 1 : 0);
   const svPinchStartWin = useSharedValue(baseWin);
@@ -1222,6 +1338,8 @@ export function NativeLiveLineChart({
   /** Throttle scrub tooltip runOnJS — line/crosshair still follow every frame via svScrubX. */
   const svScrubJsLastTs = useSharedValue(0);
   const svScrubJsLastHx = useSharedValue(-1e9);
+  /** Throttle badge label runOnJS to ~42 Hz max (reduces JS thread pressure). */
+  const svBadgeLastJsFlush = useSharedValue(0);
   const svScrubJsLastOp = useSharedValue(-1);
   const svBurst = useSharedValue(0);
   /** Single 0→1 timeline for all particles in the current burst (one `withTiming` instead of N). */
@@ -1419,6 +1537,9 @@ export function NativeLiveLineChart({
     (q, prev) => {
       'worklet';
       if (prev !== undefined && q === prev) return;
+      const t = Date.now();
+      if (t - svBadgeLastJsFlush.value < 24) return; // ~42 Hz max
+      svBadgeLastJsFlush.value = t;
       runOnJS(setBadgeFromQuant)(q);
     },
     [badgeQuantMul, setBadgeFromQuant],
@@ -1430,33 +1551,34 @@ export function NativeLiveLineChart({
       return { min: lo, max: hi };
     });
   }, []);
+  /** Batch simple SharedValue config updates to reduce effect overhead. */
   useEffect(() => {
     svLerpSpeed.value = lerpSpeed;
-  }, [lerpSpeed, svLerpSpeed]);
-
-  useEffect(() => {
+    svStreamDelay.value = streamDelay;
     svChartH.value = Math.max(1, chartH);
-  }, [chartH, svChartH]);
-
-  useEffect(() => {
     svGridOn.value = grid ? 1 : 0;
-  }, [grid, svGridOn]);
-
-  useEffect(() => {
     svPauseTarget.value = paused ? 1 : 0;
-  }, [paused, svPauseTarget]);
+  }, [lerpSpeed, streamDelay, chartH, grid, paused, svLerpSpeed, svStreamDelay, svChartH, svGridOn, svPauseTarget]);
 
+  /** Batch data-driven SharedValue updates. */
   useEffect(() => {
     if (isCandle && liveCandle) {
       svRawValue.value = liveCandle.close;
     } else {
       svRawValue.value = effectiveValue;
     }
-  }, [isCandle, liveCandle, effectiveValue, svRawValue]);
-
-  useEffect(() => {
     svMorphTipV.value = lineValue ?? effectiveValue;
-  }, [effectiveValue, lineValue, svMorphTipV]);
+    svDataTipT.value = now;
+  }, [
+    isCandle,
+    liveCandle,
+    effectiveValue,
+    lineValue,
+    now,
+    svRawValue,
+    svMorphTipV,
+    svDataTipT,
+  ]);
 
   useEffect(() => {
     svIsCandleFlag.value = isCandle ? 1 : 0;
@@ -1510,11 +1632,6 @@ export function NativeLiveLineChart({
     svSmLiveL,
     svSmLiveC,
   ]);
-
-  /** Keep data tip time on the UI thread (live dot eases toward wall clock in `onEngineFrame`). */
-  useEffect(() => {
-    svDataTipT.value = now;
-  }, [now, svDataTipT]);
 
   useEffect(() => {
     if (empty) return;
@@ -1667,11 +1784,27 @@ export function NativeLiveLineChart({
       if (pauseProgress < 0.995) {
         const wall = Date.now() / 1000;
         const dataT = svDataTipT.value;
-        const targetT = wall > dataT ? wall : dataT;
-        let tipT = svTipT.value;
-        tipT = lerpFr(tipT, targetT, LIVE_TIP_CLOCK_CATCHUP, Math.max(engineDt, 0.0001));
-        if (Math.abs(tipT - targetT) < 0.002) tipT = targetT;
-        svTipT.value = tipT;
+        const delay = svStreamDelay.value;
+        if (delay > 0) {
+          // Delayed mode: tip advances linearly with wall clock, offset by delay.
+          // Value is interpolated from historical data at the delayed time for a
+          // perfectly flowy line even with sparse (1s / 3s) ticks.
+          let targetT = wall - delay;
+          const pts = svEffectiveDataArr.value;
+          if (pts.length > 0) {
+            const firstT = pts[0]!.time;
+            const lastT = pts[pts.length - 1]!.time;
+            if (targetT < firstT) targetT = firstT;
+            if (targetT > lastT) targetT = lastT;
+          }
+          svTipT.value = targetT;
+        } else {
+          const targetT = wall > dataT ? wall : dataT;
+          let tipT = svTipT.value;
+          tipT = lerpFr(tipT, targetT, LIVE_TIP_CLOCK_CATCHUP, Math.max(engineDt, 0.0001));
+          if (Math.abs(tipT - targetT) < 0.002) tipT = targetT;
+          svTipT.value = tipT;
+        }
       }
 
       /* ---- Horizontal scroll transform (static path follows tip time) ---- */
@@ -1705,18 +1838,26 @@ export function NativeLiveLineChart({
         svReveal.value = rev;
       }
 
-      /* ---- Value smoothing (unchanged base logic, matches upstream exactly) ---- */
+      /* ---- Value smoothing (live) or historical interpolation (delayed) ---- */
       const ch = svChartH.value;
       const dmin0 = svMin.value;
       const dmax0 = svMax.value;
-      const disp = svTipV.value;
-      const tgt = svRawValue.value;
-      const ls = svLerpSpeed.value;
-      const spd = computeAdaptiveSpeed(tgt, disp, dmin0, dmax0, ls);
-      const prevR = dmax0 - dmin0 || 1;
-      let nextDisp = lerpFr(disp, tgt, spd, engineDt);
-      if (Math.abs(nextDisp - tgt) < prevR * VALUE_SNAP_THRESHOLD) nextDisp = tgt;
-      svTipV.value = nextDisp;
+      const delay = svStreamDelay.value;
+      if (delay > 0) {
+        // Delayed mode: sample the data array at the delayed tip time for
+        // smooth, flowy motion between sparse ticks.
+        const pts = svEffectiveDataArr.value;
+        svTipV.value = interpolateValueAtTime(pts, svTipT.value, svRawValue.value);
+      } else {
+        const disp = svTipV.value;
+        const tgt = svRawValue.value;
+        const ls = svLerpSpeed.value;
+        const spd = computeAdaptiveSpeed(tgt, disp, dmin0, dmax0, ls);
+        const prevR = dmax0 - dmin0 || 1;
+        let nextDisp = lerpFr(disp, tgt, spd, engineDt);
+        if (Math.abs(nextDisp - tgt) < prevR * VALUE_SNAP_THRESHOLD) nextDisp = tgt;
+        svTipV.value = nextDisp;
+      }
 
       /* ---- Live candle OHLC smoothing (upstream `CANDLE_LERP_SPEED`) ---- */
       if (svIsCandleFlag.value === 1) {
@@ -2022,9 +2163,13 @@ export function NativeLiveLineChart({
   /*  ALL derived values (hooks) — BEFORE return                      */
   /* ================================================================ */
 
-  const clipRect = chartW > 0 && chartH > 0
-    ? rect(pad.left - 1, pad.top, chartW + 2, chartH)
-    : undefined;
+  const clipRect = useMemo(
+    () =>
+      chartW > 0 && chartH > 0
+        ? rect(pad.left - 1, pad.top, chartW + 2, chartH)
+        : undefined,
+    [chartW, chartH, pad.left, pad.top],
+  );
 
   const staticLinePath = useMemo(
     () =>
@@ -2046,10 +2191,6 @@ export function NativeLiveLineChart({
     [effectiveData, buildSnapshot, layout.width, layout.height, pad, win, buf],
   );
 
-  useEffect(() => {
-    svStaticLinePath.value = staticLinePath;
-  }, [staticLinePath, svStaticLinePath]);
-
   const staticMorphLinePath = useMemo(
     () =>
       buildPath(
@@ -2070,10 +2211,6 @@ export function NativeLiveLineChart({
     [morphLineData, buildSnapshot, layout.width, layout.height, pad, win, buf],
   );
 
-  useEffect(() => {
-    svStaticMorphLinePath.value = staticMorphLinePath;
-  }, [staticMorphLinePath, svStaticMorphLinePath]);
-
   const staticFillPath = useMemo(
     () =>
       buildPath(
@@ -2092,9 +2229,19 @@ export function NativeLiveLineChart({
     [effectiveData, buildSnapshot, layout.width, layout.height, pad, win, buf],
   );
 
+  /** Batch static path SharedValue updates into a single effect. */
   useEffect(() => {
+    svStaticLinePath.value = staticLinePath;
+    svStaticMorphLinePath.value = staticMorphLinePath;
     svStaticFillPath.value = staticFillPath;
-  }, [staticFillPath, svStaticFillPath]);
+  }, [
+    staticLinePath,
+    staticMorphLinePath,
+    staticFillPath,
+    svStaticLinePath,
+    svStaticMorphLinePath,
+    svStaticFillPath,
+  ]);
 
   const tipPadL = pad.left;
   const tipPadR = pad.right;
@@ -3245,7 +3392,7 @@ export function NativeLiveLineChart({
                       color={isCandle ? candleBadgeDashColor : pal.dashLine}
                       strokeWidth={1}
                     >
-                      <DashPathEffect intervals={[4, 4]} />
+                      <DashPathEffect intervals={PRICE_DASH_INTERVALS} />
                     </SkiaLine>
                   </Group>
 
