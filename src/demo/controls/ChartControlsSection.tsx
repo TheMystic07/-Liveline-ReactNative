@@ -20,8 +20,6 @@ type Props = {
   chartViewSupportsOrderbook: boolean;
   chartViewSupportsGradient: boolean;
   chartViewSupportsTrailGlow: boolean;
-  /** Native Skia: snapshot one-shot line chart; web falls back to live. */
-  snapshotSupported: boolean;
 };
 
 function ChartControlsSectionInner({
@@ -31,12 +29,8 @@ function ChartControlsSectionInner({
   chartViewSupportsOrderbook,
   chartViewSupportsGradient,
   chartViewSupportsTrailGlow,
-  snapshotSupported,
 }: Props) {
   const { theme, accent } = config;
-  const lineView = config.chartView === 'line';
-  const liveActive = lineView && (config.lineRenderer === 'live' || !snapshotSupported);
-  const snapshotActive = lineView && config.lineRenderer === 'snapshot' && snapshotSupported;
   return (
     <View>
       <ControlRow label="Theme" labelColor={muted}>
@@ -67,7 +61,6 @@ function ChartControlsSectionInner({
           active={config.chartView === 'multi'}
           label="Multi"
           onPress={() => {
-            config.setLineRenderer('live');
             config.setChartView('multi');
           }}
           theme={theme}
@@ -77,28 +70,8 @@ function ChartControlsSectionInner({
           active={config.chartView === 'candle'}
           label="Candle"
           onPress={() => {
-            config.setLineRenderer('live');
             config.setChartView('candle');
           }}
-          theme={theme}
-          accent={accent}
-        />
-      </ControlRow>
-
-      <ControlRow label="Line" labelColor={muted}>
-        <Chip
-          active={liveActive}
-          label="Live"
-          onPress={() => config.setLineRenderer('live')}
-          disabled={!lineView}
-          theme={theme}
-          accent={accent}
-        />
-        <Chip
-          active={snapshotActive}
-          label="Snapshot"
-          onPress={() => config.setLineRenderer('snapshot')}
-          disabled={!lineView || !snapshotSupported}
           theme={theme}
           accent={accent}
         />

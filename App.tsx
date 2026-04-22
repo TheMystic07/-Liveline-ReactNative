@@ -1,13 +1,11 @@
-import { useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useMemo } from 'react';
 import { StatusBar } from 'expo-status-bar';
-import { Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 import {
   LiveLineChart,
-  SnapshotLineChart,
-  type LiveLinePoint,
   type LiveLineSeries,
   type LiveOrderbookSnapshot,
 } from './src/chart';
@@ -78,34 +76,19 @@ export default function App() {
       const offset = seedOffset(id);
       const base = d[0]?.value ?? 100;
       const biasOffset = base * bias;
-      const points: LiveLinePoint[] = d.map((point, index) => {
+      const points = d.map((point, index) => {
         const t = point.time;
         const harmonic =
           Math.sin(t * 0.73 + offset * 0.11) * 0.52 +
           Math.cos(t * 0.29 + offset * 0.07) * 0.34 +
           Math.sin(index * 0.09 + offset * 0.03) * 0.18;
-        return {
-          time: t,
-          value: point.value + biasOffset + harmonic * scale,
-        };
+        return { time: t, value: point.value + biasOffset + harmonic * scale };
       });
-      return {
-        id,
-        label,
-        color,
-        data: points,
-        value: points[points.length - 1]?.value ?? base,
-      };
+      return { id, label, color, data: points, value: points[points.length - 1]?.value ?? base };
     };
 
     return [
-      {
-        id: 'primary',
-        label: 'Primary',
-        color: chart.accent,
-        data: d,
-        value: liveFeed.value,
-      },
+      { id: 'primary', label: 'Primary', color: chart.accent, data: d, value: liveFeed.value },
       makeSeries('hedge', 'Hedge', '#22c55e', -0.02, 0.85),
       makeSeries('arb', 'Arb', '#f59e0b', 0.015, 1.15),
     ];
@@ -128,47 +111,14 @@ export default function App() {
   const modeSupportsGradientLine =
     chart.chartView === 'line' || (chart.chartView === 'candle' && chart.candleLineMorph);
   const modeSupportsDegen = chart.chartView === 'line';
-  const snapshotSupported = Platform.OS !== 'web';
-  const showLineSnapshot =
-    chart.chartView === 'line' && chart.lineRenderer === 'snapshot' && snapshotSupported;
 
-  /** Captured when entering snapshot mode only — not updated on live ticks. */
-  const [snapshotFrozen, setSnapshotFrozen] = useState<{
-    data: LiveLinePoint[];
-    value: number;
-  } | null>(null);
-  const snapshotActiveRef = useRef(false);
-
-  useLayoutEffect(() => {
-    if (!showLineSnapshot) {
-      snapshotActiveRef.current = false;
-      setSnapshotFrozen(null);
-      return;
-    }
-    if (!snapshotActiveRef.current) {
-      snapshotActiveRef.current = true;
-      setSnapshotFrozen({
-        data: liveFeed.data.map((p) => ({ time: p.time, value: p.value })),
-        value: liveFeed.value,
-      });
-    }
-  }, [showLineSnapshot, liveFeed.data, liveFeed.value]);
-
-  const liveReferenceLine = useMemo(
+  const referenceLine = useMemo(
     () =>
-      chart.showReferenceLine ? { value: liveFeed.value - valueDelta / 2, label: 'MID' as const } : undefined,
+      chart.showReferenceLine
+        ? { value: liveFeed.value - valueDelta / 2, label: 'MID' as const }
+        : undefined,
     [chart.showReferenceLine, liveFeed.value, valueDelta],
   );
-
-  const snapshotReferenceLine = useMemo(() => {
-    if (!snapshotFrozen || !chart.showReferenceLine) return undefined;
-    const d = snapshotFrozen.data;
-    const snapDelta =
-      d.length < 2
-        ? 0
-        : snapshotFrozen.value - d[Math.max(0, d.length - 24)].value;
-    return { value: snapshotFrozen.value - snapDelta / 2, label: 'MID' as const };
-  }, [snapshotFrozen, chart.showReferenceLine]);
 
   return (
     <GestureHandlerRootView style={styles.gestureRoot}>
@@ -194,7 +144,6 @@ export default function App() {
                   chartViewSupportsOrderbook={modeSupportsOrderbook}
                   chartViewSupportsGradient={modeSupportsGradientLine}
                   chartViewSupportsTrailGlow={modeSupportsLineTrailGlow}
-                  snapshotSupported={snapshotSupported}
                 />
                 <FeedControlsSection
                   feed={feed}
@@ -217,71 +166,47 @@ export default function App() {
                 Disabled controls do not apply in the current chart mode.
               </Text>
 
-              {showLineSnapshot && snapshotFrozen ? (
-                <SnapshotLineChart
-                  data={snapshotFrozen.data}
-                  value={snapshotFrozen.value}
-                  theme={chart.theme}
-                  color={chart.accent}
-                  window={chart.windowSecs}
-                  badge={chart.showBadge}
-                  badgeVariant={chart.badgeVariant}
-                  liveDotGlow={chart.liveDotGlow}
-                  lineTrailGlow={chart.lineTrailGlow}
-                  gradientLineColoring={chart.gradientLineColoring}
-                  referenceLine={snapshotReferenceLine}
-                  height={320}
-                  emptyText="Waiting for ticks"
-                  snapToPointScrubbing={interaction.snapToPointScrubbing}
-                  scrubHaptics={interaction.scrubHaptics}
-                  tooltipY={14}
-                  tooltipOutline
-                />
-              ) : showLineSnapshot ? (
-                <View style={{ height: 320, borderRadius: 12, backgroundColor: panelBackground }} />
-              ) : (
-                <LiveLineChart
-                  data={liveFeed.data}
-                  value={liveFeed.value}
-                  theme={chart.theme}
-                  color={chart.accent}
-                  window={chart.windowSecs}
-                  windows={DEMO_WINDOW_OPTIONS}
-                  onWindowChange={chart.setWindowSecs}
-                  windowStyle="rounded"
-                  momentum
-                  badge={chart.showBadge}
-                  badgeVariant={chart.badgeVariant}
-                  badgeNumberFlow={chart.badgeNumberFlow}
-                  scrubNumberFlow={interaction.scrubNumberFlow}
-                  scrubHaptics={interaction.scrubHaptics}
-                  snapToPointScrubbing={interaction.snapToPointScrubbing}
-                  pinchToZoom={interaction.pinchToZoom}
-                  referenceLine={liveReferenceLine}
-                  liveDotGlow={chart.liveDotGlow}
-                  lineTrailGlow={chart.lineTrailGlow}
-                  gradientLineColoring={chart.gradientLineColoring}
-                  degen={degenConfig}
-                  paused={effectivePaused}
-                  loading={liveFeed.data.length < 2}
-                  height={320}
-                  mode={chart.chartView === 'candle' ? 'candle' : 'line'}
-                  onModeChange={(next) => {
-                    chart.setChartView(next === 'candle' ? 'candle' : 'line');
-                    if (next === 'line') chart.setCandleLineMorph(false);
-                  }}
-                  showBuiltInModeToggle={chart.chartView !== 'multi'}
-                  showBuiltInMorphToggle={chart.chartView === 'candle'}
-                  lineMode={chart.candleLineMorph}
-                  onLineModeChange={chart.setCandleLineMorph}
-                  {...(chart.chartView === 'candle'
-                    ? { candles: liveFeed.candles, liveCandle: liveFeed.liveCandle }
-                    : chart.chartView === 'multi'
-                      ? { series: demoSeries }
-                      : {})}
-                  orderbook={syntheticOrderbook}
-                />
-              )}
+              <LiveLineChart
+                data={liveFeed.data}
+                value={liveFeed.value}
+                theme={chart.theme}
+                color={chart.accent}
+                window={chart.windowSecs}
+                windows={DEMO_WINDOW_OPTIONS}
+                onWindowChange={chart.setWindowSecs}
+                windowStyle="rounded"
+                momentum
+                badge={chart.showBadge}
+                badgeVariant={chart.badgeVariant}
+                badgeNumberFlow={chart.badgeNumberFlow}
+                scrubNumberFlow={interaction.scrubNumberFlow}
+                scrubHaptics={interaction.scrubHaptics}
+                snapToPointScrubbing={interaction.snapToPointScrubbing}
+                pinchToZoom={interaction.pinchToZoom}
+                referenceLine={referenceLine}
+                liveDotGlow={chart.liveDotGlow}
+                lineTrailGlow={chart.lineTrailGlow}
+                gradientLineColoring={chart.gradientLineColoring}
+                degen={degenConfig}
+                paused={effectivePaused}
+                loading={liveFeed.data.length < 2}
+                height={320}
+                mode={chart.chartView === 'candle' ? 'candle' : 'line'}
+                onModeChange={(next) => {
+                  chart.setChartView(next === 'candle' ? 'candle' : 'line');
+                  if (next === 'line') chart.setCandleLineMorph(false);
+                }}
+                showBuiltInModeToggle={chart.chartView !== 'multi'}
+                showBuiltInMorphToggle={chart.chartView === 'candle'}
+                lineMode={chart.candleLineMorph}
+                onLineModeChange={chart.setCandleLineMorph}
+                {...(chart.chartView === 'candle'
+                  ? { candles: liveFeed.candles, liveCandle: liveFeed.liveCandle }
+                  : chart.chartView === 'multi'
+                    ? { series: demoSeries }
+                    : {})}
+                orderbook={syntheticOrderbook}
+              />
 
               <View style={styles.statusRail}>
                 <Text style={[styles.statusText, { color: muted }]}>
@@ -316,15 +241,6 @@ export default function App() {
                 <Text style={[styles.statusText, { color: muted }]}>
                   badge: <Text style={{ color: headline }}>{chart.showBadge ? 'on' : 'off'}</Text>
                 </Text>
-                {chart.chartView === 'line' ? (
-                  <Text style={[styles.statusText, { color: muted }]}>
-                    line:{' '}
-                    <Text style={{ color: headline }}>
-                      {showLineSnapshot ? 'snapshot' : 'live'}
-                      {!snapshotSupported ? ' (web: live only)' : ''}
-                    </Text>
-                  </Text>
-                ) : null}
               </View>
             </View>
           </ScrollView>
