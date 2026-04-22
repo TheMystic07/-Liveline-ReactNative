@@ -78,6 +78,68 @@ export function buildSplinePath(
   return cmds.join(' ');
 }
 
+export function buildSplinePathFromBuffers(
+  xPoints: ArrayLike<number>,
+  yPoints: ArrayLike<number>,
+  count: number,
+  floorY?: number,
+): string {
+  'worklet';
+  if (count <= 0) return '';
+  if (count < 2) {
+    const x0 = xPoints[0]!;
+    const y0 = yPoints[0]!;
+    const cmds = [`M ${x0} ${y0}`, `L ${x0 + 0.1} ${y0}`];
+    if (floorY !== undefined) cmds.push(`L ${x0 + 0.1} ${floorY}`, `L ${x0} ${floorY}`, 'Z');
+    return cmds.join(' ');
+  }
+
+  const useBuf = count <= BUF_SIZE;
+  const delta = useBuf ? _delta : new Float64Array(count - 1);
+  const hh = useBuf ? _hh : new Float64Array(count - 1);
+  const m = useBuf ? _m : new Float64Array(count);
+
+  for (let i = 0; i < count - 1; i++) {
+    hh[i] = xPoints[i + 1]! - xPoints[i]!;
+    delta[i] = hh[i] === 0 ? 0 : (yPoints[i + 1]! - yPoints[i]!) / hh[i]!;
+  }
+
+  m[0] = delta[0]!;
+  m[count - 1] = delta[count - 2]!;
+  for (let i = 1; i < count - 1; i++) {
+    m[i] = delta[i - 1]! * delta[i]! <= 0 ? 0 : (delta[i - 1]! + delta[i]!) / 2;
+  }
+
+  for (let i = 0; i < count - 1; i++) {
+    if (delta[i] === 0) {
+      m[i] = 0;
+      m[i + 1] = 0;
+    } else {
+      const a = m[i]! / delta[i]!;
+      const b = m[i + 1]! / delta[i]!;
+      const s2 = a * a + b * b;
+      if (s2 > 9) {
+        const s = 3 / Math.sqrt(s2);
+        m[i] = s * a * delta[i]!;
+        m[i + 1] = s * b * delta[i]!;
+      }
+    }
+  }
+
+  const cmds: string[] = [`M ${xPoints[0]!} ${yPoints[0]!}`];
+  for (let i = 0; i < count - 1; i++) {
+    const hi = hh[i]!;
+    cmds.push(
+      `C ${xPoints[i]! + hi / 3} ${yPoints[i]! + m[i]! * hi / 3} ${xPoints[i + 1]! - hi / 3} ${yPoints[i + 1]! - m[i + 1]! * hi / 3} ${xPoints[i + 1]!} ${yPoints[i + 1]!}`,
+    );
+  }
+
+  if (floorY !== undefined) {
+    cmds.push(`L ${xPoints[count - 1]!} ${floorY}`, `L ${xPoints[0]!} ${floorY}`, 'Z');
+  }
+  return cmds.join(' ');
+}
+
 /** Build a Fritsch-Carlson monotone spline directly into an existing {@link SkPath}. */
 export function buildSplinePathToSkPath(
   path: SkPath,
@@ -147,6 +209,76 @@ export function buildSplinePathToSkPath(
   }
 }
 
+export function buildSplinePathToSkPathFromBuffers(
+  path: SkPath,
+  xPoints: ArrayLike<number>,
+  yPoints: ArrayLike<number>,
+  count: number,
+  floorY?: number,
+): void {
+  'worklet';
+  path.reset();
+  if (count <= 0) return;
+  if (count < 2) {
+    const x0 = xPoints[0]!;
+    const y0 = yPoints[0]!;
+    path.moveTo(x0, y0).lineTo(x0 + 0.1, y0);
+    if (floorY !== undefined) {
+      path.lineTo(x0 + 0.1, floorY).lineTo(x0, floorY).close();
+    }
+    return;
+  }
+
+  const useBuf = count <= BUF_SIZE;
+  const delta = useBuf ? _delta : new Float64Array(count - 1);
+  const hh = useBuf ? _hh : new Float64Array(count - 1);
+  const m = useBuf ? _m : new Float64Array(count);
+
+  for (let i = 0; i < count - 1; i++) {
+    hh[i] = xPoints[i + 1]! - xPoints[i]!;
+    delta[i] = hh[i] === 0 ? 0 : (yPoints[i + 1]! - yPoints[i]!) / hh[i]!;
+  }
+
+  m[0] = delta[0]!;
+  m[count - 1] = delta[count - 2]!;
+  for (let i = 1; i < count - 1; i++) {
+    m[i] = delta[i - 1]! * delta[i]! <= 0 ? 0 : (delta[i - 1]! + delta[i]!) / 2;
+  }
+
+  for (let i = 0; i < count - 1; i++) {
+    if (delta[i] === 0) {
+      m[i] = 0;
+      m[i + 1] = 0;
+    } else {
+      const a = m[i]! / delta[i]!;
+      const b = m[i + 1]! / delta[i]!;
+      const s2 = a * a + b * b;
+      if (s2 > 9) {
+        const s = 3 / Math.sqrt(s2);
+        m[i] = s * a * delta[i]!;
+        m[i + 1] = s * b * delta[i]!;
+      }
+    }
+  }
+
+  path.moveTo(xPoints[0]!, yPoints[0]!);
+  for (let i = 0; i < count - 1; i++) {
+    const hi = hh[i]!;
+    path.cubicTo(
+      xPoints[i]! + hi / 3,
+      yPoints[i]! + m[i]! * hi / 3,
+      xPoints[i + 1]! - hi / 3,
+      yPoints[i + 1]! - m[i + 1]! * hi / 3,
+      xPoints[i + 1]!,
+      yPoints[i + 1]!,
+    );
+  }
+
+  if (floorY !== undefined) {
+    path.lineTo(xPoints[count - 1]!, floorY).lineTo(xPoints[0]!, floorY).close();
+  }
+}
+
 export function buildPath(
   pts: readonly LiveLinePoint[],
   tipT: number,
@@ -207,13 +339,7 @@ export function buildPath(
       _spY[spCount] = tipY;
       spCount++;
     }
-
-    // Build screenPoints array from flat buffers (buildSplinePath needs ScreenPoint[])
-    const screenPoints: ScreenPoint[] = new Array(spCount);
-    for (let i = 0; i < spCount; i++) {
-      screenPoints[i] = { x: _spX[i]!, y: _spY[i]! };
-    }
-    return buildSplinePath(screenPoints, floor ? h - pad.bottom : undefined);
+    return buildSplinePathFromBuffers(_spX, _spY, spCount, floor ? h - pad.bottom : undefined);
   }
 
   // Fallback for very large datasets
@@ -301,12 +427,13 @@ export function buildPathToSkPath(
       _spY[spCount] = tipY;
       spCount++;
     }
-
-    const screenPoints: ScreenPoint[] = new Array(spCount);
-    for (let i = 0; i < spCount; i++) {
-      screenPoints[i] = { x: _spX[i]!, y: _spY[i]! };
-    }
-    buildSplinePathToSkPath(path, screenPoints, floor ? h - pad.bottom : undefined);
+    buildSplinePathToSkPathFromBuffers(
+      path,
+      _spX,
+      _spY,
+      spCount,
+      floor ? h - pad.bottom : undefined,
+    );
     return;
   }
 

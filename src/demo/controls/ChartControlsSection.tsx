@@ -38,6 +38,23 @@ function ChartControlsSectionInner({
         <Chip active={theme === 'light'} label="Light" onPress={() => config.setTheme('light')} theme={theme} accent={accent} />
       </ControlRow>
 
+      <ControlRow label="Render" labelColor={muted}>
+        <Chip
+          active={config.renderMode === 'live'}
+          label="Live"
+          onPress={() => config.setRenderMode('live')}
+          theme={theme}
+          accent={accent}
+        />
+        <Chip
+          active={config.renderMode === 'static'}
+          label="Static"
+          onPress={() => config.setRenderMode('static')}
+          theme={theme}
+          accent={accent}
+        />
+      </ControlRow>
+
       <ControlRow label="Badge" labelColor={muted}>
         <Chip active={config.showBadge} label="On" onPress={() => config.setShowBadge(true)} theme={theme} accent={accent} />
         <Chip active={!config.showBadge} label="Off" onPress={() => config.setShowBadge(false)} theme={theme} accent={accent} />

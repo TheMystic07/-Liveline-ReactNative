@@ -1,5 +1,6 @@
-import { useEffect, useRef } from 'react';
+import { useEffect } from 'react';
 import {
+  cancelAnimation,
   Easing,
   runOnJS,
   useDerivedValue,
@@ -25,6 +26,8 @@ export type UseStaticDrawAnimationInput = {
   chartHeight: number;
   /** Left padding (clip rect starts here). */
   padLeft: number;
+  /** Dataset/window signature used to decide when the reveal animation should replay. */
+  animationKey?: string | number;
   /** Draw animation duration in ms (default 1200). */
   duration: number;
   /** Easing curve (default 'ease-out'). */
@@ -47,9 +50,9 @@ export type UseStaticDrawAnimationOutput = {
   /** Badge opacity (fades in at 85%→100% of draw progress). */
   dvBadgeOp: DerivedValue<number>;
   /** Drawing dot opacity (1 during draw, fades out on complete). */
-  dvDrawDotOp: DerivedValue<number>;
+  dvDrawDotOp: SharedValue<number>;
   /** Static end dot opacity (0 during draw, 1 on complete). */
-  dvEndDotOp: DerivedValue<number>;
+  dvEndDotOp: SharedValue<number>;
 };
 
 /* ------------------------------------------------------------------ */
@@ -75,17 +78,39 @@ function resolveEasing(e: DrawEasing) {
 export function useStaticDrawAnimation(
   input: UseStaticDrawAnimationInput,
 ): UseStaticDrawAnimationOutput {
-  const { ready, chartWidth, chartHeight, padLeft, duration, easing, onComplete } = input;
+  const {
+    ready,
+    chartWidth,
+    chartHeight,
+    padLeft,
+    animationKey,
+    duration,
+    easing,
+    onComplete,
+  } = input;
 
   const svDrawProgress = useSharedValue(0);
   const drawComplete = useSharedValue(0);
-  const startedRef = useRef(false);
+  const dvDrawDotOp = useSharedValue(0);
+  const dvEndDotOp = useSharedValue(0);
 
-  // Fire the animation once when ready
   useEffect(() => {
-    if (!ready || chartWidth <= 0 || startedRef.current) return;
-    startedRef.current = true;
+    cancelAnimation(svDrawProgress);
+    cancelAnimation(dvDrawDotOp);
+    cancelAnimation(dvEndDotOp);
 
+    if (!ready || chartWidth <= 0) {
+      svDrawProgress.value = 0;
+      drawComplete.value = 0;
+      dvDrawDotOp.value = 0;
+      dvEndDotOp.value = 0;
+      return;
+    }
+
+    svDrawProgress.value = 0;
+    drawComplete.value = 0;
+    dvDrawDotOp.value = 1;
+    dvEndDotOp.value = 0;
     svDrawProgress.value = withTiming(
       1,
       { duration, easing: resolveEasing(easing) },
@@ -93,11 +118,24 @@ export function useStaticDrawAnimation(
         'worklet';
         if (finished) {
           drawComplete.value = 1;
+          dvEndDotOp.value = withTiming(1, { duration: 140, easing: Easing.out(Easing.quad) });
+          dvDrawDotOp.value = withTiming(0, { duration: 200, easing: Easing.out(Easing.quad) });
           if (onComplete) runOnJS(onComplete)();
         }
       },
     );
-  }, [ready, chartWidth, duration, easing, onComplete, svDrawProgress, drawComplete]);
+  }, [
+    animationKey,
+    ready,
+    chartWidth,
+    duration,
+    easing,
+    onComplete,
+    svDrawProgress,
+    drawComplete,
+    dvDrawDotOp,
+    dvEndDotOp,
+  ]);
 
   // Clip rect: expands from padLeft to padLeft + chartWidth
   const dvClipRect = useDerivedValue(() => {
@@ -121,16 +159,6 @@ export function useStaticDrawAnimation(
     const p = svDrawProgress.value;
     return p > 0.85 ? (p - 0.85) / 0.15 : 0;
   });
-
-  // Drawing dot opacity: visible during draw, 0 when complete
-  const dvDrawDotOp = useDerivedValue(
-    () => (drawComplete.value === 1 ? 0 : Math.min(1, svDrawProgress.value * 4)),
-  );
-
-  // Static end dot: visible only after draw completes
-  const dvEndDotOp = useDerivedValue(
-    () => drawComplete.value,
-  );
 
   return {
     svDrawProgress,

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Gesture } from 'react-native-gesture-handler';
 import {
   Easing,
@@ -168,6 +168,14 @@ export type ScrubTipState = {
   candle?: CandlePoint;
 } | null;
 
+export type StaticScrubSample = {
+  hx: number;
+  hv: number;
+  ht: number;
+  opacity: number;
+  candle?: CandlePoint;
+} | null;
+
 export type UseStaticScrubInput = {
   /** Whether scrub is enabled (prop-level). */
   enabled: boolean;
@@ -198,6 +206,8 @@ export type UseStaticScrubInput = {
   haptics: boolean;
   /** Whether we're in candle mode. */
   isCandle: boolean;
+  /** Optional JS-thread subscriber for scrub updates. */
+  onHoverSample?: (sample: StaticScrubSample) => void;
 };
 
 export type UseStaticScrubOutput = {
@@ -229,11 +239,22 @@ export function useStaticScrub(input: UseStaticScrubInput): UseStaticScrubOutput
     snapToPoint,
     haptics,
     isCandle,
+    onHoverSample,
   } = input;
 
   const svScrubX = useSharedValue(0);
   const svScrubOp = useSharedValue(0);
   const svScrubHv = useSharedValue(0);
+  const svData = useSharedValue<LiveLinePoint[]>(data.slice());
+  const svCandles = useSharedValue<CandlePoint[]>(candles ? [...candles] : []);
+
+  useEffect(() => {
+    svData.value = data.slice();
+  }, [data, svData]);
+
+  useEffect(() => {
+    svCandles.value = candles ? [...candles] : [];
+  }, [candles, svCandles]);
 
   // Throttle runOnJS calls
   const svScrubJsLastTs = useSharedValue(0);
@@ -267,6 +288,13 @@ export function useStaticScrub(input: UseStaticScrubInput): UseStaticScrubOutput
     if (haptics) scrubPanBeginHaptic();
   }, [haptics]);
 
+  const emitHoverSample = useCallback(
+    (sample: StaticScrubSample) => {
+      onHoverSample?.(sample);
+    },
+    [onHoverSample],
+  );
+
   const gesture = useMemo(() => {
     const panGesture = Gesture.Pan()
       .enabled(enabled)
@@ -280,10 +308,13 @@ export function useStaticScrub(input: UseStaticScrubInput): UseStaticScrubOutput
         let ht: number;
         let cand: CandlePoint | undefined;
 
-        if (isCandle && candles && candles.length > 0) {
+        const candleData = svCandles.value;
+        const lineData = svData.value;
+
+        if (isCandle && candleData.length > 0) {
           const c = sampleCandleScrubAtX(
             e.x, chartWidth, pad, win, buf, tipT, tipV,
-            candles, candleWidthSecs,
+            candleData, candleWidthSecs,
           );
           hx = c.hx;
           hv = c.hv;
@@ -292,7 +323,7 @@ export function useStaticScrub(input: UseStaticScrubInput): UseStaticScrubOutput
         } else {
           const sample = sampleScrubAtX(
             e.x, chartWidth, pad, win, buf, tipT, tipV,
-            data, snapToPoint,
+            lineData, snapToPoint,
           );
           hx = sample.hx;
           hv = sample.hv;
@@ -305,6 +336,7 @@ export function useStaticScrub(input: UseStaticScrubInput): UseStaticScrubOutput
         svScrubOp.value = withTiming(1, { duration: 90, easing: Easing.out(Easing.quad) });
         runOnJS(onScrubPanBeginHaptic)();
         runOnJS(applyScrubTip)(hx, hv, ht, 1, cand);
+        runOnJS(emitHoverSample)({ hx, hv, ht, opacity: 1, candle: cand });
       })
       .onUpdate((e) => {
         'worklet';
@@ -316,10 +348,13 @@ export function useStaticScrub(input: UseStaticScrubInput): UseStaticScrubOutput
         let liveX: number;
         let cand: CandlePoint | undefined;
 
-        if (isCandle && candles && candles.length > 0) {
+        const candleData = svCandles.value;
+        const lineData = svData.value;
+
+        if (isCandle && candleData.length > 0) {
           const c = sampleCandleScrubAtX(
             e.x, chartWidth, pad, win, buf, tipT, tipV,
-            candles, candleWidthSecs,
+            candleData, candleWidthSecs,
           );
           hx = c.hx;
           hv = c.hv;
@@ -329,7 +364,7 @@ export function useStaticScrub(input: UseStaticScrubInput): UseStaticScrubOutput
         } else {
           const sample = sampleScrubAtX(
             e.x, chartWidth, pad, win, buf, tipT, tipV,
-            data, snapToPoint,
+            lineData, snapToPoint,
           );
           hx = sample.hx;
           hv = sample.hv;
@@ -366,6 +401,7 @@ export function useStaticScrub(input: UseStaticScrubInput): UseStaticScrubOutput
         svScrubJsLastHx.value = hx;
         svScrubJsLastOp.value = op;
         runOnJS(applyScrubTip)(hx, hv, ht, op, cand);
+        runOnJS(emitHoverSample)({ hx, hv, ht, opacity: op, candle: cand });
       })
       .onFinalize(() => {
         'worklet';
@@ -379,6 +415,7 @@ export function useStaticScrub(input: UseStaticScrubInput): UseStaticScrubOutput
         svScrubJsLastTs.value = 0;
         svScrubJsLastHx.value = -1e9;
         svScrubJsLastOp.value = -1;
+        runOnJS(emitHoverSample)(null);
       });
 
     return panGesture;
@@ -391,17 +428,18 @@ export function useStaticScrub(input: UseStaticScrubInput): UseStaticScrubOutput
     buf,
     tipT,
     tipV,
-    data,
-    candles,
     candleWidthSecs,
     snapToPoint,
     isCandle,
     applyScrubTip,
     clearScrubTip,
+    emitHoverSample,
     onScrubPanBeginHaptic,
     svScrubX,
     svScrubOp,
     svScrubHv,
+    svData,
+    svCandles,
     svScrubJsLastTs,
     svScrubJsLastHx,
     svScrubJsLastOp,

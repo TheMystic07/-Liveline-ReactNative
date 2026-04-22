@@ -3,12 +3,15 @@ import { useState } from 'react';
 import type { BadgeVariant } from '../../chart';
 
 export type ChartView = 'line' | 'multi' | 'candle';
+export type RenderMode = 'live' | 'static';
 
 export type ChartConfig = {
   theme: 'dark' | 'light';
   setTheme: (v: 'dark' | 'light') => void;
   accent: string;
   setAccent: (v: string) => void;
+  renderMode: RenderMode;
+  setRenderMode: (v: RenderMode) => void;
   chartView: ChartView;
   setChartView: (v: ChartView) => void;
   windowSecs: number;
@@ -38,6 +41,7 @@ const DEFAULT_ACCENT = '#3b82f6';
 export function useChartConfig(): ChartConfig {
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [accent, setAccent] = useState<string>(DEFAULT_ACCENT);
+  const [renderMode, setRenderMode] = useState<RenderMode>('live');
   const [chartView, setChartView] = useState<ChartView>('line');
   const [windowSecs, setWindowSecs] = useState<number>(30);
   const [showBadge, setShowBadge] = useState<boolean>(true);
@@ -55,6 +59,8 @@ export function useChartConfig(): ChartConfig {
     setTheme,
     accent,
     setAccent,
+    renderMode,
+    setRenderMode,
     chartView,
     setChartView,
     windowSecs,

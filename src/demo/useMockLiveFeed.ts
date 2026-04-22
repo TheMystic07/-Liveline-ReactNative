@@ -1,18 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-import type { CandlePoint, LiveLinePoint } from '../chart';
-
-type Volatility = 'calm' | 'normal' | 'chaos';
+import type { LiveLinePoint } from '../chart';
+import {
+  VOLATILITY_SCALE,
+  buildSeedSnapshot,
+  nextPoint,
+  nextSnapshotFromPoint,
+  type DemoVolatility as Volatility,
+  type FeedSnapshot,
+} from './mockFeedData';
 const FEED_FLUSH_MS = 200;
-
-const VOLATILITY_SCALE: Record<Volatility, number> = {
-  calm: 0.22,
-  normal: 0.7,
-  chaos: 1.7,
-};
-
-/** Wall-clock bucket length (seconds) for OHLC candles (matches upstream-style fixed period). */
-export const MOCK_CANDLE_BUCKET_SEC = 5;
 
 const CAPACITY = 480;
 
@@ -56,155 +53,6 @@ class PointRing {
     if (this.size === 0) return undefined;
     return this.buf[(this.head + this.size - 1) % CAPACITY];
   }
-}
-
-function bucketStart(timeSec: number): number {
-  return Math.floor(timeSec / MOCK_CANDLE_BUCKET_SEC) * MOCK_CANDLE_BUCKET_SEC;
-}
-
-function nextPoint(previous: number, time: number, volatility: Volatility) {
-  const scale = VOLATILITY_SCALE[volatility];
-  const drift = (Math.random() - 0.47) * scale;
-  const spike = Math.random() > 0.94 ? (Math.random() - 0.5) * scale * 4.5 : 0;
-  return {
-    time,
-    value: previous + drift + spike,
-  };
-}
-
-function aggregateOHLC(points: LiveLinePoint[]): { candles: CandlePoint[]; live: CandlePoint | undefined } {
-  if (points.length === 0) return { candles: [], live: undefined };
-
-  const lastT = points[points.length - 1]!.time;
-  const currentBucket = bucketStart(lastT);
-  const history: CandlePoint[] = [];
-
-  let bucket = bucketStart(points[0]!.time);
-  let open = points[0]!.value;
-  let high = open;
-  let low = open;
-  let close = open;
-  let seen = 0;
-  let live: CandlePoint | undefined;
-
-  for (let i = 0; i < points.length; i++) {
-    const p = points[i]!;
-    const b = bucketStart(p.time);
-    if (b !== bucket) {
-      const candle: CandlePoint = { time: bucket, open, high, low, close };
-      if (bucket < currentBucket) {
-        history.push(candle);
-      } else {
-        live = candle;
-      }
-      bucket = b;
-      open = p.value;
-      high = p.value;
-      low = p.value;
-      close = p.value;
-      seen = 1;
-      continue;
-    }
-    if (p.value > high) high = p.value;
-    if (p.value < low) low = p.value;
-    close = p.value;
-    seen += 1;
-  }
-
-  if (seen > 0) {
-    const candle: CandlePoint = { time: bucket, open, high, low, close };
-    if (bucket < currentBucket) {
-      history.push(candle);
-    } else {
-      live = candle;
-    }
-  }
-
-  const candles = history.length > 140 ? history.slice(-140) : history;
-  return { candles, live };
-}
-
-type FeedSnapshot = {
-  data: LiveLinePoint[];
-  value: number;
-  candles: CandlePoint[];
-  liveCandle: CandlePoint | undefined;
-};
-
-function buildSeedSnapshot(baseValue: number, volatility: Volatility): FeedSnapshot {
-  const seedEnd = Date.now() / 1000;
-  const seeded: LiveLinePoint[] = [];
-  let cursor = baseValue;
-
-  for (let index = 140; index >= 0; index -= 1) {
-    const point = nextPoint(cursor, seedEnd - index * 0.6, volatility);
-    cursor = point.value;
-    seeded.push(point);
-  }
-
-  const { candles, live } = aggregateOHLC(seeded);
-  return {
-    data: seeded,
-    value: cursor,
-    candles,
-    liveCandle: live,
-  };
-}
-
-function nextSnapshotFromRing(
-  current: FeedSnapshot,
-  nextData: LiveLinePoint[],
-  point: LiveLinePoint,
-): FeedSnapshot {
-  const pointBucket = bucketStart(point.time);
-  const live = current.liveCandle;
-
-  if (!live) {
-    return {
-      data: nextData,
-      value: point.value,
-      candles: current.candles,
-      liveCandle: {
-        time: pointBucket,
-        open: point.value,
-        high: point.value,
-        low: point.value,
-        close: point.value,
-      },
-    };
-  }
-
-  if (pointBucket < live.time) {
-    const { candles, live: fallbackLive } = aggregateOHLC(nextData);
-    return { data: nextData, value: point.value, candles, liveCandle: fallbackLive };
-  }
-
-  if (pointBucket === live.time) {
-    return {
-      data: nextData,
-      value: point.value,
-      candles: current.candles,
-      liveCandle: {
-        ...live,
-        high: Math.max(live.high, point.value),
-        low: Math.min(live.low, point.value),
-        close: point.value,
-      },
-    };
-  }
-
-  return {
-    data: nextData,
-    value: point.value,
-    candles: [...current.candles, live].slice(-140),
-    liveCandle: {
-      time: pointBucket,
-      open: point.value,
-      high: point.value,
-      low: point.value,
-      close: point.value,
-    },
-  };
 }
 
 export function useMockLiveFeed({
@@ -270,7 +118,7 @@ export function useMockLiveFeed({
       pendingPointRef.current = null;
       ringRef.current.push(point);
       const nextData = ringRef.current.toArray();
-      setFeed((current) => nextSnapshotFromRing(current, nextData, point));
+      setFeed((current) => nextSnapshotFromPoint(current, nextData, point));
     }, FEED_FLUSH_MS);
 
     return () => {

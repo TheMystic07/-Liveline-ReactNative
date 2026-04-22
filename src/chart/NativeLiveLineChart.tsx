@@ -67,11 +67,11 @@ import { BADGE_NUMBER_FLOW_FONT_SRC } from './BadgeSkiaNumberFlow';
 import { formatPriceCentsWorklet, supportsTwoDecimalNumberFlow } from './chartNumberFlow';
 import { SCRUB_TIP_FLOW_W } from './ScrubSkiaNumberFlow';
 import { AxisLabels } from './render/AxisLabels';
-import { BadgeOverlay } from './render/BadgeOverlay';
 import { CrosshairCanvas } from './render/CrosshairCanvas';
 import { EmptyState } from './render/EmptyState';
 import { GridCanvas } from './render/GridCanvas';
 import { LiveDotLayer } from './render/LiveDotLayer';
+import { LiveBadgeOverlay } from './render/LiveBadgeOverlay';
 import { LinePathLayer } from './render/LinePathLayer';
 import { type ParticleSpec, ParticlesLayer } from './render/ParticlesLayer';
 import { ReferenceLineCanvas } from './render/ReferenceLineCanvas';
@@ -87,7 +87,11 @@ import {
   LOADING_AMPLITUDE_RATIO,
   LOADING_SCROLL_SPEED,
 } from './draw/loadingShape';
-import { buildPath, buildSplinePath, buildPathToSkPath, buildSplinePathToSkPath } from './draw/buildLiveLinePath';
+import {
+  buildPath,
+  buildSplinePathFromBuffers,
+  buildSplinePathToSkPathFromBuffers,
+} from './draw/buildLiveLinePath';
 import { decayShake, randomShakeOffset, shakeAmplitude } from './draw/shake';
 import { monotoneSplinePath } from './math/spline';
 
@@ -109,6 +113,13 @@ interface TimeTick {
   x: number;
   text: string;
 }
+
+type EngineFrameFlushPayload = {
+  effectiveWin?: number | null;
+  smoothedDisplay?: { o: number; h: number; l: number; c: number; t: number } | null;
+  grid?: { min: number; max: number } | null;
+  stop?: boolean;
+};
 
 /* ------------------------------------------------------------------ */
 /*  Constants — matching upstream exactly                               */
@@ -145,7 +156,7 @@ const CANDLE_OHLC_LERP_SPEED = 0.25;
 /** Upstream `LINE_MORPH_MS` — line↔candle morph duration. */
 const LINE_MORPH_MS = 500;
 /** Extracted to module scope to avoid per-render array allocations. */
-const PRICE_DASH_INTERVALS: readonly [number, number] = [4, 4];
+const PRICE_DASH_INTERVALS = [4, 4];
 /** Throttle JS merges while OHLC lerps on the UI thread (ms). */
 const CANDLE_SMOOTH_EMIT_MS = 32;
 const ENGINE_IDLE_STOP_MS = 60;
@@ -644,11 +655,7 @@ function buildAnimatedTailPath(
     spCount++;
   }
 
-  const screenPoints: Array<{ x: number; y: number }> = new Array(spCount);
-  for (let i = 0; i < spCount; i++) {
-    screenPoints[i] = { x: _tailX[i]!, y: _tailY[i]! };
-  }
-  return buildSplinePath(screenPoints);
+  return buildSplinePathFromBuffers(_tailX, _tailY, spCount);
 }
 
 function buildAnimatedTailPathToSkPath(
@@ -716,11 +723,7 @@ function buildAnimatedTailPathToSkPath(
     spCount++;
   }
 
-  const screenPoints: Array<{ x: number; y: number }> = new Array(spCount);
-  for (let i = 0; i < spCount; i++) {
-    screenPoints[i] = { x: _tailX[i]!, y: _tailY[i]! };
-  }
-  buildSplinePathToSkPath(path, screenPoints);
+  buildSplinePathToSkPathFromBuffers(path, _tailX, _tailY, spCount);
 }
 
 /* ------------------------------------------------------------------ */
@@ -902,12 +905,10 @@ export function NativeLiveLineChart({
   );
 
   const [smoothedLive, setSmoothedLive] = useState<CandlePoint | null>(null);
-  const flushSmoothedDisplay = useCallback(
-    (o: number, h: number, l: number, c: number, t: number) => {
-      setSmoothedLive({ time: t, open: o, high: h, low: l, close: c });
-    },
-    [],
-  );
+  const smoothedLiveRef = useRef<CandlePoint | null>(null);
+  useEffect(() => {
+    smoothedLiveRef.current = smoothedLive;
+  }, [smoothedLive]);
 
   const skiaDefaultNumberFormat = useMemo(
     () => supportsTwoDecimalNumberFlow(formatValue),
@@ -1020,10 +1021,10 @@ export function NativeLiveLineChart({
   const svWinTransActive = useSharedValue(0);
   /** Current effective window secs (animated). Used by rendering. */
   const [effectiveWin, setEffectiveWin] = useState(baseWin);
-
-  const flushEffectiveWin = useCallback((v: number) => {
-    setEffectiveWin(v);
-  }, []);
+  const effectiveWinRef = useRef(baseWin);
+  useEffect(() => {
+    effectiveWinRef.current = effectiveWin;
+  }, [effectiveWin]);
 
   /** Trigger a smooth window transition when the target render window changes. */
   const prevResolvedWin = useRef(baseWin);
@@ -1129,7 +1130,55 @@ export function NativeLiveLineChart({
   const gridIntRef = useRef(0);
   /** Y-range used for grid / labels — tracks smoothed `svMin`/`svMax` from the UI thread. */
   const [gridSmooth, setGridSmooth] = useState<{ min: number; max: number } | null>(null);
+  const gridSmoothRef = useRef<{ min: number; max: number } | null>(null);
   const didRangeInitRef = useRef(false);
+  useEffect(() => {
+    gridSmoothRef.current = gridSmooth;
+  }, [gridSmooth]);
+
+  const flushEngineFrame = useCallback((payload: EngineFrameFlushPayload) => {
+    if (payload.effectiveWin != null) {
+      const prevWin = effectiveWinRef.current;
+      if (Math.abs(prevWin - payload.effectiveWin) > 1e-6) {
+        effectiveWinRef.current = payload.effectiveWin;
+        setEffectiveWin(payload.effectiveWin);
+      }
+    }
+
+    if (payload.smoothedDisplay) {
+      const next = {
+        time: payload.smoothedDisplay.t,
+        open: payload.smoothedDisplay.o,
+        high: payload.smoothedDisplay.h,
+        low: payload.smoothedDisplay.l,
+        close: payload.smoothedDisplay.c,
+      };
+      const prev = smoothedLiveRef.current;
+      if (
+        !prev ||
+        prev.time !== next.time ||
+        prev.open !== next.open ||
+        prev.high !== next.high ||
+        prev.low !== next.low ||
+        prev.close !== next.close
+      ) {
+        smoothedLiveRef.current = next;
+        setSmoothedLive(next);
+      }
+    }
+
+    if (payload.grid) {
+      const prev = gridSmoothRef.current;
+      if (!prev || Math.abs(prev.min - payload.grid.min) > 1e-12 || Math.abs(prev.max - payload.grid.max) > 1e-12) {
+        gridSmoothRef.current = payload.grid;
+        setGridSmooth(payload.grid);
+      }
+    }
+
+    if (payload.stop) {
+      setEngineActive((prev) => (prev ? false : prev));
+    }
+  }, []);
 
   useEffect(() => {
     if (!loading && data.length >= 2) return;
@@ -1469,7 +1518,6 @@ export function NativeLiveLineChart({
     candleWidthProp,
   ]);
 
-  const [flowPillW, setFlowPillW] = useState(80);
   const [engineActive, setEngineActive] = useState(false);
 
   type BuildSnapshot = {
@@ -1496,61 +1544,13 @@ export function NativeLiveLineChart({
   const startEngine = useCallback(() => {
     setEngineActive(true);
   }, []);
-  const stopEngine = useCallback(() => {
-    setEngineActive(false);
-  }, []);
-  const setFlowPillWStable = useCallback((w: number) => {
-    setFlowPillW((prev) => (prev === w ? prev : w));
-  }, []);
-  useAnimatedReaction(
-    () => Math.round(svBadgePillW.value),
-    (w, prev) => {
-      'worklet';
-      if (prev !== undefined && w === prev) return;
-      runOnJS(setFlowPillWStable)(w);
-    },
-    [setFlowPillWStable],
-  );
 
   const dvScrubValueStr = useDerivedValue(() => {
     'worklet';
     return formatPriceCentsWorklet(svScrubHv.value);
   });
 
-  const [badgeStr, setBadgeStr] = useState(() => formatValue(effectiveValue));
   const badgeQuantMul = formatValue === defaultFmtVal ? 100 : 10_000;
-
-  /** Sync badge label only when quantized display changes (avoids runOnJS every frame). */
-  const setBadgeFromQuant = useCallback(
-    (q: number) => {
-      const v = q / badgeQuantMul;
-      setBadgeStr((s) => {
-        const n = formatValue(v);
-        return n === s ? s : n;
-      });
-    },
-    [formatValue, badgeQuantMul],
-  );
-
-  useAnimatedReaction(
-    () => Math.round(svTipV.value * badgeQuantMul),
-    (q, prev) => {
-      'worklet';
-      if (prev !== undefined && q === prev) return;
-      const t = Date.now();
-      if (t - svBadgeLastJsFlush.value < 24) return; // ~42 Hz max
-      svBadgeLastJsFlush.value = t;
-      runOnJS(setBadgeFromQuant)(q);
-    },
-    [badgeQuantMul, setBadgeFromQuant],
-  );
-
-  const flushGridSmooth = useCallback((lo: number, hi: number) => {
-    setGridSmooth((prev) => {
-      if (prev && Math.abs(prev.min - lo) < 1e-12 && Math.abs(prev.max - hi) < 1e-12) return prev;
-      return { min: lo, max: hi };
-    });
-  }, []);
   /** Batch simple SharedValue config updates to reduce effect overhead. */
   useEffect(() => {
     svLerpSpeed.value = lerpSpeed;
@@ -1779,6 +1779,10 @@ export function NativeLiveLineChart({
       if (pauseProgress > 0.995) pauseProgress = 1;
       svPauseProgress.value = pauseProgress;
       const engineDt = dt * (1 - pauseProgress);
+      let pendingEffectiveWin: number | null = null;
+      let pendingSmoothedDisplay: EngineFrameFlushPayload['smoothedDisplay'] = null;
+      let pendingGrid: EngineFrameFlushPayload['grid'] = null;
+      let shouldStopEngine = false;
 
       /* ---- Live tip time: glide on wall clock when samples are sparse / delayed ---- */
       if (pauseProgress < 0.995) {
@@ -1823,10 +1827,10 @@ export function NativeLiveLineChart({
         if (prog > 1) prog = 1;
         svWinProgress.value = prog;
         const winVal = lerpWindowLogSpace(svWinFrom.value, svWinTo.value, prog);
-        runOnJS(flushEffectiveWin)(winVal);
+        pendingEffectiveWin = winVal;
         if (prog >= 1) {
           svWinTransActive.value = 0;
-          runOnJS(flushEffectiveWin)(svWinTo.value);
+          pendingEffectiveWin = svWinTo.value;
         }
       }
 
@@ -1869,13 +1873,13 @@ export function NativeLiveLineChart({
         let acc = svCandleEmitAcc.value + dt;
         if (acc >= CANDLE_SMOOTH_EMIT_MS) {
           acc = 0;
-          runOnJS(flushSmoothedDisplay)(
-            svSmLiveO.value,
-            svSmLiveH.value,
-            svSmLiveL.value,
-            svSmLiveC.value,
-            svLiveBucketTime.value,
-          );
+          pendingSmoothedDisplay = {
+            o: svSmLiveO.value,
+            h: svSmLiveH.value,
+            l: svSmLiveL.value,
+            c: svSmLiveC.value,
+            t: svLiveBucketTime.value,
+          };
         }
         svCandleEmitAcc.value = acc;
       } else {
@@ -1952,7 +1956,7 @@ export function NativeLiveLineChart({
         svGridFlushAcc.value += engineDt;
         if (svGridFlushAcc.value >= GRID_FLUSH_MS) {
           svGridFlushAcc.value = 0;
-          runOnJS(flushGridSmooth)(svMin.value, svMax.value);
+          pendingGrid = { min: svMin.value, max: svMax.value };
         }
       }
 
@@ -2031,16 +2035,28 @@ export function NativeLiveLineChart({
         svEngineIdleMs.value = nextIdle;
         if (nextIdle >= ENGINE_IDLE_STOP_MS) {
           svEngineIdleMs.value = -1e9;
-          runOnJS(stopEngine)();
+          shouldStopEngine = true;
         }
       } else {
         svEngineIdleMs.value = 0;
       }
+
+      if (
+        pendingEffectiveWin !== null ||
+        pendingSmoothedDisplay !== null ||
+        pendingGrid !== null ||
+        shouldStopEngine
+      ) {
+        runOnJS(flushEngineFrame)({
+          effectiveWin: pendingEffectiveWin,
+          smoothedDisplay: pendingSmoothedDisplay,
+          grid: pendingGrid,
+          stop: shouldStopEngine,
+        });
+      }
     },
     [
-      stopEngine,
-      flushGridSmooth,
-      flushSmoothedDisplay,
+      flushEngineFrame,
       padTopForEngine,
       padBottomForEngine,
       svBuildMin,
@@ -2477,11 +2493,11 @@ export function NativeLiveLineChart({
     );
   }, [layout.height, pad]);
   const dvDashP1 = useDerivedValue(
-    () => vec(pad.left, dvDashY.value),
+    () => ({ x: pad.left, y: dvDashY.value }),
     [pad.left],
   );
   const dvDashP2 = useDerivedValue(
-    () => vec(layout.width - pad.right, dvDashY.value),
+    () => ({ x: layout.width - pad.right, y: dvDashY.value }),
     [layout.width, pad.right],
   );
 
@@ -2567,10 +2583,10 @@ export function NativeLiveLineChart({
   }, [layout.width, pad.left, pad.right, win, buf]);
 
   const dvCrossP1 = useDerivedValue(
-    () => vec(dvHoverX.value, pad.top), [pad.top],
+    () => ({ x: dvHoverX.value, y: pad.top }), [pad.top],
   );
   const dvCrossP2 = useDerivedValue(
-    () => vec(dvHoverX.value, layout.height - pad.bottom),
+    () => ({ x: dvHoverX.value, y: layout.height - pad.bottom }),
     [layout.height, pad.bottom],
   );
   const dvCrossLineOp = useDerivedValue(() => dvCrossEffectiveOp.value * 0.5);
@@ -3021,13 +3037,6 @@ export function NativeLiveLineChart({
 
   /* ---- computed ---- */
   const baseY = layout.height - pad.bottom;
-
-  const onBadgeTemplateLayout = useCallback(
-    (e: { nativeEvent: { layout: { width: number } } }) => {
-      svBadgeTargetTextW.value = e.nativeEvent.layout.width;
-    },
-    [svBadgeTargetTextW],
-  );
 
   // Loading state
   const loadPath = useMemo(
@@ -3535,7 +3544,7 @@ export function NativeLiveLineChart({
                   />
                 ) : null}
 
-                <BadgeOverlay
+                <LiveBadgeOverlay
                   badge={badge}
                   empty={empty}
                   variant={badgeVariant}
@@ -3543,15 +3552,18 @@ export function NativeLiveLineChart({
                   badgeFlowA11yLabel={badgeFlowA11y}
                   badgeNumFont={badgeNumFont}
                   badgeValue={svTipV}
-                  flowPillW={flowPillW}
-                  badgeStr={badgeStr}
+                  badgePillWidth={svBadgePillW}
+                  badgeTargetTextW={svBadgeTargetTextW}
+                  badgeLastJsFlush={svBadgeLastJsFlush}
+                  badgeQuantMul={badgeQuantMul}
+                  formatValue={formatValue}
+                  effectiveValue={effectiveValue}
                   badgeStyle={asBadge}
                   badgeTextWrapStyle={asBadgeTextWrap}
                   backgroundPath={dvBadgeBgPath}
                   innerPath={dvBadgeInnerPath}
                   innerColor={dvBadgeInnerColor}
                   pillH={pillH}
-                  onBadgeTemplateLayout={onBadgeTemplateLayout}
                   pal={pal}
                   badgeTextStyle={styles.badgeTxt}
                 />

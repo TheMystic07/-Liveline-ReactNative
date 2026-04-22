@@ -6,6 +6,7 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 import {
   LiveLineChart,
+  StaticChart,
   type LiveLineSeries,
   type LiveOrderbookSnapshot,
 } from './src/chart';
@@ -15,6 +16,7 @@ import { useInteractionConfig } from './src/demo/config/useInteractionConfig';
 import { ChartControlsSection } from './src/demo/controls/ChartControlsSection';
 import { FeedControlsSection } from './src/demo/controls/FeedControlsSection';
 import { InteractionControlsSection } from './src/demo/controls/InteractionControlsSection';
+import { buildSeedSnapshot } from './src/demo/mockFeedData';
 import { useMockLiveFeed } from './src/demo/useMockLiveFeed';
 import { DEMO_WINDOW_OPTIONS } from './src/demo/windowOptions';
 
@@ -30,7 +32,7 @@ export default function App() {
       feed.degenMode
         ? { scale: feed.degenScale, downMomentum: feed.degenDownMomentum }
         : false,
-    [feed.degenMode, feed.degenScale, feed.degenDownMomentum],
+    [feed.degenDownMomentum, feed.degenMode, feed.degenScale],
   );
 
   const liveFeed = useMockLiveFeed({
@@ -39,23 +41,27 @@ export default function App() {
     paused: effectivePaused,
     mania: feed.degenMode,
   });
+  const staticSnapshot = useMemo(() => buildSeedSnapshot(100, feed.volatility), [feed.volatility]);
+  const chartFeed = chart.renderMode === 'static' ? staticSnapshot : liveFeed;
 
   const valueDelta = useMemo(() => {
-    if (liveFeed.data.length < 2) return 0;
-    return liveFeed.value - liveFeed.data[Math.max(0, liveFeed.data.length - 24)].value;
-  }, [liveFeed.data, liveFeed.value]);
+    if (chartFeed.data.length < 2) return 0;
+    return chartFeed.value - chartFeed.data[Math.max(0, chartFeed.data.length - 24)].value;
+  }, [chartFeed.data, chartFeed.value]);
 
   const syntheticOrderbook = useMemo((): LiveOrderbookSnapshot | undefined => {
-    if (chart.chartView === 'multi' || !chart.showOrderbookStream) return undefined;
-    const mid = liveFeed.value;
+    if (chart.renderMode === 'static' || chart.chartView === 'multi' || !chart.showOrderbookStream) {
+      return undefined;
+    }
+    const mid = chartFeed.value;
     const spread =
       Math.max(0.02, mid * 0.0011) *
       (feed.volatility === 'chaos' ? 2.1 : feed.volatility === 'calm' ? 0.62 : 1);
     const levels = 10;
     const bids: [number, number][] = [];
     const asks: [number, number][] = [];
-    const n = liveFeed.data.length;
-    for (let i = 0; i < levels; i++) {
+    const n = chartFeed.data.length;
+    for (let i = 0; i < levels; i += 1) {
       const j = i + 1;
       const szb = 3 + ((i * 19 + (n % 13)) % 78) * (feed.volatility === 'chaos' ? 1.45 : 1);
       const sza = 3 + ((i * 17 + (n % 10)) % 76) * (feed.volatility === 'chaos' ? 1.4 : 1);
@@ -63,20 +69,27 @@ export default function App() {
       asks.push([mid + spread * j, sza]);
     }
     return { bids, asks };
-  }, [chart.chartView, liveFeed.value, liveFeed.data.length, chart.showOrderbookStream, feed.volatility]);
+  }, [
+    chart.chartView,
+    chart.renderMode,
+    chart.showOrderbookStream,
+    chartFeed.data.length,
+    chartFeed.value,
+    feed.volatility,
+  ]);
 
   const demoSeries = useMemo((): LiveLineSeries[] => {
     if (chart.chartView !== 'multi') return [];
-    const d = liveFeed.data;
-    if (d.length === 0) return [];
+    const data = chartFeed.data;
+    if (data.length === 0) return [];
 
-    const seedOffset = (id: string) => id.split('').reduce((s, c) => s + c.charCodeAt(0), 0);
+    const seedOffset = (id: string) => id.split('').reduce((sum, char) => sum + char.charCodeAt(0), 0);
 
-    const makeSeries = (id: string, label: string, color: string, bias: number, scale: number) => {
+    const makeSeries = (id: string, label: string, colorValue: string, bias: number, scale: number) => {
       const offset = seedOffset(id);
-      const base = d[0]?.value ?? 100;
+      const base = data[0]?.value ?? 100;
       const biasOffset = base * bias;
-      const points = d.map((point, index) => {
+      const points = data.map((point, index) => {
         const t = point.time;
         const harmonic =
           Math.sin(t * 0.73 + offset * 0.11) * 0.52 +
@@ -84,15 +97,29 @@ export default function App() {
           Math.sin(index * 0.09 + offset * 0.03) * 0.18;
         return { time: t, value: point.value + biasOffset + harmonic * scale };
       });
-      return { id, label, color, data: points, value: points[points.length - 1]?.value ?? base };
+      return { id, label, color: colorValue, data: points, value: points[points.length - 1]?.value ?? base };
     };
 
     return [
-      { id: 'primary', label: 'Primary', color: chart.accent, data: d, value: liveFeed.value },
+      { id: 'primary', label: 'Primary', color: chart.accent, data, value: chartFeed.value },
       makeSeries('hedge', 'Hedge', '#22c55e', -0.02, 0.85),
       makeSeries('arb', 'Arb', '#f59e0b', 0.015, 1.15),
     ];
-  }, [chart.accent, chart.chartView, liveFeed.data, liveFeed.value]);
+  }, [chart.accent, chart.chartView, chartFeed.data, chartFeed.value]);
+
+  const staticChartKey = useMemo(
+    () =>
+      [
+        'static',
+        chart.chartView,
+        chart.windowSecs,
+        staticSnapshot.data.length,
+        staticSnapshot.data[0]?.time ?? 0,
+        staticSnapshot.data[staticSnapshot.data.length - 1]?.time ?? 0,
+        staticSnapshot.value.toFixed(4),
+      ].join(':'),
+    [chart.chartView, chart.windowSecs, staticSnapshot],
+  );
 
   const pageBackground = chart.theme === 'dark' ? '#111111' : '#f5f5f5';
   const panelBackground = chart.theme === 'dark' ? 'rgba(255,255,255,0.02)' : 'rgba(0,0,0,0.02)';
@@ -101,23 +128,23 @@ export default function App() {
   const muted = chart.theme === 'dark' ? 'rgba(255,255,255,0.35)' : 'rgba(0,0,0,0.35)';
   const deltaColor = valueDelta >= 0 ? '#22c55e' : '#ef4444';
 
-  const modeSupportsOrderbook = chart.chartView !== 'multi';
+  const modeSupportsOrderbook = chart.renderMode === 'live' && chart.chartView !== 'multi';
   const modeSupportsScrubNumberFlow = chart.chartView === 'line';
   const modeSupportsScrubHaptics = chart.chartView === 'line';
   const modeSupportsSnap = chart.chartView !== 'candle';
-  const modeSupportsLiveDotGlow = chart.chartView === 'line';
+  const modeSupportsLiveDotGlow = chart.renderMode === 'live' && chart.chartView === 'line';
   const modeSupportsLineTrailGlow =
     chart.chartView === 'line' || (chart.chartView === 'candle' && chart.candleLineMorph);
   const modeSupportsGradientLine =
     chart.chartView === 'line' || (chart.chartView === 'candle' && chart.candleLineMorph);
-  const modeSupportsDegen = chart.chartView === 'line';
+  const modeSupportsDegen = chart.renderMode === 'live' && chart.chartView === 'line';
 
   const referenceLine = useMemo(
     () =>
       chart.showReferenceLine
-        ? { value: liveFeed.value - valueDelta / 2, label: 'MID' as const }
+        ? { value: chartFeed.value - valueDelta / 2, label: 'MID' as const }
         : undefined,
-    [chart.showReferenceLine, liveFeed.value, valueDelta],
+    [chart.showReferenceLine, chartFeed.value, valueDelta],
   );
 
   return (
@@ -134,9 +161,7 @@ export default function App() {
                 </Text>
               </View>
 
-              <View
-                style={[styles.controlPanel, { backgroundColor: panelBackground, borderColor: panelBorder }]}
-              >
+              <View style={[styles.controlPanel, { backgroundColor: panelBackground, borderColor: panelBorder }]}>
                 <ChartControlsSection
                   config={chart}
                   muted={muted}
@@ -166,51 +191,89 @@ export default function App() {
                 Disabled controls do not apply in the current chart mode.
               </Text>
 
-              <LiveLineChart
-                data={liveFeed.data}
-                value={liveFeed.value}
-                theme={chart.theme}
-                color={chart.accent}
-                window={chart.windowSecs}
-                windows={DEMO_WINDOW_OPTIONS}
-                onWindowChange={chart.setWindowSecs}
-                windowStyle="rounded"
-                momentum
-                badge={chart.showBadge}
-                badgeVariant={chart.badgeVariant}
-                badgeNumberFlow={chart.badgeNumberFlow}
-                scrubNumberFlow={interaction.scrubNumberFlow}
-                scrubHaptics={interaction.scrubHaptics}
-                snapToPointScrubbing={interaction.snapToPointScrubbing}
-                pinchToZoom={interaction.pinchToZoom}
-                referenceLine={referenceLine}
-                liveDotGlow={chart.liveDotGlow}
-                lineTrailGlow={chart.lineTrailGlow}
-                gradientLineColoring={chart.gradientLineColoring}
-                degen={degenConfig}
-                paused={effectivePaused}
-                loading={liveFeed.data.length < 2}
-                height={320}
-                mode={chart.chartView === 'candle' ? 'candle' : 'line'}
-                onModeChange={(next) => {
-                  chart.setChartView(next === 'candle' ? 'candle' : 'line');
-                  if (next === 'line') chart.setCandleLineMorph(false);
-                }}
-                showBuiltInModeToggle={chart.chartView !== 'multi'}
-                showBuiltInMorphToggle={chart.chartView === 'candle'}
-                lineMode={chart.candleLineMorph}
-                onLineModeChange={chart.setCandleLineMorph}
-                {...(chart.chartView === 'candle'
-                  ? { candles: liveFeed.candles, liveCandle: liveFeed.liveCandle }
-                  : chart.chartView === 'multi'
-                    ? { series: demoSeries }
-                    : {})}
-                orderbook={syntheticOrderbook}
-              />
+              {chart.renderMode === 'live' ? (
+                <LiveLineChart
+                  data={liveFeed.data}
+                  value={liveFeed.value}
+                  theme={chart.theme}
+                  color={chart.accent}
+                  window={chart.windowSecs}
+                  windows={DEMO_WINDOW_OPTIONS}
+                  onWindowChange={chart.setWindowSecs}
+                  windowStyle="rounded"
+                  momentum
+                  badge={chart.showBadge}
+                  badgeVariant={chart.badgeVariant}
+                  badgeNumberFlow={chart.badgeNumberFlow}
+                  scrubNumberFlow={interaction.scrubNumberFlow}
+                  scrubHaptics={interaction.scrubHaptics}
+                  snapToPointScrubbing={interaction.snapToPointScrubbing}
+                  pinchToZoom={interaction.pinchToZoom}
+                  referenceLine={referenceLine}
+                  liveDotGlow={chart.liveDotGlow}
+                  lineTrailGlow={chart.lineTrailGlow}
+                  gradientLineColoring={chart.gradientLineColoring}
+                  degen={degenConfig}
+                  paused={effectivePaused}
+                  loading={liveFeed.data.length < 2}
+                  height={320}
+                  mode={chart.chartView === 'candle' ? 'candle' : 'line'}
+                  onModeChange={(next) => {
+                    chart.setChartView(next === 'candle' ? 'candle' : 'line');
+                    if (next === 'line') chart.setCandleLineMorph(false);
+                  }}
+                  showBuiltInModeToggle={chart.chartView !== 'multi'}
+                  showBuiltInMorphToggle={chart.chartView === 'candle'}
+                  lineMode={chart.candleLineMorph}
+                  onLineModeChange={chart.setCandleLineMorph}
+                  {...(chart.chartView === 'candle'
+                    ? { candles: liveFeed.candles, liveCandle: liveFeed.liveCandle }
+                    : chart.chartView === 'multi'
+                      ? { series: demoSeries }
+                      : {})}
+                  orderbook={syntheticOrderbook}
+                />
+              ) : (
+                <StaticChart
+                  key={staticChartKey}
+                  data={staticSnapshot.data}
+                  theme={chart.theme}
+                  color={chart.accent}
+                  window={chart.windowSecs}
+                  windows={DEMO_WINDOW_OPTIONS}
+                  onWindowChange={chart.setWindowSecs}
+                  windowStyle="rounded"
+                  badge={chart.showBadge}
+                  badgeVariant={chart.badgeVariant}
+                  scrubNumberFlow={interaction.scrubNumberFlow}
+                  scrubHaptics={interaction.scrubHaptics}
+                  snapToPointScrubbing={interaction.snapToPointScrubbing}
+                  pinchToZoom={interaction.pinchToZoom}
+                  referenceLine={referenceLine}
+                  lineTrailGlow={chart.lineTrailGlow}
+                  gradientLineColoring={chart.gradientLineColoring}
+                  loading={false}
+                  height={320}
+                  mode={chart.chartView === 'candle' ? 'candle' : 'line'}
+                  onModeChange={(next) => {
+                    chart.setChartView(next === 'candle' ? 'candle' : 'line');
+                    if (next === 'line') chart.setCandleLineMorph(false);
+                  }}
+                  showBuiltInModeToggle={chart.chartView !== 'multi'}
+                  showBuiltInMorphToggle={chart.chartView === 'candle'}
+                  lineMode={chart.candleLineMorph}
+                  onLineModeChange={chart.setCandleLineMorph}
+                  {...(chart.chartView === 'candle'
+                    ? { candles: staticSnapshot.candles }
+                    : chart.chartView === 'multi'
+                      ? { series: demoSeries }
+                      : {})}
+                />
+              )}
 
               <View style={styles.statusRail}>
                 <Text style={[styles.statusText, { color: muted }]}>
-                  value: <Text style={{ color: headline }}>{liveFeed.value.toFixed(2)}</Text>
+                  value: <Text style={{ color: headline }}>{chartFeed.value.toFixed(2)}</Text>
                 </Text>
                 <Text style={[styles.statusText, { color: muted }]}>
                   delta:{' '}
@@ -230,6 +293,9 @@ export default function App() {
                 </Text>
                 <Text style={[styles.statusText, { color: muted }]}>
                   lifecycle: <Text style={{ color: headline }}>{feed.appIsActive ? 'active' : 'paused'}</Text>
+                </Text>
+                <Text style={[styles.statusText, { color: muted }]}>
+                  render: <Text style={{ color: headline }}>{chart.renderMode}</Text>
                 </Text>
                 <Text style={[styles.statusText, { color: muted }]}>
                   chart:{' '}

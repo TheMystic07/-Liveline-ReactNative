@@ -1,4 +1,4 @@
-import { DashPathEffect, Group, Line as SkiaLine, vec } from '@shopify/react-native-skia';
+import { DashPathEffect, Group, Line as SkiaLine } from '@shopify/react-native-skia';
 import { useDerivedValue, type SharedValue } from 'react-native-reanimated';
 
 type ReferenceLineCanvasProps = {
@@ -13,7 +13,7 @@ type ReferenceLineCanvasProps = {
 
 const LABEL_GAP = 10;
 const LABEL_CHAR_W = 7;
-const REF_DASH_INTERVALS: readonly [number, number] = [4, 4];
+const REF_DASH_INTERVALS = [4, 4];
 
 function readWorklet(v: number | SharedValue<number>): number {
   'worklet';
@@ -36,12 +36,12 @@ export function ReferenceLineCanvas({
   const yPos = useDerivedValue(() => readWorklet(y), [y]);
   const opacityVal = useDerivedValue(() => readWorklet(opacity), [opacity]);
 
-  const p1Seg1 = useDerivedValue(() => vec(padLeft, yPos.value));
-  const p2Seg1 = useDerivedValue(() => vec(centerX - labelWidth / 2 - LABEL_GAP, yPos.value));
-  const p1Seg2 = useDerivedValue(() => vec(centerX + labelWidth / 2 + LABEL_GAP, yPos.value));
-  const p2Seg2 = useDerivedValue(() => vec(layoutWidth - padRight, yPos.value));
-  const p1Full = useDerivedValue(() => vec(padLeft, yPos.value));
-  const p2Full = useDerivedValue(() => vec(layoutWidth - padRight, yPos.value));
+  const p1Seg1 = useDerivedValue(() => ({ x: padLeft, y: yPos.value }));
+  const p2Seg1 = useDerivedValue(() => ({ x: centerX - labelWidth / 2 - LABEL_GAP, y: yPos.value }));
+  const p1Seg2 = useDerivedValue(() => ({ x: centerX + labelWidth / 2 + LABEL_GAP, y: yPos.value }));
+  const p2Seg2 = useDerivedValue(() => ({ x: layoutWidth - padRight, y: yPos.value }));
+  const p1Full = useDerivedValue(() => ({ x: padLeft, y: yPos.value }));
+  const p2Full = useDerivedValue(() => ({ x: layoutWidth - padRight, y: yPos.value }));
 
   return (
     <Group opacity={opacityVal}>

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Platform, StyleSheet, Text, View } from 'react-native';
 import {
   Canvas,
@@ -15,6 +15,7 @@ import {
 import { useSkiaFont } from 'number-flow-react-native/skia';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import {
+  runOnJS,
   useDerivedValue,
   useSharedValue,
 } from 'react-native-reanimated';
@@ -42,6 +43,7 @@ import type { StaticChartProps } from './staticTypes';
 import {
   calcGridTicksJs,
   calcTimeTicksJs,
+  clamp,
   defaultFormatTime,
   defaultFormatValue,
   interpAtTimeJs,
@@ -54,6 +56,7 @@ import { useStaticScrub } from './hooks/useStaticScrub';
 
 import { AxisLabels } from './render/AxisLabels';
 import { BadgeOverlay } from './render/BadgeOverlay';
+import { ChartControlRow, type ChartControlOption } from './ChartControlRow';
 import { CrosshairCanvas } from './render/CrosshairCanvas';
 import { EmptyState } from './render/EmptyState';
 import { GridCanvas } from './render/GridCanvas';
@@ -73,7 +76,7 @@ const WINDOW_BUFFER_BADGE = 0.05;
 const WINDOW_BUFFER_NO_BADGE = 0.015;
 
 const mono = Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' });
-const PRICE_DASH_INTERVALS: readonly [number, number] = [4, 4];
+const PRICE_DASH_INTERVALS = [4, 4];
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -130,8 +133,16 @@ export function NativeStaticLineChart({
   contentInset,
 }: StaticChartProps) {
   const buf = windowBuffer(badge);
-  const win = controlledWin;
   const empty = data.length === 0;
+  const ws: LiveLineWindowStyle = windowStyleProp ?? 'default';
+
+  const resolvedWin = useMemo(() => {
+    if (!windows?.length) return controlledWin;
+    if (windows.some((entry) => entry.secs === controlledWin)) return controlledWin;
+    return windows[0]!.secs;
+  }, [controlledWin, windows]);
+  const [pinchWindow, setPinchWindow] = useState<number | null>(null);
+  const win = pinchWindow ?? resolvedWin;
 
   /* ---- Palette ---- */
   const pal = useMemo(
@@ -157,6 +168,10 @@ export function NativeStaticLineChart({
   const lastPoint = useMemo(
     () => (data.length > 0 ? data[data.length - 1]! : null),
     [data],
+  );
+  const animationKey = useMemo(
+    () => `${resolvedWin}:${data.length}:${data[0]?.time ?? 0}:${lastPoint?.time ?? 0}:${lastPoint?.value ?? 0}`,
+    [resolvedWin, data, lastPoint],
   );
   const tipT = lastPoint?.time ?? 0;
   const tipV = lastPoint?.value ?? 0;
@@ -227,10 +242,28 @@ export function NativeStaticLineChart({
     chartWidth: chartW,
     chartHeight: layout.height,
     padLeft: pad.left,
+    animationKey,
     duration: drawDuration,
     easing: drawEasing,
     onComplete: onDrawComplete,
   });
+
+  const onHoverSample = useCallback(
+    (sample: { hx: number; hv: number; ht: number; opacity: number } | null) => {
+      if (!onHover) return;
+      if (!sample || sample.opacity <= 0.01) {
+        onHover(null);
+        return;
+      }
+      onHover({
+        time: sample.ht,
+        value: sample.hv,
+        x: sample.hx,
+        y: toScreenYJs(sample.hv, rng.min, rng.max, layout.height, pad),
+      });
+    },
+    [onHover, rng.min, rng.max, layout.height, pad],
+  );
 
   /* ---- Scrub ---- */
   const {
@@ -253,6 +286,7 @@ export function NativeStaticLineChart({
     snapToPoint: snapToPointScrubbing,
     haptics: scrubHapticsProp,
     isCandle: false,
+    onHoverSample,
   });
 
   /* ---- Derived values for Skia rendering ---- */
@@ -268,6 +302,11 @@ export function NativeStaticLineChart({
   const svIdentityTranslateX = useSharedValue(0);
   const svIdentityScaleY = useSharedValue(1);
   const svIdentityTranslateY = useSharedValue(0);
+  const svLineData = useSharedValue<LiveLinePoint[]>(data.slice());
+
+  useEffect(() => {
+    svLineData.value = data.slice();
+  }, [data, svLineData]);
 
   // Live dot position (last data point)
   const lastPointX = useMemo(
@@ -288,11 +327,11 @@ export function NativeStaticLineChart({
     const re = tipT + win * buf;
     const le = re - win;
     const t = le + ((dotX - pad.left) / cw) * (re - le);
-    const v = interpAtTimeJs(data, t) ?? tipV;
+    const v = interpAtTimeJs(svLineData.value, t) ?? tipV;
     const span = Math.max(0.0001, rng.max - rng.min);
     const ch = Math.max(1, layout.height - pad.top - pad.bottom);
     return pad.top + (1 - (v - rng.min) / span) * ch;
-  }, [lastPoint, layout.width, layout.height, pad, win, buf, tipT, tipV, data, rng]);
+  }, [lastPoint, layout.width, layout.height, pad, win, buf, tipT, tipV, rng, svLineData]);
 
   // Line color (static — no momentum blending)
   const lineColor = pal.accent;
@@ -312,9 +351,9 @@ export function NativeStaticLineChart({
     if (!scrubTip) return 0;
     return toScreenYJs(svScrubHv.value, rng.min, rng.max, layout.height, pad);
   }, [rng.min, rng.max, layout.height, pad, scrubTip]);
-  const dvCrossP1 = useDerivedValue(() => vec(svScrubX.value, pad.top), [pad.top]);
+  const dvCrossP1 = useDerivedValue(() => ({ x: svScrubX.value, y: pad.top }), [pad.top]);
   const dvCrossP2 = useDerivedValue(
-    () => vec(svScrubX.value, layout.height - pad.bottom),
+    () => ({ x: svScrubX.value, y: layout.height - pad.bottom }),
     [layout.height, pad.bottom],
   );
   const dvCrossLineOp = useDerivedValue(() => svScrubOp.value * 0.3);
@@ -326,9 +365,9 @@ export function NativeStaticLineChart({
     () => toScreenYJs(tipV, rng.min, rng.max, layout.height, pad),
     [tipV, rng.min, rng.max, layout.height, pad],
   );
-  const dvDashP1 = useDerivedValue(() => vec(pad.left, dvDashY.value), [pad.left]);
+  const dvDashP1 = useDerivedValue(() => ({ x: pad.left, y: dvDashY.value }), [pad.left]);
   const dvDashP2 = useDerivedValue(
-    () => vec(layout.width - pad.right, dvDashY.value),
+    () => ({ x: layout.width - pad.right, y: dvDashY.value }),
     [layout.width, pad.right],
   );
 
@@ -346,8 +385,7 @@ export function NativeStaticLineChart({
   const skiaScrubFlow = scrub && scrubNumberFlow !== false && skiaDefaultNumberFormat && scrubTipFont != null;
 
   const svBadgeValue = useSharedValue(tipV);
-  // Keep badge value in sync
-  useMemo(() => {
+  useEffect(() => {
     svBadgeValue.value = tipV;
   }, [tipV, svBadgeValue]);
 
@@ -428,12 +466,49 @@ export function NativeStaticLineChart({
   /* ================================================================ */
 
   const gesture = useMemo(
-    () => Gesture.Simultaneous(scrubGesture),
-    [scrubGesture],
+    () =>
+      Gesture.Simultaneous(
+        scrubGesture,
+        Gesture.Pinch()
+          .enabled(pinchToZoom)
+          .onUpdate((e) => {
+            'worklet';
+            const next = clamp(
+              resolvedWin / Math.max(0.5, Math.min(2.5, e.scale)),
+              5,
+              resolvedWin * 6,
+            );
+            runOnJS(setPinchWindow)(next);
+          })
+          .onEnd(() => {
+            'worklet';
+            runOnJS(setPinchWindow)(null);
+          }),
+      ),
+    [pinchToZoom, resolvedWin, scrubGesture],
+  );
+
+  const windowControls = useMemo<ChartControlOption[]>(
+    () =>
+      windows?.map((entry) => ({
+        key: entry.secs,
+        label: entry.label,
+        active: pinchWindow == null && resolvedWin === entry.secs,
+        onPress: () => onWindowChange?.(entry.secs),
+      })) ?? [],
+    [onWindowChange, pinchWindow, resolvedWin, windows],
   );
 
   return (
     <View style={[styles.root, { height }, style]}>
+      {windowControls.length > 0 ? (
+        <ChartControlRow
+          options={windowControls}
+          theme={theme}
+          styleVariant={ws}
+          marginLeft={pad.left}
+        />
+      ) : null}
       <GestureDetector gesture={gesture}>
         <View style={[styles.shell, { backgroundColor: pal.surface }]}>
           <View

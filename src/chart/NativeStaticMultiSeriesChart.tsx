@@ -1,11 +1,9 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Platform, StyleSheet, Text, View } from 'react-native';
 import {
   Canvas,
   Circle,
-  DashPathEffect,
   Group,
-  Line as SkiaLine,
   LinearGradient,
   Path,
   Rect,
@@ -13,46 +11,52 @@ import {
   vec,
 } from '@shopify/react-native-skia';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
-import { useDerivedValue, useSharedValue } from 'react-native-reanimated';
+import { runOnJS, useDerivedValue, useSharedValue } from 'react-native-reanimated';
 
-import { resolvePalette } from './theme';
+import {
+  BADGE_LINE_H,
+  BADGE_PAD_X,
+  BADGE_PAD_Y,
+  BADGE_TAIL_LEN,
+  BADGE_TAIL_SPREAD,
+  badgeSvgPath,
+} from './draw/badge';
 import { buildPath } from './draw/buildLiveLinePath';
-import type { ChartPadding, LiveLinePoint, LiveLineSeries } from './types';
-import type { StaticChartProps } from './staticTypes';
+import { useStaticDrawAnimation } from './hooks/useStaticDrawAnimation';
+import { useStaticScrub } from './hooks/useStaticScrub';
 import {
   calcGridTicksJs,
   calcTimeTicksJs,
+  clamp,
   defaultFormatTime,
   defaultFormatValue,
   interpAtTimeJs,
+  nearestPointAtTimeJs,
   toScreenXJs,
   toScreenYJs,
 } from './nativeChartUtils';
-
-import { useStaticDrawAnimation } from './hooks/useStaticDrawAnimation';
-import { useStaticScrub } from './hooks/useStaticScrub';
-
+import type {
+  ChartPadding,
+  LiveLinePoint,
+  LiveLineTheme,
+  LiveLineWindowStyle,
+} from './types';
+import { resolvePalette } from './theme';
+import type { StaticChartProps } from './staticTypes';
 import { AxisLabels } from './render/AxisLabels';
+import { BadgeOverlay } from './render/BadgeOverlay';
+import { ChartControlRow, type ChartControlOption } from './ChartControlRow';
 import { CrosshairCanvas } from './render/CrosshairCanvas';
 import { EmptyState } from './render/EmptyState';
 import { GridCanvas } from './render/GridCanvas';
 import { ReferenceLineCanvas } from './render/ReferenceLineCanvas';
 import { ReferenceLineLabel } from './render/ReferenceLineLabel';
-import { ScrubTooltip } from './render/ScrubTooltip';
 import { useTrackedGridLabels, useTrackedTimeLabels } from './render/useTrackedAxisLabels';
-
-/* ------------------------------------------------------------------ */
-/*  Constants                                                          */
-/* ------------------------------------------------------------------ */
 
 const FADE_EDGE_WIDTH = 40;
 const WIN_BUF = 0.015;
-
+const WIN_BUF_BADGE = 0.05;
 const mono = Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' });
-
-/* ------------------------------------------------------------------ */
-/*  Helpers                                                            */
-/* ------------------------------------------------------------------ */
 
 function computeUnionRange(
   seriesArr: Array<{ data: readonly LiveLinePoint[]; value: number }>,
@@ -83,21 +87,34 @@ function computeUnionRange(
   return { min: min - margin, max: max + margin };
 }
 
-/* ------------------------------------------------------------------ */
-/*  Component                                                          */
-/* ------------------------------------------------------------------ */
+function buildWindowControls(
+  windows: StaticChartProps['windows'],
+  resolvedWin: number,
+  pinchWindow: number | null,
+  onWindowChange?: (secs: number) => void,
+): ChartControlOption[] {
+  return (
+    windows?.map((entry) => ({
+      key: entry.secs,
+      label: entry.label,
+      active: pinchWindow == null && resolvedWin === entry.secs,
+      onPress: () => onWindowChange?.(entry.secs),
+    })) ?? []
+  );
+}
 
 export function NativeStaticMultiSeriesChart({
   series = [],
-  data: dataProp = [],
   theme = 'dark',
   color = '#3b82f6',
   lineWidth: lineWidthProp,
   window: controlledWin = 30,
   windows,
   onWindowChange,
+  windowStyle: windowStyleProp = 'default',
   grid = true,
   badge = true,
+  badgeVariant = 'default',
   referenceLine,
   lineTrailGlow = true,
   gradientLineColoring = false,
@@ -108,19 +125,26 @@ export function NativeStaticMultiSeriesChart({
   formatTime = defaultFormatTime,
   scrub = true,
   snapToPointScrubbing = false,
+  pinchToZoom = false,
   scrubHaptics: scrubHapticsProp = true,
   tooltipY = 14,
-  tooltipOutline = true,
   drawDuration = 1200,
   drawEasing = 'ease-out',
   onDrawComplete,
+  onHover,
   style,
   contentInset,
 }: StaticChartProps) {
-  const win = controlledWin;
-  const buf = WIN_BUF;
+  const ws: LiveLineWindowStyle = windowStyleProp ?? 'default';
+  const resolvedWin = useMemo(() => {
+    if (!windows?.length) return controlledWin;
+    if (windows.some((entry) => entry.secs === controlledWin)) return controlledWin;
+    return windows[0]!.secs;
+  }, [controlledWin, windows]);
+  const [pinchWindow, setPinchWindow] = useState<number | null>(null);
+  const win = pinchWindow ?? resolvedWin;
+  const buf = badge ? WIN_BUF_BADGE : WIN_BUF;
 
-  /* ---- Layout ---- */
   const [layout, setLayout] = useState({ width: 0, height: 0 });
   const pad: ChartPadding = useMemo(
     () => ({
@@ -134,22 +158,28 @@ export function NativeStaticMultiSeriesChart({
   const chartW = Math.max(0, layout.width - pad.left - pad.right);
   const chartH = Math.max(0, layout.height - pad.top - pad.bottom);
 
-  /* ---- Palette ---- */
   const primaryPal = useMemo(
     () => resolvePalette(series[0]?.color ?? color, theme, lineWidthProp),
-    [series, color, theme, lineWidthProp],
+    [color, lineWidthProp, series, theme],
   );
-
-  /* ---- Data prep ---- */
   const visibleSeries = series.length > 0 ? series : [];
-
   const latestTime = useMemo(
     () =>
       visibleSeries.reduce(
-        (mx, s) => Math.max(mx, s.data[s.data.length - 1]?.time ?? 0),
+        (mx, entry) => Math.max(mx, entry.data[entry.data.length - 1]?.time ?? 0),
         0,
       ),
     [visibleSeries],
+  );
+  const animationKey = useMemo(
+    () =>
+      `${resolvedWin}:${visibleSeries
+        .map(
+          (entry) =>
+            `${entry.id}:${entry.data.length}:${entry.data[0]?.time ?? 0}:${entry.data[entry.data.length - 1]?.time ?? 0}:${entry.value}`,
+        )
+        .join('|')}`,
+    [resolvedWin, visibleSeries],
   );
 
   const rightEdge = latestTime + win * buf;
@@ -157,94 +187,106 @@ export function NativeStaticMultiSeriesChart({
 
   const preparedSeries = useMemo(
     () =>
-      visibleSeries.map((s) => {
-        const filteredData = s.data.filter(
-          (p) => p.time >= leftEdge - 2 && p.time <= rightEdge + 1,
+      visibleSeries.map((entry) => {
+        const filteredData = entry.data.filter(
+          (point) => point.time >= leftEdge - 2 && point.time <= rightEdge + 1,
         );
-        const lastVal = s.data.length > 0 ? s.data[s.data.length - 1]!.value : 0;
-        const pal = resolvePalette(s.color ?? color, theme, lineWidthProp);
-        return { ...s, filteredData, lastVal, palette: pal };
+        const lastVal = entry.data.length > 0 ? entry.data[entry.data.length - 1]!.value : 0;
+        return {
+          ...entry,
+          filteredData,
+          lastVal,
+          palette: resolvePalette(entry.color ?? color, theme, lineWidthProp),
+        };
       }),
-    [visibleSeries, leftEdge, rightEdge, color, theme, lineWidthProp],
+    [color, leftEdge, lineWidthProp, rightEdge, theme, visibleSeries],
   );
 
-  const empty = loading || layout.width <= 0 || preparedSeries.every((s) => s.filteredData.length < 2);
+  const empty =
+    loading || layout.width <= 0 || preparedSeries.every((entry) => entry.filteredData.length < 2);
 
   const rng = useMemo(
     () =>
       computeUnionRange(
-        preparedSeries.map((s) => ({ data: s.filteredData, value: s.lastVal })),
+        preparedSeries.map((entry) => ({ data: entry.filteredData, value: entry.lastVal })),
         referenceLine?.value,
       ),
     [preparedSeries, referenceLine?.value],
   );
 
-  // Build paths (once per series)
   const seriesPaths = useMemo(
     () =>
       !empty && layout.width > 0
-        ? preparedSeries.map((s) =>
+        ? preparedSeries.map((entry) =>
             buildPath(
-              s.data, latestTime, s.lastVal,
-              rng.min, rng.max,
-              layout.width, layout.height,
-              pad, win, buf, false,
+              entry.data,
+              latestTime,
+              entry.lastVal,
+              rng.min,
+              rng.max,
+              layout.width,
+              layout.height,
+              pad,
+              win,
+              buf,
+              false,
             ),
           )
         : [],
-    [preparedSeries, latestTime, rng, layout, pad, win, buf, empty],
+    [buf, empty, latestTime, layout.height, layout.width, pad, preparedSeries, rng.max, rng.min, win],
   );
 
-  /* ---- Grid / Axis ---- */
   const gridTicks = useMemo(
     () =>
       grid && !empty && layout.width > 0
         ? calcGridTicksJs(rng.min, rng.max, chartH, layout.height, pad, formatValue)
         : [],
-    [grid, rng, chartH, layout.height, pad, formatValue, empty],
+    [chartH, empty, formatValue, grid, layout.height, layout.width, pad, rng.max, rng.min],
   );
   const trackedGridLabels = useTrackedGridLabels(gridTicks);
-
   const timeTicks = useMemo(
     () =>
       !empty && layout.width > 0
         ? calcTimeTicksJs(leftEdge, rightEdge, layout.width, pad, formatTime)
         : [],
-    [leftEdge, rightEdge, layout.width, pad, formatTime, empty],
+    [empty, formatTime, layout.width, leftEdge, pad, rightEdge],
   );
   const trackedTimeLabels = useTrackedTimeLabels(timeTicks);
 
-  /* ---- Draw animation ---- */
-  const {
-    drawComplete,
-    dvClipRect,
-    dvDrawDotX,
-    dvGridOp,
-    dvDrawDotOp,
-    dvEndDotOp,
-  } = useStaticDrawAnimation({
-    ready: !empty && layout.width > 0,
-    chartWidth: chartW,
-    chartHeight: layout.height,
-    padLeft: pad.left,
-    duration: drawDuration,
-    easing: drawEasing,
-    onComplete: onDrawComplete,
-  });
+  const { drawComplete, dvClipRect, dvDrawDotX, dvGridOp, dvDrawDotOp, dvEndDotOp } =
+    useStaticDrawAnimation({
+      ready: !empty && layout.width > 0,
+      chartWidth: chartW,
+      chartHeight: layout.height,
+      padLeft: pad.left,
+      animationKey,
+      duration: drawDuration,
+      easing: drawEasing,
+      onComplete: onDrawComplete,
+    });
 
-  /* ---- Primary series for scrub ---- */
   const primary = preparedSeries[0];
   const tipT = latestTime;
   const tipV = primary?.lastVal ?? 0;
 
-  /* ---- Scrub ---- */
-  const {
-    gesture: scrubGesture,
-    svScrubX,
-    svScrubOp,
-    svScrubHv,
-    scrubTip,
-  } = useStaticScrub({
+  const onHoverSample = useCallback(
+    (sample: { hx: number; hv: number; ht: number; opacity: number } | null) => {
+      if (!onHover) return;
+      if (!sample || sample.opacity <= 0.01) {
+        onHover(null);
+        return;
+      }
+      onHover({
+        time: sample.ht,
+        value: sample.hv,
+        x: sample.hx,
+        y: toScreenYJs(sample.hv, rng.min, rng.max, layout.height, pad),
+      });
+    },
+    [layout.height, onHover, pad, rng.max, rng.min],
+  );
+
+  const { gesture: scrubGesture, svScrubX, svScrubOp, svScrubHv, scrubTip } = useStaticScrub({
     enabled: scrub,
     drawComplete,
     chartWidth: layout.width,
@@ -258,18 +300,19 @@ export function NativeStaticMultiSeriesChart({
     snapToPoint: snapToPointScrubbing,
     haptics: scrubHapticsProp,
     isCandle: false,
+    onHoverSample,
   });
 
-  /* ---- Derived values ---- */
   const clipRect = useMemo(
-    () =>
-      chartW > 0 && chartH > 0
-        ? rect(pad.left - 1, pad.top, chartW + 2, chartH)
-        : undefined,
-    [chartW, chartH, pad.left, pad.top],
+    () => (chartW > 0 && chartH > 0 ? rect(pad.left - 1, pad.top, chartW + 2, chartH) : undefined),
+    [chartH, chartW, pad.left, pad.top],
   );
+  const svPrimaryData = useSharedValue<LiveLinePoint[]>(primary?.data ? [...primary.data] : []);
 
-  // Drawing dot Y (follows primary series)
+  useEffect(() => {
+    svPrimaryData.value = primary?.data ? [...primary.data] : [];
+  }, [primary?.data, svPrimaryData]);
+
   const dvDrawDotY = useDerivedValue(() => {
     if (!primary || layout.width <= 0) return 0;
     const dotX = dvDrawDotX.value;
@@ -277,83 +320,142 @@ export function NativeStaticMultiSeriesChart({
     const re = tipT + win * buf;
     const le = re - win;
     const t = le + ((dotX - pad.left) / cw) * (re - le);
-    const v = interpAtTimeJs(primary.data, t) ?? tipV;
+    const v = interpAtTimeJs(svPrimaryData.value, t) ?? tipV;
     const span = Math.max(0.0001, rng.max - rng.min);
     const ch = Math.max(1, layout.height - pad.top - pad.bottom);
     return pad.top + (1 - (v - rng.min) / span) * ch;
-  }, [primary, layout, pad, win, buf, tipT, tipV, rng]);
+  }, [buf, dvDrawDotX, layout.height, layout.width, pad, primary, rng.max, rng.min, svPrimaryData, tipT, tipV, win]);
 
-  // End dot positions for each series
   const endDots = useMemo(
     () =>
-      preparedSeries.map((s) => ({
+      preparedSeries.map((entry) => ({
         x: toScreenXJs(latestTime, leftEdge, rightEdge, layout.width, pad),
-        y: toScreenYJs(s.lastVal, rng.min, rng.max, layout.height, pad),
-        color: s.palette.accent,
+        y: toScreenYJs(entry.lastVal, rng.min, rng.max, layout.height, pad),
+        color: entry.palette.accent,
       })),
-    [preparedSeries, latestTime, leftEdge, rightEdge, layout, pad, rng],
+    [latestTime, layout.height, layout.width, leftEdge, pad, preparedSeries, rightEdge, rng.max, rng.min],
   );
 
-  // Reference line
+  const multiScrubInfo = useMemo(() => {
+    if (!scrubTip) return null;
+    const values = preparedSeries
+      .map((entry) => {
+        const nearest = snapToPointScrubbing
+          ? nearestPointAtTimeJs(entry.data, scrubTip.ht)
+          : null;
+        const value = nearest ? nearest.value : interpAtTimeJs(entry.data, scrubTip.ht);
+        if (value == null) return null;
+        return {
+          id: entry.id,
+          label: entry.label ?? entry.id,
+          color: entry.palette.accent,
+          value,
+          y: toScreenYJs(value, rng.min, rng.max, layout.height, pad),
+        };
+      })
+      .filter(Boolean) as Array<{
+      id: string;
+      label: string;
+      color: string;
+      value: number;
+      y: number;
+    }>;
+    if (values.length === 0) return null;
+    return { x: scrubTip.hx, time: scrubTip.ht, values };
+  }, [layout.height, pad, preparedSeries, rng.max, rng.min, scrubTip, snapToPointScrubbing]);
+
   const dvReferenceY = useDerivedValue(
     () =>
-      referenceLine
-        ? toScreenYJs(referenceLine.value, rng.min, rng.max, layout.height, pad)
-        : 0,
-    [referenceLine, rng, layout.height, pad],
+      referenceLine ? toScreenYJs(referenceLine.value, rng.min, rng.max, layout.height, pad) : 0,
+    [layout.height, pad, referenceLine, rng.max, rng.min],
   );
-
-  // Crosshair
   const dvHoverX = useDerivedValue(() => svScrubX.value);
-  const dvHoverY = useDerivedValue(() => {
-    if (!scrubTip) return 0;
-    return toScreenYJs(svScrubHv.value, rng.min, rng.max, layout.height, pad);
-  }, [rng, layout.height, pad, scrubTip]);
-  const dvCrossP1 = useDerivedValue(() => vec(svScrubX.value, pad.top), [pad.top]);
+  const dvHoverY = useDerivedValue(
+    () => (multiScrubInfo ? toScreenYJs(svScrubHv.value, rng.min, rng.max, layout.height, pad) : 0),
+    [layout.height, multiScrubInfo, pad, rng.max, rng.min, svScrubHv],
+  );
+  const dvCrossP1 = useDerivedValue(() => vec(svScrubX.value, pad.top), [pad.top, svScrubX]);
   const dvCrossP2 = useDerivedValue(
     () => vec(svScrubX.value, layout.height - pad.bottom),
-    [layout.height, pad.bottom],
+    [layout.height, pad.bottom, svScrubX],
   );
-  const dvCrossLineOp = useDerivedValue(() => svScrubOp.value * 0.3);
-  const dvCrossDotR = useDerivedValue(() => (svScrubOp.value > 0.01 ? 4.5 : 0));
-  const dvCrossDotOp = useDerivedValue(() => svScrubOp.value);
+  const dvCrossLineOp = useDerivedValue(() => svScrubOp.value * 0.3, [svScrubOp]);
 
-  // Scrub tip layout
-  const scrubTipLayout = useMemo(() => {
-    if (!scrubTip || layout.width < 300) return null;
-    const v = formatValue(scrubTip.hv);
-    const t = formatTime(scrubTip.ht);
-    const sep = '  ·  ';
-    const charW = 7.85;
-    const totalW = v.length * charW + sep.length * charW + t.length * charW;
-    const liveX = endDots[0]?.x ?? 0;
-    const dotRight = liveX + 7;
-    let left = scrubTip.hx - totalW / 2;
-    const minX = pad.left + 4;
-    const maxX = dotRight - totalW;
-    if (left < minX) left = minX;
-    if (left > maxX) left = maxX;
-    return { left, v, t, sep };
-  }, [scrubTip, layout.width, formatValue, formatTime, endDots, pad]);
-
-  const dvScrubValueStr = useDerivedValue(() => {
-    'worklet';
-    return String(svScrubHv.value.toFixed(2));
-  });
+  const [flowPillW, setFlowPillW] = useState(80);
+  const pillH = BADGE_LINE_H + BADGE_PAD_Y * 2;
+  const badgeStr = useMemo(() => formatValue(primary?.lastVal ?? 0), [formatValue, primary?.lastVal]);
+  const svBadgeValue = useSharedValue(primary?.lastVal ?? 0);
+  useEffect(() => {
+    svBadgeValue.value = primary?.lastVal ?? 0;
+  }, [primary?.lastVal, svBadgeValue]);
+  const onBadgeTemplateLayout = useCallback(
+    (e: { nativeEvent: { layout: { width: number } } }) => {
+      const w = e.nativeEvent.layout.width;
+      setFlowPillW((prev) => (prev === Math.round(w) ? prev : Math.round(w)));
+    },
+    [],
+  );
+  const badgePillW = useMemo(() => Math.max(8, flowPillW) + BADGE_PAD_X * 2, [flowPillW]);
+  const badgeBgPath = useMemo(
+    () => badgeSvgPath(badgePillW, pillH, BADGE_TAIL_LEN, BADGE_TAIL_SPREAD),
+    [badgePillW, pillH],
+  );
+  const badgeInnerPath = useMemo(
+    () => badgeSvgPath(badgePillW - 4, pillH - 4, BADGE_TAIL_LEN - 1, BADGE_TAIL_SPREAD - 0.5),
+    [badgePillW, pillH],
+  );
+  const badgeX = useMemo(() => layout.width - pad.right + 4, [layout.width, pad.right]);
+  const badgeY = endDots[0]?.y ?? 0;
+  const asBadge = useMemo(
+    () => ({
+      left: badgeX,
+      top: badgeY - pillH / 2,
+      width: BADGE_TAIL_LEN + badgePillW,
+      height: pillH,
+    }),
+    [badgePillW, badgeX, badgeY, pillH],
+  );
+  const asBadgeTextWrap = useMemo(() => ({ opacity: 1 }), []);
 
   const baseY = layout.height - pad.bottom;
-
   const gesture = useMemo(
-    () => Gesture.Simultaneous(scrubGesture),
-    [scrubGesture],
+    () =>
+      Gesture.Simultaneous(
+        scrubGesture,
+        Gesture.Pinch()
+          .enabled(pinchToZoom)
+          .onUpdate((e) => {
+            'worklet';
+            const next = clamp(
+              resolvedWin / Math.max(0.5, Math.min(2.5, e.scale)),
+              5,
+              resolvedWin * 6,
+            );
+            runOnJS(setPinchWindow)(next);
+          })
+          .onEnd(() => {
+            'worklet';
+            runOnJS(setPinchWindow)(null);
+          }),
+      ),
+    [pinchToZoom, resolvedWin, scrubGesture],
   );
 
-  /* ================================================================ */
-  /*  RENDER                                                           */
-  /* ================================================================ */
+  const windowControls = useMemo(
+    () => buildWindowControls(windows, resolvedWin, pinchWindow, onWindowChange),
+    [onWindowChange, pinchWindow, resolvedWin, windows],
+  );
 
   return (
     <View style={[styles.root, { height }, style]}>
+      {windowControls.length > 0 ? (
+        <ChartControlRow
+          options={windowControls}
+          theme={theme as LiveLineTheme}
+          styleVariant={ws}
+          marginLeft={pad.left}
+        />
+      ) : null}
       <GestureDetector gesture={gesture}>
         <View style={[styles.shell, { backgroundColor: primaryPal.surface }]}>
           <View
@@ -377,7 +479,6 @@ export function NativeStaticMultiSeriesChart({
             ) : (
               <>
                 <Canvas style={StyleSheet.absoluteFill}>
-                  {/* Grid */}
                   <GridCanvas
                     grid={grid}
                     gridLabels={trackedGridLabels}
@@ -389,37 +490,43 @@ export function NativeStaticMultiSeriesChart({
                     pal={primaryPal}
                   />
 
-                  {/* Series lines (all clipped by draw animation) */}
                   <Group clip={dvClipRect}>
                     {seriesPaths.map((path, idx) => {
-                      const s = preparedSeries[idx]!;
+                      const entry = preparedSeries[idx]!;
                       return (
-                        <Group key={s.id} clip={clipRect}>
+                        <Group key={entry.id} clip={clipRect}>
                           {lineTrailGlow ? (
                             <Path
                               path={path}
                               style="stroke"
-                              strokeWidth={s.palette.lineWidth + 4}
+                              strokeWidth={entry.palette.lineWidth + 4}
                               strokeJoin="round"
                               strokeCap="round"
-                              color={s.palette.accentGlow}
+                              color={entry.palette.accentGlow}
                               opacity={0.5}
                             />
                           ) : null}
                           <Path
                             path={path}
                             style="stroke"
-                            strokeWidth={s.palette.lineWidth}
+                            strokeWidth={entry.palette.lineWidth}
                             strokeJoin="round"
                             strokeCap="round"
-                            color={s.palette.accent}
-                          />
+                            color={gradientLineColoring ? undefined : entry.palette.accent}
+                          >
+                            {gradientLineColoring ? (
+                              <LinearGradient
+                                start={vec(0, pad.top)}
+                                end={vec(layout.width - pad.right, layout.height)}
+                                colors={[entry.palette.gridLabel, entry.palette.accent]}
+                              />
+                            ) : null}
+                          </Path>
                         </Group>
                       );
                     })}
                   </Group>
 
-                  {/* Reference line */}
                   {referenceLine ? (
                     <ReferenceLineCanvas
                       label={referenceLine.label}
@@ -432,44 +539,19 @@ export function NativeStaticMultiSeriesChart({
                     />
                   ) : null}
 
-                  {/* Drawing dot (primary series) */}
                   <Group opacity={dvDrawDotOp}>
-                    <Circle
-                      cx={dvDrawDotX}
-                      cy={dvDrawDotY}
-                      r={10}
-                      color={primaryPal.accentGlow}
-                      opacity={0.5}
-                    />
-                    <Circle
-                      cx={dvDrawDotX}
-                      cy={dvDrawDotY}
-                      r={4}
-                      color={primaryPal.accent}
-                    />
+                    <Circle cx={dvDrawDotX} cy={dvDrawDotY} r={10} color={primaryPal.accentGlow} opacity={0.5} />
+                    <Circle cx={dvDrawDotX} cy={dvDrawDotY} r={4} color={primaryPal.accent} />
                   </Group>
 
-                  {/* End dots (one per series, after draw completes) */}
                   <Group opacity={dvEndDotOp}>
                     {endDots.map((dot, idx) => (
-                      <Circle
-                        key={preparedSeries[idx]!.id}
-                        cx={dot.x}
-                        cy={dot.y}
-                        r={4}
-                        color={dot.color}
-                      />
+                      <Circle key={preparedSeries[idx]!.id} cx={dot.x} cy={dot.y} r={4} color={dot.color} />
                     ))}
                   </Group>
 
-                  {/* Left-edge fade */}
                   <Group blendMode="dstOut">
-                    <Rect
-                      x={0}
-                      y={0}
-                      width={pad.left + FADE_EDGE_WIDTH}
-                      height={layout.height}
-                    >
+                    <Rect x={0} y={0} width={pad.left + FADE_EDGE_WIDTH} height={layout.height}>
                       <LinearGradient
                         start={vec(pad.left, 0)}
                         end={vec(pad.left + FADE_EDGE_WIDTH, 0)}
@@ -478,34 +560,43 @@ export function NativeStaticMultiSeriesChart({
                     </Rect>
                   </Group>
 
-                  {/* Crosshair */}
                   <CrosshairCanvas
                     lineP1={dvCrossP1}
                     lineP2={dvCrossP2}
                     lineOpacity={dvCrossLineOp}
                     dotX={dvHoverX}
                     dotY={dvHoverY}
-                    dotRadius={dvCrossDotR}
-                    dotOpacity={dvCrossDotOp}
+                    dotRadius={0}
+                    dotOpacity={0}
                     lineColor={primaryPal.crosshair}
                     dotColor={primaryPal.accent}
                   />
+                  {multiScrubInfo
+                    ? multiScrubInfo.values.map((entry) => (
+                      <Circle
+                        key={`scrub-${entry.id}`}
+                        cx={multiScrubInfo.x}
+                        cy={entry.y}
+                        r={4}
+                        color={entry.color}
+                      />
+                    ))
+                    : null}
                 </Canvas>
 
-                {/* Scrub tooltip */}
-                <ScrubTooltip
-                  layout={scrub && scrubTipLayout ? scrubTipLayout : null}
-                  top={pad.top + tooltipY + 10}
-                  opacity={svScrubOp}
-                  tooltipOutline={tooltipOutline}
-                  skiaScrubFlow={false}
-                  scrubTipFont={null as any}
-                  scrubValue={dvScrubValueStr}
-                  pal={primaryPal}
-                  textStyle={styles.scrubTipText}
-                />
+                {multiScrubInfo ? (
+                  <View pointerEvents="none" style={[styles.tooltip, { top: pad.top + tooltipY + 10 }]}>
+                    <Text style={[styles.tooltipText, { color: primaryPal.tooltipText }]}>
+                      {formatTime(multiScrubInfo.time)}
+                    </Text>
+                    {multiScrubInfo.values.map((entry) => (
+                      <Text key={entry.id} style={[styles.tooltipText, { color: entry.color }]}>
+                        {`${entry.label}: ${formatValue(entry.value)}`}
+                      </Text>
+                    ))}
+                  </View>
+                ) : null}
 
-                {/* Axis labels */}
                 <AxisLabels
                   grid={grid}
                   gridLabels={trackedGridLabels}
@@ -517,7 +608,6 @@ export function NativeStaticMultiSeriesChart({
                   styles={{ yLabel: styles.yLabel, tLabel: styles.tLabel }}
                 />
 
-                {/* Reference line label */}
                 {referenceLine?.label ? (
                   <ReferenceLineLabel
                     label={referenceLine.label}
@@ -530,6 +620,44 @@ export function NativeStaticMultiSeriesChart({
                     textStyle={styles.referenceLabel}
                   />
                 ) : null}
+
+                {preparedSeries.map((entry, index) =>
+                  endDots[index] ? (
+                    <View
+                      key={`label-${entry.id}`}
+                      pointerEvents="none"
+                      style={{
+                        position: 'absolute',
+                        left: endDots[index]!.x + 8,
+                        top: endDots[index]!.y - 7,
+                      }}
+                    >
+                      <Text style={[styles.seriesLabel, { color: entry.palette.accent }]}>
+                        {entry.label ?? entry.id}
+                      </Text>
+                    </View>
+                  ) : null,
+                )}
+
+                <BadgeOverlay
+                  badge={badge}
+                  empty={empty}
+                  variant={badgeVariant}
+                  skiaBadgeFlow={false}
+                  badgeNumFont={null}
+                  badgeValue={svBadgeValue}
+                  flowPillW={flowPillW}
+                  badgeStr={badgeStr}
+                  badgeStyle={asBadge}
+                  badgeTextWrapStyle={asBadgeTextWrap}
+                  backgroundPath={badgeBgPath}
+                  innerPath={badgeInnerPath}
+                  innerColor={primary?.palette.accent ?? primaryPal.accent}
+                  pillH={pillH}
+                  onBadgeTemplateLayout={onBadgeTemplateLayout}
+                  pal={primaryPal}
+                  badgeTextStyle={styles.badgeTxt}
+                />
               </>
             )}
           </View>
@@ -539,20 +667,33 @@ export function NativeStaticMultiSeriesChart({
   );
 }
 
-/* ================================================================== */
-/*  Styles                                                             */
-/* ================================================================== */
-
 const styles = StyleSheet.create({
   root: { gap: 6 },
   shell: { flex: 1, borderRadius: 12, padding: 0 },
   plot: { flex: 1, borderRadius: 12, overflow: 'hidden' },
-  scrubTipText: {
-    fontFamily: mono,
-    fontSize: 13,
-    fontWeight: '400',
-  },
+  badgeTxt: { fontFamily: mono, fontSize: 12, fontWeight: '600', letterSpacing: 0.15 },
   referenceLabel: { fontFamily: mono, fontSize: 11, fontWeight: '500' },
+  tooltip: {
+    position: 'absolute',
+    left: 12,
+    gap: 2,
+  },
+  tooltipText: {
+    fontFamily: mono,
+    fontSize: 12,
+    fontWeight: '500',
+  },
   yLabel: { position: 'absolute', fontSize: 11, fontWeight: '400', fontFamily: mono },
-  tLabel: { position: 'absolute', fontSize: 11, fontWeight: '400', fontFamily: mono, textAlign: 'center' },
+  tLabel: {
+    position: 'absolute',
+    fontSize: 11,
+    fontWeight: '400',
+    fontFamily: mono,
+    textAlign: 'center',
+  },
+  seriesLabel: {
+    fontFamily: mono,
+    fontSize: 10,
+    fontWeight: '600',
+  },
 });
