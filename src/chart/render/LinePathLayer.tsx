@@ -29,12 +29,15 @@ type LinePathLayerProps = {
   gradientLineColoring: boolean;
   gradientStartColor: string;
   gradientEndColor: string;
+  rangeTranslateX: SharedValue<number>;
   rangeScaleY: SharedValue<number>;
   rangeTranslateY: SharedValue<number>;
   tipPath?: SharedValue<string>;
 };
 
-type RangeTransform = Array<{ translateY: number } | { scaleY: number }>;
+type RangeTransform = Array<
+  { translateX: number } | { translateY: number } | { scaleY: number }
+>;
 
 function LinePathLayerImpl({
   clipRect,
@@ -54,24 +57,27 @@ function LinePathLayerImpl({
   gradientLineColoring,
   gradientStartColor,
   gradientEndColor,
+  rangeTranslateX,
   rangeScaleY,
   rangeTranslateY,
   tipPath,
 }: LinePathLayerProps) {
   const rangeTransform = useSharedValue<RangeTransform>([
+    { translateX: 0 },
     { translateY: 0 },
     { scaleY: 1 },
   ]);
 
   useAnimatedReaction(
     () => ({
+      translateX: rangeTranslateX.value,
       translateY: rangeTranslateY.value,
       scaleY: rangeScaleY.value,
     }),
-    ({ translateY, scaleY }) => {
-      rangeTransform.value = [{ translateY }, { scaleY }];
+    ({ translateX, translateY, scaleY }) => {
+      rangeTransform.value = [{ translateX }, { translateY }, { scaleY }];
     },
-    [rangeTranslateY, rangeScaleY],
+    [rangeTranslateX, rangeTranslateY, rangeScaleY],
   );
 
   if (!clipRect) return null;

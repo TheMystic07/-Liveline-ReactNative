@@ -77,16 +77,45 @@ export default function App() {
     if (chart.chartView !== 'multi') return [];
     const d = liveFeed.data;
     if (d.length === 0) return [];
-    const hedge: LiveLinePoint[] = d.map((p) => ({
-      time: p.time,
-      value: p.value * 0.998 - valueDelta * 0.12,
-    }));
-    const hedgeVal = hedge[hedge.length - 1]?.value ?? liveFeed.value;
+
+    const seedOffset = (id: string) => id.split('').reduce((s, c) => s + c.charCodeAt(0), 0);
+
+    const makeSeries = (id: string, label: string, color: string, bias: number, scale: number) => {
+      const offset = seedOffset(id);
+      const base = d[0]?.value ?? 100;
+      const biasOffset = base * bias;
+      const points: LiveLinePoint[] = d.map((point, index) => {
+        const t = point.time;
+        const harmonic =
+          Math.sin(t * 0.73 + offset * 0.11) * 0.52 +
+          Math.cos(t * 0.29 + offset * 0.07) * 0.34 +
+          Math.sin(index * 0.09 + offset * 0.03) * 0.18;
+        return {
+          time: t,
+          value: point.value + biasOffset + harmonic * scale,
+        };
+      });
+      return {
+        id,
+        label,
+        color,
+        data: points,
+        value: points[points.length - 1]?.value ?? base,
+      };
+    };
+
     return [
-      { id: 'primary', label: 'Primary', color: chart.accent, data: d, value: liveFeed.value },
-      { id: 'hedge', label: 'Hedge', color: '#22c55e', data: hedge, value: hedgeVal },
+      {
+        id: 'primary',
+        label: 'Primary',
+        color: chart.accent,
+        data: d,
+        value: liveFeed.value,
+      },
+      makeSeries('hedge', 'Hedge', '#22c55e', -0.02, 0.85),
+      makeSeries('arb', 'Arb', '#f59e0b', 0.015, 1.15),
     ];
-  }, [chart.accent, chart.chartView, liveFeed.data, liveFeed.value, valueDelta]);
+  }, [chart.accent, chart.chartView, liveFeed.data, liveFeed.value]);
 
   const pageBackground = chart.theme === 'dark' ? '#111111' : '#f5f5f5';
   const panelBackground = chart.theme === 'dark' ? 'rgba(255,255,255,0.02)' : 'rgba(0,0,0,0.02)';
@@ -153,7 +182,6 @@ export default function App() {
               </Text>
 
               <LiveLineChart
-                static={chart.staticChart}
                 data={liveFeed.data}
                 value={liveFeed.value}
                 theme={chart.theme}
@@ -231,9 +259,6 @@ export default function App() {
                 </Text>
                 <Text style={[styles.statusText, { color: muted }]}>
                   badge: <Text style={{ color: headline }}>{chart.showBadge ? 'on' : 'off'}</Text>
-                </Text>
-                <Text style={[styles.statusText, { color: muted }]}>
-                  engine: <Text style={{ color: headline }}>{chart.staticChart ? 'static' : 'live'}</Text>
                 </Text>
               </View>
             </View>

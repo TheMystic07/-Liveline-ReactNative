@@ -86,6 +86,7 @@ import {
   LOADING_AMPLITUDE_RATIO,
   LOADING_SCROLL_SPEED,
 } from './draw/loadingShape';
+import { buildPath, buildSplinePath } from './draw/buildLiveLinePath';
 import { decayShake, randomShakeOffset, shakeAmplitude } from './draw/shake';
 import { monotoneSplinePath } from './math/spline';
 
@@ -179,8 +180,11 @@ const FINE_LABEL_HIDE_PX = 40;
 /** Grid label fade speeds. */
 const GRID_LABEL_FADE_IN = 0.18;
 const GRID_LABEL_FADE_OUT = 0.12;
+const LIVE_TAIL_HISTORY_POINTS = 3;
 
-type RangeTransform = Array<{ translateY: number } | { scaleY: number }>;
+type RangeTransform = Array<
+  { translateX: number } | { translateY: number } | { scaleY: number }
+>;
 
 /* ------------------------------------------------------------------ */
 /*  Pure helpers                                                       */
@@ -547,112 +551,65 @@ function calcTimeTicks(
   return out;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Path builder — Fritsch-Carlson monotone cubic spline               */
-/*  Inline worklet-compatible version                                  */
-/* ------------------------------------------------------------------ */
-
-function buildPath(
+function buildAnimatedTailPath(
   pts: readonly LiveLinePoint[],
   tipT: number,
   tipV: number,
-  lo: number,
-  hi: number,
+  buildTipT: number,
+  buildMin: number,
+  buildMax: number,
+  currentMin: number,
+  currentMax: number,
   w: number,
   h: number,
   pad: ChartPadding,
   win: number,
-  buffer: number,
-  floor: boolean,
+  buf: number,
 ) {
+  'worklet';
   if (pts.length === 0 || w <= 0 || h <= 0) return '';
 
-  const cw = w - pad.left - pad.right;
-  const ch = h - pad.top - pad.bottom;
-  const lastDataT = pts[pts.length - 1]!.time;
-  let rightEdge = tipT + win * buffer;
-  let leftEdge = rightEdge - win;
-  // `svTipT` can ease ahead of the last sample toward wall clock; the default window then
-  // slides past all points (`p.time < leftEdge - 2` skips everything) and the path is empty.
-  if (leftEdge > lastDataT - 2) {
-    rightEdge = lastDataT + win * buffer;
-    leftEdge = rightEdge - win;
-  }
-  const span = Math.max(0.0001, hi - lo);
-  const floorY = h - pad.bottom;
+  const ch = Math.max(1, h - pad.top - pad.bottom);
+  const cw = Math.max(1, w - pad.left - pad.right);
+  const buildSpan = Math.max(1e-4, buildMax - buildMin);
+  const currentSpan = Math.max(1e-4, currentMax - currentMin);
+  const rightEdgeBuild = buildTipT + win * buf;
+  const leftEdgeBuild = rightEdgeBuild - win;
+  const rightEdgeCurrent = tipT + win * buf;
+  const leftEdgeCurrent = rightEdgeCurrent - win;
+  const dx = -((tipT - buildTipT) / Math.max(win, 1e-4)) * cw;
+  const scaleY = buildSpan / currentSpan;
+  const translateY =
+    (pad.top + ch) * (1 - scaleY) + ((currentMin - buildMin) / buildSpan) * ch * scaleY;
   const yMin = pad.top;
   const yMax = h - pad.bottom;
-  const cy = (y: number) => Math.max(yMin, Math.min(yMax, y));
+  const clampY = (y: number) => Math.max(yMin, Math.min(yMax, y));
 
-  const f: { x: number; y: number }[] = [];
-  for (let i = 0; i < pts.length; i++) {
-    const p = pts[i];
-    if (p.time < leftEdge - 2) continue;
-    if (p.time > tipT + 1) break;
-    const x = pad.left + ((p.time - leftEdge) / (rightEdge - leftEdge || 1)) * cw;
-    const rawY = pad.top + (1 - (p.value - lo) / span) * ch;
-    f.push({ x, y: cy(rawY) });
+  const screenPoints: Array<{ x: number; y: number }> = [];
+  const tailStart = Math.max(0, pts.length - LIVE_TAIL_HISTORY_POINTS);
+  for (let i = tailStart; i < pts.length; i++) {
+    const point = pts[i]!;
+    const value = i === pts.length - 1 ? tipV : point.value;
+    const x =
+      pad.left + ((point.time - leftEdgeBuild) / (rightEdgeBuild - leftEdgeBuild || 1)) * cw + dx;
+    const yBuild = pad.top + (1 - (value - buildMin) / buildSpan) * ch;
+    const y = clampY(yBuild * scaleY + translateY);
+    screenPoints.push({ x, y });
   }
-  if (f.length === 0) return '';
 
-  // Append live tip
-  const lx = pad.left + ((tipT - leftEdge) / (rightEdge - leftEdge || 1)) * cw;
-  const ly = cy(pad.top + (1 - (tipV - lo) / span) * ch);
-  const last = f[f.length - 1];
-  if (Math.abs(last.x - lx) < 0.5) {
-    f[f.length - 1] = { x: lx, y: ly };
+  if (screenPoints.length === 0) return '';
+
+  const tipX =
+    pad.left + ((tipT - leftEdgeCurrent) / (rightEdgeCurrent - leftEdgeCurrent || 1)) * cw;
+  const tipY = clampY(pad.top + (1 - (tipV - currentMin) / currentSpan) * ch);
+  const last = screenPoints[screenPoints.length - 1]!;
+  if (Math.abs(last.x - tipX) < 0.5) {
+    screenPoints[screenPoints.length - 1] = { x: tipX, y: tipY };
   } else {
-    f.push({ x: lx, y: ly });
+    screenPoints.push({ x: tipX, y: tipY });
   }
 
-  if (f.length < 2) {
-    const cmds = [`M ${f[0].x} ${f[0].y}`, `L ${f[0].x + 0.1} ${f[0].y}`];
-    if (floor) cmds.push(`L ${f[0].x + 0.1} ${floorY}`, `L ${f[0].x} ${floorY}`, 'Z');
-    return cmds.join(' ');
-  }
-
-  // Fritsch-Carlson monotone cubic
-  const n = f.length;
-  const delta: number[] = new Array(n - 1);
-  const hh: number[] = new Array(n - 1);
-  for (let i = 0; i < n - 1; i++) {
-    hh[i] = f[i + 1].x - f[i].x;
-    delta[i] = hh[i] === 0 ? 0 : (f[i + 1].y - f[i].y) / hh[i];
-  }
-  const m: number[] = new Array(n);
-  m[0] = delta[0];
-  m[n - 1] = delta[n - 2];
-  for (let i = 1; i < n - 1; i++) {
-    m[i] = delta[i - 1] * delta[i] <= 0 ? 0 : (delta[i - 1] + delta[i]) / 2;
-  }
-  for (let i = 0; i < n - 1; i++) {
-    if (delta[i] === 0) {
-      m[i] = 0;
-      m[i + 1] = 0;
-    } else {
-      const a = m[i] / delta[i];
-      const b = m[i + 1] / delta[i];
-      const s2 = a * a + b * b;
-      if (s2 > 9) {
-        const s = 3 / Math.sqrt(s2);
-        m[i] = s * a * delta[i];
-        m[i + 1] = s * b * delta[i];
-      }
-    }
-  }
-
-  const cmds: string[] = [`M ${f[0].x} ${f[0].y}`];
-  for (let i = 0; i < n - 1; i++) {
-    const hi2 = hh[i];
-    cmds.push(
-      `C ${f[i].x + hi2 / 3} ${f[i].y + m[i] * hi2 / 3} ${f[i + 1].x - hi2 / 3} ${f[i + 1].y - m[i + 1] * hi2 / 3} ${f[i + 1].x} ${f[i + 1].y}`,
-    );
-  }
-
-  if (floor) {
-    cmds.push(`L ${f[n - 1].x} ${floorY}`, `L ${f[0].x} ${floorY}`, 'Z');
-  }
-  return cmds.join(' ');
+  return buildSplinePath(screenPoints);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1303,9 +1260,14 @@ export function NativeLiveLineChart({
   const svStaticFillPath = useSharedValue('');
   const svStaticMorphLinePath = useSharedValue('');
   /** Skia `transform` must receive `SharedValue`, not `DerivedValue` — keep scalars here. */
+  const svAnimTranslateX = useSharedValue(0);
   const svAnimRangeScaleY = useSharedValue(1);
   const svAnimRangeTranslateY = useSharedValue(0);
+  const svIdentityTranslateX = useSharedValue(0);
+  const svIdentityRangeScaleY = useSharedValue(1);
+  const svIdentityRangeTranslateY = useSharedValue(0);
   const svFillRangeTransform = useSharedValue<RangeTransform>([
+    { translateX: 0 },
     { translateY: 0 },
     { scaleY: 1 },
   ]);
@@ -1313,15 +1275,9 @@ export function NativeLiveLineChart({
   const svBuildMax = useSharedValue(1);
   const svBuildTipT = useSharedValue(0);
   /** Last committed data point — worklet must not read `effectiveData` / `morphLineData` arrays (host crash). */
-  const svLastLineDataT = useSharedValue(0);
-  const svLastLineDataV = useSharedValue(0);
-  const svLastMorphDataT = useSharedValue(0);
-  const svLastMorphDataV = useSharedValue(0);
-  const svLineDataCount = useSharedValue(0);
-  const svMorphDataCount = useSharedValue(0);
   const liveCandleBucketRef = useRef<number | null>(null);
 
-  /** Full point arrays stored in SharedValues so worklets can read them without host-array deps. */
+  /** Full point arrays stored in SharedValues so worklets can build live tail paths on the UI thread. */
   const svEffectiveDataArr = useSharedValue<LiveLinePoint[]>([]);
   const svMorphLineDataArr = useSharedValue<LiveLinePoint[]>([]);
   const svCandleVisibleArr = useSharedValue<CandlePoint[]>([]);
@@ -1330,13 +1286,14 @@ export function NativeLiveLineChart({
   const [lineMorphJs, setLineMorphJs] = useState(0);
   useAnimatedReaction(
     () => ({
+      translateX: svAnimTranslateX.value,
       translateY: svAnimRangeTranslateY.value,
       scaleY: svAnimRangeScaleY.value,
     }),
-    ({ translateY, scaleY }) => {
-      svFillRangeTransform.value = [{ translateY }, { scaleY }];
+    ({ translateX, translateY, scaleY }) => {
+      svFillRangeTransform.value = [{ translateX }, { translateY }, { scaleY }];
     },
-    [svAnimRangeTranslateY, svAnimRangeScaleY],
+    [svAnimTranslateX, svAnimRangeTranslateY, svAnimRangeScaleY],
   );
 
   useAnimatedReaction(
@@ -1717,6 +1674,15 @@ export function NativeLiveLineChart({
         svTipT.value = tipT;
       }
 
+      /* ---- Horizontal scroll transform (static path follows tip time) ---- */
+      {
+        const buildTipT = svBuildTipT.value;
+        const currentTipT = svTipT.value;
+        const dx =
+          -((currentTipT - buildTipT) / Math.max(win, 1e-4)) * Math.max(1, chartW);
+        svAnimTranslateX.value = dx;
+      }
+
       /* ---- Window transition (log-space cosine easing) ---- */
       if (svWinTransActive.value === 1) {
         // Accumulate progress using dt (frame-rate independent)
@@ -1751,23 +1717,6 @@ export function NativeLiveLineChart({
       let nextDisp = lerpFr(disp, tgt, spd, engineDt);
       if (Math.abs(nextDisp - tgt) < prevR * VALUE_SNAP_THRESHOLD) nextDisp = tgt;
       svTipV.value = nextDisp;
-
-      /* ---- Range transform (static path follows range animation) ---- */
-      {
-        const bMin = svBuildMin.value;
-        const bMax = svBuildMax.value;
-        const cMin = svMin.value;
-        const cMax = svMax.value;
-        const buildSpan = Math.max(1e-4, bMax - bMin);
-        const curSpan = Math.max(1e-4, cMax - cMin);
-        const scaleY = buildSpan / curSpan;
-        const h = svChartH.value;
-        const ch = Math.max(1, h - padTopForEngine - padBottomForEngine);
-        const translateY =
-          (padTopForEngine + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
-        svAnimRangeScaleY.value = scaleY;
-        svAnimRangeTranslateY.value = translateY;
-      }
 
       /* ---- Live candle OHLC smoothing (upstream `CANDLE_LERP_SPEED`) ---- */
       if (svIsCandleFlag.value === 1) {
@@ -1806,6 +1755,19 @@ export function NativeLiveLineChart({
       if (Math.abs(nextMax - tmax) < pxTh) nextMax = tmax;
       svMin.value = nextMin;
       svMax.value = nextMax;
+
+      /* ---- Range transform (static path follows range animation) ---- */
+      {
+        const bMin = svBuildMin.value;
+        const bMax = svBuildMax.value;
+        const buildSpan = Math.max(1e-4, bMax - bMin);
+        const curSpan = Math.max(1e-4, nextMax - nextMin);
+        const scaleY = buildSpan / curSpan;
+        const translateY =
+          (padTopForEngine + ch) * (1 - scaleY) + ((nextMin - bMin) / buildSpan) * ch * scaleY;
+        svAnimRangeScaleY.value = scaleY;
+        svAnimRangeTranslateY.value = translateY;
+      }
 
       /* ---- Badge Y lerp (upstream BADGE_Y_LERP = 0.35) ---- */
       if (svBadgeOn.value === 1) {
@@ -1942,11 +1904,15 @@ export function NativeLiveLineChart({
       padBottomForEngine,
       svBuildMin,
       svBuildMax,
+      svBuildTipT,
+      svAnimTranslateX,
       svAnimRangeScaleY,
       svAnimRangeTranslateY,
       svMin,
       svMax,
       svChartH,
+      chartW,
+      win,
     ],
   );
 
@@ -1969,31 +1935,13 @@ export function NativeLiveLineChart({
       tipV: svTipV.value,
       morphTipV: svMorphTipV.value,
     });
-  }, [effectiveData, morphLineData, svMin, svMax, svTipT, svTipV, svMorphTipV]);
+  }, [effectiveData, morphLineData, win, buf, svMin, svMax, svTipT, svTipV, svMorphTipV]);
 
   useEffect(() => {
     svBuildMin.value = buildSnapshot.range.min;
     svBuildMax.value = buildSnapshot.range.max;
     svBuildTipT.value = buildSnapshot.tipT;
   }, [buildSnapshot, svBuildMin, svBuildMax, svBuildTipT]);
-
-  useEffect(() => {
-    svLineDataCount.value = effectiveData.length;
-    if (effectiveData.length > 0) {
-      const l = effectiveData[effectiveData.length - 1]!;
-      svLastLineDataT.value = l.time;
-      svLastLineDataV.value = l.value;
-    }
-  }, [effectiveData, svLastLineDataT, svLastLineDataV, svLineDataCount]);
-
-  useEffect(() => {
-    svMorphDataCount.value = morphLineData.length;
-    if (morphLineData.length > 0) {
-      const l = morphLineData[morphLineData.length - 1]!;
-      svLastMorphDataT.value = l.time;
-      svLastMorphDataV.value = l.value;
-    }
-  }, [morphLineData, svLastMorphDataT, svLastMorphDataV, svMorphDataCount]);
 
   useEffect(() => {
     svEffectiveDataArr.value = effectiveData;
@@ -2075,7 +2023,7 @@ export function NativeLiveLineChart({
   /* ================================================================ */
 
   const clipRect = chartW > 0 && chartH > 0
-    ? rect(pad.left, pad.top, chartW, chartH)
+    ? rect(pad.left - 1, pad.top, chartW + 2, chartH)
     : undefined;
 
   const staticLinePath = useMemo(
@@ -2092,6 +2040,8 @@ export function NativeLiveLineChart({
         win,
         buf,
         false,
+        false,
+        LIVE_TAIL_HISTORY_POINTS,
       ),
     [effectiveData, buildSnapshot, layout.width, layout.height, pad, win, buf],
   );
@@ -2114,6 +2064,8 @@ export function NativeLiveLineChart({
         win,
         buf,
         false,
+        false,
+        LIVE_TAIL_HISTORY_POINTS,
       ),
     [morphLineData, buildSnapshot, layout.width, layout.height, pad, win, buf],
   );
@@ -2151,43 +2103,21 @@ export function NativeLiveLineChart({
   const tipLayW = layout.width;
   const tipLayH = layout.height;
 
-  const svTipLinePath = useDerivedValue(() => {
+  const svAnimatedLinePath = useDerivedValue(() => {
     'worklet';
-    if (svLineDataCount.value < 1 || tipLayW <= 0 || tipLayH <= 0) return '';
-
-    const lastT = svLastLineDataT.value;
-    const lastV = svLastLineDataV.value;
-    const w = tipLayW;
-    const h = tipLayH;
-
-    const bMin = svBuildMin.value;
-    const bMax = svBuildMax.value;
-    const buildSpan = Math.max(1e-4, bMax - bMin);
-    const cMin = svMin.value;
-    const cMax = svMax.value;
-    const curSpan = Math.max(1e-4, cMax - cMin);
-
-    const ch = Math.max(1, h - tipPadT - tipPadB);
-    const cw = Math.max(1, w - tipPadL - tipPadR);
-
-    const rightEdgeBuild = svBuildTipT.value + win * buf;
-    const leftEdgeBuild = rightEdgeBuild - win;
-    const x0 =
-      tipPadL + ((lastT - leftEdgeBuild) / (rightEdgeBuild - leftEdgeBuild || 1)) * cw;
-    const y0Build = tipPadT + (1 - (lastV - bMin) / buildSpan) * ch;
-
-    const scaleY = buildSpan / curSpan;
-    const translateY =
-      (tipPadT + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
-    const y0 = y0Build * scaleY + translateY;
-
-    const rightEdgeCur = svTipT.value + win * buf;
-    const leftEdgeCur = rightEdgeCur - win;
-    const x1 =
-      tipPadL + ((svTipT.value - leftEdgeCur) / (rightEdgeCur - leftEdgeCur || 1)) * cw;
-    const y1 = tipPadT + (1 - (svTipV.value - cMin) / curSpan) * ch;
-
-    return `M ${x0} ${y0} L ${x1} ${y1}`;
+    return buildPath(
+      svEffectiveDataArr.value,
+      svTipT.value,
+      svTipV.value,
+      svMin.value,
+      svMax.value,
+      tipLayW,
+      tipLayH,
+      { left: tipPadL, right: tipPadR, top: tipPadT, bottom: tipPadB },
+      win,
+      buf,
+      false,
+    );
   }, [
     tipLayW,
     tipLayH,
@@ -2197,9 +2127,102 @@ export function NativeLiveLineChart({
     tipPadB,
     win,
     buf,
-    svLineDataCount,
-    svLastLineDataT,
-    svLastLineDataV,
+    svEffectiveDataArr,
+    svMin,
+    svMax,
+    svTipT,
+    svTipV,
+  ]);
+
+  const svAnimatedMorphLinePath = useDerivedValue(() => {
+    'worklet';
+    return buildPath(
+      svMorphLineDataArr.value,
+      svTipT.value,
+      svMorphTipV.value,
+      svMin.value,
+      svMax.value,
+      tipLayW,
+      tipLayH,
+      { left: tipPadL, right: tipPadR, top: tipPadT, bottom: tipPadB },
+      win,
+      buf,
+      false,
+    );
+  }, [
+    tipLayW,
+    tipLayH,
+    tipPadL,
+    tipPadR,
+    tipPadT,
+    tipPadB,
+    win,
+    buf,
+    svMorphLineDataArr,
+    svMin,
+    svMax,
+    svTipT,
+    svMorphTipV,
+  ]);
+
+  const svAnimatedFillPath = useDerivedValue(() => {
+    'worklet';
+    return buildPath(
+      svEffectiveDataArr.value,
+      svTipT.value,
+      svTipV.value,
+      svMin.value,
+      svMax.value,
+      tipLayW,
+      tipLayH,
+      { left: tipPadL, right: tipPadR, top: tipPadT, bottom: tipPadB },
+      win,
+      buf,
+      true,
+    );
+  }, [
+    tipLayW,
+    tipLayH,
+    tipPadL,
+    tipPadR,
+    tipPadT,
+    tipPadB,
+    win,
+    buf,
+    svEffectiveDataArr,
+    svMin,
+    svMax,
+    svTipT,
+    svTipV,
+  ]);
+
+  const svTipLinePath = useDerivedValue(() => {
+    'worklet';
+    return buildAnimatedTailPath(
+      svEffectiveDataArr.value,
+      svTipT.value,
+      svTipV.value,
+      svBuildTipT.value,
+      svBuildMin.value,
+      svBuildMax.value,
+      svMin.value,
+      svMax.value,
+      tipLayW,
+      tipLayH,
+      { left: tipPadL, right: tipPadR, top: tipPadT, bottom: tipPadB },
+      win,
+      buf,
+    );
+  }, [
+    tipLayW,
+    tipLayH,
+    tipPadL,
+    tipPadR,
+    tipPadT,
+    tipPadB,
+    win,
+    buf,
+    svEffectiveDataArr,
     svBuildMin,
     svBuildMax,
     svBuildTipT,
@@ -2211,41 +2234,21 @@ export function NativeLiveLineChart({
 
   const svTipMorphLinePath = useDerivedValue(() => {
     'worklet';
-    if (svMorphDataCount.value < 1 || tipLayW <= 0 || tipLayH <= 0) return '';
-
-    const lastT = svLastMorphDataT.value;
-    const lastV = svLastMorphDataV.value;
-    const w = tipLayW;
-    const h = tipLayH;
-
-    const bMin = svBuildMin.value;
-    const bMax = svBuildMax.value;
-    const buildSpan = Math.max(1e-4, bMax - bMin);
-    const cMin = svMin.value;
-    const cMax = svMax.value;
-    const curSpan = Math.max(1e-4, cMax - cMin);
-
-    const ch = Math.max(1, h - tipPadT - tipPadB);
-    const cw = Math.max(1, w - tipPadL - tipPadR);
-
-    const rightEdgeBuild = svBuildTipT.value + win * buf;
-    const leftEdgeBuild = rightEdgeBuild - win;
-    const x0 =
-      tipPadL + ((lastT - leftEdgeBuild) / (rightEdgeBuild - leftEdgeBuild || 1)) * cw;
-    const y0Build = tipPadT + (1 - (lastV - bMin) / buildSpan) * ch;
-
-    const scaleY = buildSpan / curSpan;
-    const translateY =
-      (tipPadT + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
-    const y0 = y0Build * scaleY + translateY;
-
-    const rightEdgeCur = svTipT.value + win * buf;
-    const leftEdgeCur = rightEdgeCur - win;
-    const x1 =
-      tipPadL + ((svTipT.value - leftEdgeCur) / (rightEdgeCur - leftEdgeCur || 1)) * cw;
-    const y1 = tipPadT + (1 - (svMorphTipV.value - cMin) / curSpan) * ch;
-
-    return `M ${x0} ${y0} L ${x1} ${y1}`;
+    return buildAnimatedTailPath(
+      svMorphLineDataArr.value,
+      svTipT.value,
+      svMorphTipV.value,
+      svBuildTipT.value,
+      svBuildMin.value,
+      svBuildMax.value,
+      svMin.value,
+      svMax.value,
+      tipLayW,
+      tipLayH,
+      { left: tipPadL, right: tipPadR, top: tipPadT, bottom: tipPadB },
+      win,
+      buf,
+    );
   }, [
     tipLayW,
     tipLayH,
@@ -2255,9 +2258,7 @@ export function NativeLiveLineChart({
     tipPadB,
     win,
     buf,
-    svMorphDataCount,
-    svLastMorphDataT,
-    svLastMorphDataV,
+    svMorphLineDataArr,
     svBuildMin,
     svBuildMax,
     svBuildTipT,
@@ -3083,25 +3084,23 @@ export function NativeLiveLineChart({
                       {/* -- Fill gradient (scrub splits like upstream drawLine) — reveal-gated -- */}
                       {fill && clipRect ? (
                         <Group clip={clipRect} opacity={dvRevealLineOp}>
-                          <Group transform={svFillRangeTransform}>
-                            <Group clip={dvClipL}>
-                              <Path path={svStaticFillPath}>
-                                <LinearGradient
-                                  start={vec(0, pad.top)}
-                                  end={vec(0, layout.height - pad.bottom)}
-                                  colors={[pal.accentFillTop, pal.accentFillBottom]}
-                                />
-                              </Path>
-                            </Group>
-                            <Group clip={dvClipR} opacity={dvRightSegOp}>
-                              <Path path={svStaticFillPath}>
-                                <LinearGradient
-                                  start={vec(0, pad.top)}
-                                  end={vec(0, layout.height - pad.bottom)}
-                                  colors={[pal.accentFillTop, pal.accentFillBottom]}
-                                />
-                              </Path>
-                            </Group>
+                          <Group clip={dvClipL}>
+                            <Path path={svAnimatedFillPath}>
+                              <LinearGradient
+                                start={vec(0, pad.top)}
+                                end={vec(0, layout.height - pad.bottom)}
+                                colors={[pal.accentFillTop, pal.accentFillBottom]}
+                              />
+                            </Path>
+                          </Group>
+                          <Group clip={dvClipR} opacity={dvRightSegOp}>
+                            <Path path={svAnimatedFillPath}>
+                              <LinearGradient
+                                start={vec(0, pad.top)}
+                                end={vec(0, layout.height - pad.bottom)}
+                                colors={[pal.accentFillTop, pal.accentFillBottom]}
+                              />
+                            </Path>
                           </Group>
                         </Group>
                       ) : null}
@@ -3112,7 +3111,7 @@ export function NativeLiveLineChart({
                         rightClip={dvClipR}
                         rightOpacity={dvRightSegOp}
                         revealOpacity={dvRevealLineOp}
-                        path={svStaticLinePath}
+                        path={svAnimatedLinePath}
                         layoutHeight={layout.height}
                         padTop={pad.top}
                         padRight={pad.right}
@@ -3124,9 +3123,9 @@ export function NativeLiveLineChart({
                         gradientLineColoring={gradientLineColoring}
                         gradientStartColor={pal.gridLabel}
                         gradientEndColor={pal.accent}
-                        rangeScaleY={svAnimRangeScaleY}
-                        rangeTranslateY={svAnimRangeTranslateY}
-                        tipPath={svTipLinePath}
+                        rangeTranslateX={svIdentityTranslateX}
+                        rangeScaleY={svIdentityRangeScaleY}
+                        rangeTranslateY={svIdentityRangeTranslateY}
                       />
                     </>
                   ) : null}
@@ -3206,7 +3205,7 @@ export function NativeLiveLineChart({
                           rightClip={dvClipR}
                           rightOpacity={dvRightSegOp}
                           revealOpacity={1}
-                          path={svStaticMorphLinePath}
+                          path={svAnimatedMorphLinePath}
                           layoutHeight={layout.height}
                           padTop={pad.top}
                           padRight={pad.right}
@@ -3218,9 +3217,9 @@ export function NativeLiveLineChart({
                           gradientLineColoring={gradientLineColoring}
                           gradientStartColor={pal.gridLabel}
                           gradientEndColor={pal.accent}
-                          rangeScaleY={svAnimRangeScaleY}
-                          rangeTranslateY={svAnimRangeTranslateY}
-                          tipPath={svTipMorphLinePath}
+                          rangeTranslateX={svIdentityTranslateX}
+                          rangeScaleY={svIdentityRangeScaleY}
+                          rangeTranslateY={svIdentityRangeTranslateY}
                         />
                       </Group>
                     </>

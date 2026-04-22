@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import {
   Canvas,
@@ -6,42 +6,25 @@ import {
   DashPathEffect,
   Group,
   Line as SkiaLine,
+  LinearGradient,
   Path,
+  Rect,
   rect,
   vec,
 } from '@shopify/react-native-skia';
-import { useSkiaFont } from 'number-flow-react-native/skia';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
-import Animated, {
-  Easing,
-  runOnJS,
-  useAnimatedReaction,
-  useAnimatedStyle,
-  useDerivedValue,
-  useSharedValue,
-  withTiming,
-} from 'react-native-reanimated';
-import type { SharedValue } from 'react-native-reanimated';
+import { runOnJS } from 'react-native-reanimated';
 
-import { BADGE_NUMBER_FLOW_FONT_SRC } from './BadgeSkiaNumberFlow';
-import { supportsTwoDecimalNumberFlow } from './chartNumberFlow';
-import {
-  BADGE_LINE_H,
-  BADGE_PAD_Y,
-  BADGE_TAIL_LEN,
-  BADGE_TAIL_SPREAD,
-  badgeSvgPath,
-} from './draw/badge';
-import { parseColorRgb, resolvePalette } from './theme';
+import { buildPath } from './draw/buildLiveLinePath';
+import { lerp as lerpFr } from './math/lerp';
+import { resolvePalette } from './theme';
 import { GridCanvas } from './render/GridCanvas';
 import { AxisLabels } from './render/AxisLabels';
 import { CrosshairCanvas } from './render/CrosshairCanvas';
 import { EmptyState } from './render/EmptyState';
 import { ReferenceLineCanvas } from './render/ReferenceLineCanvas';
 import { ReferenceLineLabel } from './render/ReferenceLineLabel';
-import { BadgeOverlay } from './render/BadgeOverlay';
-import type { LiveLineChartProps, LiveLinePoint, LiveLineSeries } from './types';
-import { useChartSmoothingEngine } from './smoothingEngine';
+import type { LiveLineChartProps, LiveLinePoint } from './types';
 import {
   calcGridTicksJs,
   calcTimeTicksJs,
@@ -53,110 +36,49 @@ import {
   toScreenXJs,
   toScreenYJs,
 } from './nativeChartUtils';
-import { monotoneSplinePath } from './math/spline';
 
 const MULTI_WIN_BUF = 0.015;
+const FADE_EDGE_WIDTH = 40;
+const RANGE_LERP_SPEED = 0.15;
+const RANGE_ADAPTIVE_BOOST = 0.2;
+const ADAPTIVE_SPEED_BOOST = 0.2;
+const VALUE_SNAP_THRESHOLD = 0.001;
+const LIVE_TIP_CLOCK_CATCHUP = 0.42;
+const MAX_DELTA_MS = 50;
 
-type RangeTransform = Array<{ translateY: number } | { scaleY: number }>;
+const mono = Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' });
 
-function SeriesTipPath({
-  svTipT,
-  svMin,
-  svMax,
-  svTipV,
-  color,
-  hasLastPoint,
-  lastTime,
-  lastValue,
-  svBuildMin,
-  svBuildMax,
-  svBuildTipT,
-  layoutWidth,
-  layoutHeight,
-  padLeft,
-  padRight,
-  padTop,
-  padBottom,
-  win,
-}: {
-  svTipT: SharedValue<number>;
-  svMin: SharedValue<number>;
-  svMax: SharedValue<number>;
-  svTipV: SharedValue<number>;
-  color: string;
-  hasLastPoint: boolean;
-  lastTime: number;
-  lastValue: number;
-  svBuildMin: SharedValue<number>;
-  svBuildMax: SharedValue<number>;
-  svBuildTipT: SharedValue<number>;
-  layoutWidth: number;
-  layoutHeight: number;
-  padLeft: number;
-  padRight: number;
-  padTop: number;
-  padBottom: number;
-  win: number;
-}) {
-  const dvPath = useDerivedValue(() => {
-    'worklet';
-    if (!hasLastPoint || layoutWidth <= 0 || layoutHeight <= 0) return '';
-    const bMin = svBuildMin.value;
-    const bMax = svBuildMax.value;
-    const buildSpan = Math.max(1e-4, bMax - bMin);
-    const cMin = svMin.value;
-    const cMax = svMax.value;
-    const curSpan = Math.max(1e-4, cMax - cMin);
-    const ch = Math.max(1, layoutHeight - padTop - padBottom);
-    const cw = Math.max(1, layoutWidth - padLeft - padRight);
+type SmoothFrame = {
+  min: number;
+  max: number;
+  tipT: number;
+  seriesTips: Record<string, number>;
+};
 
-    const rightEdgeBuild = svBuildTipT.value + win * MULTI_WIN_BUF;
-    const leftEdgeBuild = rightEdgeBuild - win;
-    const x0 =
-      padLeft + ((lastTime - leftEdgeBuild) / (rightEdgeBuild - leftEdgeBuild || 1)) * cw;
-    const y0Build = padTop + (1 - (lastValue - bMin) / buildSpan) * ch;
+function buildSeriesTips(
+  series: ReadonlyArray<{ id: string; value: number }>,
+  prev?: Record<string, number>,
+) {
+  const next: Record<string, number> = {};
+  for (const entry of series) {
+    next[entry.id] = prev?.[entry.id] ?? entry.value;
+  }
+  return next;
+}
 
-    const scaleY = buildSpan / curSpan;
-    const translateY =
-      (padTop + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
-    const y0 = y0Build * scaleY + translateY;
-
-    const rightEdgeCur = svTipT.value + win * MULTI_WIN_BUF;
-    const leftEdgeCur = rightEdgeCur - win;
-    const x1 =
-      padLeft + ((svTipT.value - leftEdgeCur) / (rightEdgeCur - leftEdgeCur || 1)) * cw;
-    const y1 = padTop + (1 - (svTipV.value - cMin) / curSpan) * ch;
-
-    return `M ${x0} ${y0} L ${x1} ${y1}`;
-  }, [
-    hasLastPoint,
-    lastTime,
-    lastValue,
-    layoutWidth,
-    layoutHeight,
-    padLeft,
-    padRight,
-    padTop,
-    padBottom,
-    win,
-    svBuildMin,
-    svBuildMax,
-    svBuildTipT,
-    svTipT,
-    svMin,
-    svMax,
-    svTipV,
-  ]);
-  return (
-    <Path
-      path={dvPath}
-      style="stroke"
-      strokeWidth={2}
-      strokeJoin="round"
-      strokeCap="round"
-      color={color}
-    />
-  );
+function buildSeriesPath(
+  points: LiveLinePoint[],
+  tipT: number,
+  tipV: number,
+  lo: number,
+  hi: number,
+  w: number,
+  h: number,
+  pad: { top: number; right: number; bottom: number; left: number },
+  win: number,
+  buffer: number,
+) {
+  return buildPath(points, tipT, tipV, lo, hi, w, h, pad, win, buffer, false);
 }
 
 function computeUnionRange(
@@ -190,19 +112,15 @@ function computeUnionRange(
   return { min: min - margin, max: max + margin };
 }
 
-const BADGE_PILL_BODY_W = 78;
-const mono = Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' });
-
 export function NativeMultiSeriesChart({
   series = [],
   theme = 'dark',
+  color = '#3b82f6',
   window: controlledWin = 30,
   windows,
   onWindowChange,
   referenceLine,
   badge = true,
-  badgeVariant = 'default',
-  badgeNumberFlow = true,
   scrub = true,
   snapToPointScrubbing = false,
   pinchToZoom = false,
@@ -215,24 +133,21 @@ export function NativeMultiSeriesChart({
   contentInset,
   onSeriesToggle,
   seriesToggleCompact = false,
+  lerpSpeed = 0.08,
 }: LiveLineChartProps) {
-  const palette = resolvePalette(series[0]?.color ?? '#3b82f6', theme, undefined);
-  const badgeNumFont = useSkiaFont(BADGE_NUMBER_FLOW_FONT_SRC, 11);
-  const skiaBadgeFlow =
-    !!badgeNumFont &&
-    badge &&
-    badgeNumberFlow !== false &&
-    supportsTwoDecimalNumberFlow(formatValue);
+  const palette = resolvePalette(series[0]?.color ?? color, theme, undefined);
   const [layout, setLayout] = useState({ width: 0, height });
   const [hiddenSeries, setHiddenSeries] = useState<Set<string>>(new Set());
   const [scrubX, setScrubX] = useState<number | null>(null);
   const [pinchWindow, setPinchWindow] = useState<number | null>(null);
+
   const resolvedWin = useMemo(() => {
     if (!windows?.length) return controlledWin;
     if (windows.some((entry) => entry.secs === controlledWin)) return controlledWin;
     return windows[0].secs;
   }, [windows, controlledWin]);
   const activeWindow = pinchWindow ?? resolvedWin;
+
   const pad = useMemo(
     () => ({
       top: contentInset?.top ?? 12,
@@ -250,269 +165,203 @@ export function NativeMultiSeriesChart({
 
   const latestTime = useMemo(
     () =>
-      visibleSeries.reduce((max, entry) => Math.max(max, entry.data[entry.data.length - 1]?.time ?? 0), 0),
+      visibleSeries.reduce(
+        (max, entry) => Math.max(max, entry.data[entry.data.length - 1]?.time ?? 0),
+        0,
+      ),
     [visibleSeries],
   );
-  const rightEdge = latestTime + activeWindow * 0.015;
-  const leftEdge = rightEdge - activeWindow;
+  const dataRightEdge = latestTime + activeWindow * MULTI_WIN_BUF;
+  const dataLeftEdge = dataRightEdge - activeWindow;
 
   const preparedSeries = useMemo(() => {
     return visibleSeries.map((entry) => {
-      const points = entry.data.filter((point) => point.time >= leftEdge - 2 && point.time <= rightEdge + 1);
+      const points = entry.data.filter(
+        (point) => point.time >= dataLeftEdge - 2 && point.time <= dataRightEdge + 1,
+      );
       return { ...entry, points };
     });
-  }, [leftEdge, rightEdge, visibleSeries]);
+  }, [dataLeftEdge, dataRightEdge, visibleSeries]);
 
   const empty = loading || layout.width <= 0 || preparedSeries.every((entry) => entry.points.length < 2);
 
-  const range = useMemo(
+  const targetRange = useMemo(
     () => computeUnionRange(preparedSeries, referenceLine?.value),
     [preparedSeries, referenceLine?.value],
   );
+  const visibleTargets = useMemo(
+    () => visibleSeries.map((entry) => ({ id: entry.id, value: entry.value })),
+    [visibleSeries],
+  );
+  const [display, setDisplay] = useState<SmoothFrame>(() => ({
+    min: targetRange.min,
+    max: targetRange.max,
+    tipT: latestTime,
+    seriesTips: buildSeriesTips(visibleTargets),
+  }));
+  const displayRef = useRef<SmoothFrame>(display);
+
+  useEffect(() => {
+    displayRef.current = display;
+  }, [display]);
+
+  useEffect(() => {
+    const syncBase: SmoothFrame = {
+      min: targetRange.min,
+      max: targetRange.max,
+      tipT: latestTime,
+      seriesTips: buildSeriesTips(visibleTargets, displayRef.current.seriesTips),
+    };
+
+    if (empty) {
+      displayRef.current = syncBase;
+      setDisplay(syncBase);
+      return;
+    }
+
+    displayRef.current = {
+      ...displayRef.current,
+      seriesTips: buildSeriesTips(visibleTargets, displayRef.current.seriesTips),
+    };
+
+    let rafId = 0;
+    let lastFrame = 0;
+
+    const tick = (nowMs: number) => {
+      const prev = displayRef.current;
+      const dt = lastFrame === 0 ? 16.67 : Math.min(MAX_DELTA_MS, nowMs - lastFrame);
+      lastFrame = nowMs;
+
+      const targetT = Math.max(Date.now() / 1000, latestTime);
+      let nextTipT = lerpFr(prev.tipT, targetT, LIVE_TIP_CLOCK_CATCHUP, dt);
+      if (Math.abs(nextTipT - targetT) < 0.002) nextTipT = targetT;
+
+      const currentRange = Math.max(1e-4, prev.max - prev.min);
+      const targetRangeSpan = Math.max(1e-4, targetRange.max - targetRange.min);
+      const rangeGap = Math.abs(currentRange - targetRangeSpan);
+      const rangeSpeed =
+        RANGE_LERP_SPEED + Math.min(rangeGap / currentRange, 1) * RANGE_ADAPTIVE_BOOST;
+      let nextMin = lerpFr(prev.min, targetRange.min, rangeSpeed, dt);
+      let nextMax = lerpFr(prev.max, targetRange.max, rangeSpeed, dt);
+      if (Math.abs(nextMin - targetRange.min) < currentRange * VALUE_SNAP_THRESHOLD) {
+        nextMin = targetRange.min;
+      }
+      if (Math.abs(nextMax - targetRange.max) < currentRange * VALUE_SNAP_THRESHOLD) {
+        nextMax = targetRange.max;
+      }
+
+      const nextRange = Math.max(1e-4, nextMax - nextMin);
+      const nextSeriesTips = buildSeriesTips(visibleTargets, prev.seriesTips);
+      let converged = Math.abs(nextTipT - targetT) < 0.002;
+
+      for (const entry of visibleTargets) {
+        const currentValue = prev.seriesTips[entry.id] ?? entry.value;
+        const gap = Math.abs(entry.value - currentValue);
+        const speed =
+          lerpSpeed + (1 - Math.min(gap / nextRange, 1)) * ADAPTIVE_SPEED_BOOST;
+        let nextValue = lerpFr(currentValue, entry.value, speed, dt);
+        if (Math.abs(nextValue - entry.value) < nextRange * VALUE_SNAP_THRESHOLD) {
+          nextValue = entry.value;
+        }
+        nextSeriesTips[entry.id] = nextValue;
+        if (Math.abs(nextValue - entry.value) >= 1e-4) converged = false;
+      }
+
+      if (Math.abs(nextMin - targetRange.min) >= 1e-4 || Math.abs(nextMax - targetRange.max) >= 1e-4) {
+        converged = false;
+      }
+
+      const nextFrame: SmoothFrame = {
+        min: nextMin,
+        max: nextMax,
+        tipT: nextTipT,
+        seriesTips: nextSeriesTips,
+      };
+
+      displayRef.current = nextFrame;
+      setDisplay(nextFrame);
+
+      if (!converged) {
+        rafId = requestAnimationFrame(tick);
+      }
+    };
+
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [empty, latestTime, lerpSpeed, targetRange.max, targetRange.min, visibleTargets]);
+
+  const displayMin = display.min;
+  const displayMax = display.max;
+  const displayTipT = display.tipT;
+  const rightEdge = displayTipT + activeWindow * MULTI_WIN_BUF;
+  const leftEdge = rightEdge - activeWindow;
 
   const chartWidth = layout.width - pad.left - pad.right;
   const chartHeight = layout.height - pad.top - pad.bottom;
+
   const gridLabels = useMemo(
-    () => calcGridTicksJs(range.min, range.max, chartHeight, layout.height, pad, formatValue),
-    [chartHeight, formatValue, layout.height, pad, range.max, range.min],
+    () => calcGridTicksJs(displayMin, displayMax, chartHeight, layout.height, pad, formatValue),
+    [displayMin, displayMax, chartHeight, layout.height, pad, formatValue],
   );
   const timeLabels = useMemo(
     () => calcTimeTicksJs(leftEdge, rightEdge, layout.width, pad, formatTime),
     [formatTime, layout.width, leftEdge, pad, rightEdge],
   );
 
-  const primarySeries = visibleSeries[0] ?? series[0];
-  const primaryColor = primarySeries?.color ?? palette.accent;
-
+  // Build paths using SMOOTHED range and tip values
   const seriesPaths = useMemo(() => {
     return preparedSeries.map((entry) => {
-      const screenPoints = entry.points.map((point) => ({
-        x: toScreenXJs(point.time, leftEdge, rightEdge, layout.width, pad),
-        y: toScreenYJs(point.value, range.min, range.max, layout.height, pad),
-      }));
-      const livePoint = {
-        x: toScreenXJs(latestTime, leftEdge, rightEdge, layout.width, pad),
-        y: toScreenYJs(entry.value, range.min, range.max, layout.height, pad),
-      };
-      const merged = screenPoints.length > 0 ? [...screenPoints, livePoint] : [livePoint];
+      const smoothedValue = display.seriesTips[entry.id] ?? entry.value;
+      const path = buildSeriesPath(
+        entry.points,
+        displayTipT,
+        smoothedValue,
+        displayMin,
+        displayMax,
+        layout.width,
+        layout.height,
+        pad,
+        activeWindow,
+        MULTI_WIN_BUF,
+      );
+      const liveX = toScreenXJs(displayTipT, leftEdge, rightEdge, layout.width, pad);
+      const liveY = toScreenYJs(smoothedValue, displayMin, displayMax, layout.height, pad);
       return {
         id: entry.id,
         color: entry.color,
         label: entry.label ?? entry.id,
-        path: monotoneSplinePath(merged),
-        livePoint,
+        path,
+        liveX,
+        liveY,
         points: entry.points,
+        smoothedValue,
       };
     });
-  }, [leftEdge, latestTime, layout.height, layout.width, pad, preparedSeries, range.max, range.min, rightEdge]);
-
-  const engine = useChartSmoothingEngine({
-    targetMin: range.min,
-    targetMax: range.max,
-    seriesTargets: visibleSeries.map((e) => ({ id: e.id, value: e.value })),
-    dataTipT: latestTime,
-    enabled: !empty,
-  });
-
-  const [pathBuildSnapshot, setPathBuildSnapshot] = useState({
-    range: { min: 0, max: 1 },
-    tipT: 0,
-    tips: {} as Record<string, number>,
-  });
-
-  useEffect(() => {
-    if (!empty) engine.pulse();
-  }, [series, latestTime, empty, engine]);
-
-  useEffect(() => {
-    if (empty) return;
-    const tips: Record<string, number> = {};
-    for (const v of visibleSeries) {
-      tips[v.id] = engine.getSeriesTipV(v.id).value;
-    }
-    setPathBuildSnapshot({
-      range: { min: engine.svMin.value, max: engine.svMax.value },
-      tipT: engine.svTipT.value,
-      tips,
-    });
-  }, [series, empty, visibleSeries, engine]);
-
-  const svBuildMin = useSharedValue(0);
-  const svBuildMax = useSharedValue(1);
-  const svBuildTipT = useSharedValue(0);
-
-  useEffect(() => {
-    svBuildMin.value = pathBuildSnapshot.range.min;
-    svBuildMax.value = pathBuildSnapshot.range.max;
-    svBuildTipT.value = pathBuildSnapshot.tipT;
-  }, [pathBuildSnapshot, svBuildMin, svBuildMax, svBuildTipT]);
-
-  const staticSeriesPaths = useMemo(() => {
-    const tipT = pathBuildSnapshot.tipT;
-    const bMin = pathBuildSnapshot.range.min;
-    const bMax = pathBuildSnapshot.range.max;
-    const snapRight = tipT + activeWindow * MULTI_WIN_BUF;
-    const snapLeft = snapRight - activeWindow;
-    return preparedSeries.map((entry) => {
-      const screenPoints = entry.points.map((point) => ({
-        x: toScreenXJs(point.time, snapLeft, snapRight, layout.width, pad),
-        y: toScreenYJs(point.value, bMin, bMax, layout.height, pad),
-      }));
-      const tipV = pathBuildSnapshot.tips[entry.id] ?? entry.value;
-      const livePoint = {
-        x: toScreenXJs(tipT, snapLeft, snapRight, layout.width, pad),
-        y: toScreenYJs(tipV, bMin, bMax, layout.height, pad),
-      };
-      const merged = screenPoints.length > 0 ? [...screenPoints, livePoint] : [livePoint];
-      return {
-        id: entry.id,
-        color: entry.color,
-        label: entry.label ?? entry.id,
-        path: monotoneSplinePath(merged),
-        livePoint,
-        points: entry.points,
-      };
-    });
-  }, [activeWindow, layout.height, layout.width, pad, pathBuildSnapshot, preparedSeries]);
-
-  const evMin = engine.svMin;
-  const evMax = engine.svMax;
-  const evTipT = engine.svTipT;
-
-  /** Skia `Group` transform must not use `DerivedValue` — only plain `SharedValue`s. */
-  const svMultiLayH = useSharedValue(0);
-  const svMultiPadTop = useSharedValue(0);
-  const svMultiPadBot = useSharedValue(0);
-  const svMultiRangeScaleY = useSharedValue(1);
-  const svMultiRangeTranslateY = useSharedValue(0);
-  const svMultiRangeTransform = useSharedValue<RangeTransform>([
-    { translateY: 0 },
-    { scaleY: 1 },
+  }, [
+    display.seriesTips,
+    preparedSeries,
+    displayTipT,
+    displayMin,
+    displayMax,
+    layout.width,
+    layout.height,
+    pad,
+    activeWindow,
+    leftEdge,
+    rightEdge,
   ]);
 
-  useEffect(() => {
-    svMultiLayH.value = layout.height;
-    svMultiPadTop.value = pad.top;
-    svMultiPadBot.value = pad.bottom;
-  }, [layout.height, pad.top, pad.bottom, svMultiLayH, svMultiPadTop, svMultiPadBot]);
-
-  useAnimatedReaction(
-    () => {
-      'worklet';
-      const bMin = svBuildMin.value;
-      const bMax = svBuildMax.value;
-      const cMin = evMin.value;
-      const cMax = evMax.value;
-      const buildSpan = Math.max(1e-4, bMax - bMin);
-      const curSpan = Math.max(1e-4, cMax - cMin);
-      const scaleY = buildSpan / curSpan;
-      const h = svMultiLayH.value;
-      const pt = svMultiPadTop.value;
-      const pb = svMultiPadBot.value;
-      const ch = Math.max(1, h - pt - pb);
-      const translateY = (pt + ch) * (1 - scaleY) + ((cMin - bMin) / buildSpan) * ch * scaleY;
-      return `${scaleY}:${translateY}`;
-    },
-    (packed) => {
-      'worklet';
-      if (packed == null) return;
-      const parts = packed.split(':');
-      const sy = Number(parts[0]);
-      const ty = Number(parts[1]);
-      if (!Number.isFinite(sy) || !Number.isFinite(ty)) return;
-      svMultiRangeScaleY.value = sy;
-      svMultiRangeTranslateY.value = ty;
-    },
-    [svBuildMin, svBuildMax, evMin, evMax, svMultiLayH, svMultiPadTop, svMultiPadBot],
-  );
-
-  useAnimatedReaction(
-    () => ({
-      translateY: svMultiRangeTranslateY.value,
-      scaleY: svMultiRangeScaleY.value,
-    }),
-    ({ translateY, scaleY }) => {
-      svMultiRangeTransform.value = [{ translateY }, { scaleY }];
-    },
-    [svMultiRangeTranslateY, svMultiRangeScaleY],
-  );
-
-  const primaryPath = useMemo(() => {
-    if (!primarySeries) return null;
-    return staticSeriesPaths.find((p) => p.id === primarySeries.id) ?? staticSeriesPaths[0] ?? null;
-  }, [primarySeries, staticSeriesPaths]);
-
-  const pillH = BADGE_LINE_H + BADGE_PAD_Y * 2;
-  const badgeBgPath = useMemo(
-    () => badgeSvgPath(BADGE_PILL_BODY_W, pillH, BADGE_TAIL_LEN, BADGE_TAIL_SPREAD),
-    [pillH],
-  );
-  const badgeInnerPath = useMemo(
-    () =>
-      badgeSvgPath(BADGE_PILL_BODY_W - 4, pillH - 4, BADGE_TAIL_LEN - 1, BADGE_TAIL_SPREAD - 0.5),
-    [pillH],
-  );
-  const badgeInnerRgb = useMemo(() => {
-    const [r, g, b] = parseColorRgb(primaryColor);
-    return `rgb(${r},${g},${b})`;
-  }, [primaryColor]);
-
-  const svBadgeLiveX = useSharedValue(0);
-  const svBadgeLiveY = useSharedValue(0);
-  const svBadgeValue = useSharedValue(0);
-  useEffect(() => {
-    if (!primaryPath) return;
-    svBadgeLiveX.value = withTiming(primaryPath.livePoint.x, {
-      duration: 110,
-      easing: Easing.out(Easing.quad),
-    });
-    svBadgeLiveY.value = withTiming(primaryPath.livePoint.y, {
-      duration: 110,
-      easing: Easing.out(Easing.quad),
-    });
-  }, [primaryPath, svBadgeLiveX, svBadgeLiveY]);
-  useEffect(() => {
-    if (!primarySeries) return;
-    svBadgeValue.value = withTiming(primarySeries.value, {
-      duration: 110,
-      easing: Easing.out(Easing.quad),
-    });
-  }, [primarySeries, svBadgeValue]);
-
-  const [badgeStr, setBadgeStr] = useState(() =>
-    primarySeries ? formatValue(primarySeries.value) : '',
-  );
-  useEffect(() => {
-    if (!primarySeries) return;
-    setBadgeStr(formatValue(primarySeries.value));
-  }, [formatValue, primarySeries]);
-
-  const badgeDashY =
-    badge && primarySeries && layout.height > 0
-      ? toScreenYJs(primarySeries.value, range.min, range.max, layout.height, pad)
-      : 0;
-
-  const asBadge = useAnimatedStyle(() => {
-    const totalW = BADGE_TAIL_LEN + BADGE_PILL_BODY_W;
-    return {
-      opacity: 1,
-      width: totalW,
-      transform: [
-        { translateX: svBadgeLiveX.value - totalW / 2 - BADGE_TAIL_LEN },
-        { translateY: svBadgeLiveY.value - pillH - 12 },
-      ],
-    };
-  });
-  const asBadgeTextWrap = useAnimatedStyle(() => ({
-    width: Math.max(8, BADGE_PILL_BODY_W - BADGE_TAIL_LEN),
-  }));
-  const noopBadgeLayout = useCallback(() => {}, []);
+  const clipRect =
+    chartWidth > 0 && chartHeight > 0
+      ? rect(pad.left - 1, pad.top, chartWidth + 2, chartHeight)
+      : undefined;
 
   const scrubInfo = useMemo(() => {
-    if (scrubX == null || chartWidth <= 0 || latestTime <= 0) return null;
-    const liveX = toScreenXJs(latestTime, leftEdge, rightEdge, layout.width, pad);
+    if (scrubX == null || chartWidth <= 0 || displayTipT <= 0) return null;
+    const liveX = toScreenXJs(displayTipT, leftEdge, rightEdge, layout.width, pad);
     const clampedX = clamp(scrubX, pad.left, liveX);
-    const scrubTime = leftEdge + ((clampedX - pad.left) / Math.max(1, chartWidth)) * (rightEdge - leftEdge);
+    const scrubTime =
+      leftEdge + ((clampedX - pad.left) / Math.max(1, chartWidth)) * (rightEdge - leftEdge);
     const values = seriesPaths
       .map((entry) => {
         const snap = snapToPointScrubbing ? nearestPointAtTimeJs(entry.points, scrubTime) : null;
@@ -523,17 +372,44 @@ export function NativeMultiSeriesChart({
           label: entry.label,
           color: entry.color,
           value,
-          y: toScreenYJs(value, range.min, range.max, layout.height, pad),
+          y: toScreenYJs(value, displayMin, displayMax, layout.height, pad),
         };
       })
-      .filter(Boolean) as Array<{ id: string; label: string; color: string; value: number; y: number }>;
+      .filter(Boolean) as Array<{
+        id: string;
+        label: string;
+        color: string;
+        value: number;
+        y: number;
+      }>;
     if (values.length === 0) return null;
     return {
-      x: snapToPointScrubbing ? toScreenXJs(nearestPointAtTimeJs(seriesPaths[0]?.points ?? [], scrubTime)?.time ?? scrubTime, leftEdge, rightEdge, layout.width, pad) : clampedX,
+      x: snapToPointScrubbing
+        ? toScreenXJs(
+            nearestPointAtTimeJs(seriesPaths[0]?.points ?? [], scrubTime)?.time ?? scrubTime,
+            leftEdge,
+            rightEdge,
+            layout.width,
+            pad,
+          )
+        : clampedX,
       time: scrubTime,
       values,
     };
-  }, [chartWidth, latestTime, layout.height, layout.width, leftEdge, pad, range.max, range.min, rightEdge, scrubX, seriesPaths, snapToPointScrubbing]);
+  }, [
+    chartWidth,
+    displayTipT,
+    layout.height,
+    layout.width,
+    leftEdge,
+    pad,
+    displayMax,
+    displayMin,
+    rightEdge,
+    scrubX,
+    seriesPaths,
+    snapToPointScrubbing,
+  ]);
 
   const handleSeriesToggle = (id: string) => {
     setHiddenSeries((prev) => {
@@ -561,7 +437,11 @@ export function NativeMultiSeriesChart({
     const pinch = Gesture.Pinch()
       .enabled(pinchToZoom)
       .onUpdate((e) => {
-        const next = clamp(resolvedWin / Math.max(0.5, Math.min(2.5, e.scale)), 5, resolvedWin * 6);
+        const next = clamp(
+          resolvedWin / Math.max(0.5, Math.min(2.5, e.scale)),
+          5,
+          resolvedWin * 6,
+        );
         runOnJS(setPinchWindow)(next);
       })
       .onEnd(() => {
@@ -570,9 +450,6 @@ export function NativeMultiSeriesChart({
 
     return Gesture.Simultaneous(pan, pinch);
   }, [pinchToZoom, resolvedWin, scrub]);
-
-  const clipRect =
-    chartWidth > 0 && chartHeight > 0 ? rect(pad.left, pad.top, chartWidth, chartHeight) : undefined;
 
   return (
     <View style={[styles.root, { height }, style]}>
@@ -641,7 +518,13 @@ export function NativeMultiSeriesChart({
                   {referenceLine ? (
                     <ReferenceLineCanvas
                       label={referenceLine.label}
-                      y={toScreenYJs(referenceLine.value, range.min, range.max, layout.height, pad)}
+                      y={toScreenYJs(
+                        referenceLine.value,
+                        displayMin,
+                        displayMax,
+                        layout.height,
+                        pad,
+                      )}
                       opacity={1}
                       padLeft={pad.left}
                       padRight={pad.right}
@@ -650,56 +533,41 @@ export function NativeMultiSeriesChart({
                     />
                   ) : null}
 
-                  {staticSeriesPaths.map((entry) => {
-                    const lastPt =
-                      entry.points.length > 0 ? entry.points[entry.points.length - 1]! : null;
-                    return (
-                      <Group key={entry.id} clip={clipRect}>
-                        <Group transform={svMultiRangeTransform}>
-                          <Path
-                            path={entry.path}
-                            style="stroke"
-                            strokeWidth={2}
-                            strokeJoin="round"
-                            strokeCap="round"
-                            color={entry.color}
-                          />
-                        </Group>
-                        <SeriesTipPath
-                          svTipT={evTipT}
-                          svMin={evMin}
-                          svMax={evMax}
-                          svTipV={engine.getSeriesTipV(entry.id)}
-                          color={entry.color}
-                          hasLastPoint={lastPt != null}
-                          lastTime={lastPt?.time ?? 0}
-                          lastValue={lastPt?.value ?? 0}
-                          svBuildMin={svBuildMin}
-                          svBuildMax={svBuildMax}
-                          svBuildTipT={svBuildTipT}
-                          layoutWidth={layout.width}
-                          layoutHeight={layout.height}
-                          padLeft={pad.left}
-                          padRight={pad.right}
-                          padTop={pad.top}
-                          padBottom={pad.bottom}
-                          win={activeWindow}
-                        />
-                      </Group>
-                    );
-                  })}
+                  {seriesPaths.map((entry) => (
+                    <Group key={entry.id} clip={clipRect}>
+                      <Path
+                        path={entry.path}
+                        style="stroke"
+                        strokeWidth={2}
+                        strokeJoin="round"
+                        strokeCap="round"
+                        color={entry.color}
+                      />
+                    </Group>
+                  ))}
 
-                  {badge && primarySeries && !empty ? (
-                    <SkiaLine
-                      p1={vec(pad.left, badgeDashY)}
-                      p2={vec(layout.width - pad.right, badgeDashY)}
-                      color={palette.dashLine}
-                      strokeWidth={1}
-                    >
-                      <DashPathEffect intervals={[4, 4]} />
-                    </SkiaLine>
+                  {/* Endpoint dots + labels */}
+                  {seriesPaths.map((entry) => (
+                    <Group key={`dot-${entry.id}`}>
+                      <Circle cx={entry.liveX} cy={entry.liveY} r={3} color={entry.color} />
+                    </Group>
+                  ))}
+
+                  {/* Dashed price line for primary series */}
+                  {badge && seriesPaths[0] ? (
+                    <Group opacity={0.7}>
+                      <SkiaLine
+                        p1={vec(pad.left, seriesPaths[0].liveY)}
+                        p2={vec(layout.width - pad.right, seriesPaths[0].liveY)}
+                        color={palette.dashLine}
+                        strokeWidth={1}
+                      >
+                        <DashPathEffect intervals={[4, 4]} />
+                      </SkiaLine>
+                    </Group>
                   ) : null}
 
+                  {/* Crosshair */}
                   {scrubInfo ? (
                     <>
                       <CrosshairCanvas
@@ -714,10 +582,27 @@ export function NativeMultiSeriesChart({
                         dotColor={palette.accent}
                       />
                       {scrubInfo.values.map((entry) => (
-                        <Circle key={entry.id} cx={scrubInfo.x} cy={entry.y} r={4} color={entry.color} />
+                        <Circle
+                          key={`scrub-${entry.id}`}
+                          cx={scrubInfo.x}
+                          cy={entry.y}
+                          r={4}
+                          color={entry.color}
+                        />
                       ))}
                     </>
                   ) : null}
+
+                  {/* Left edge fade */}
+                  <Group blendMode="dstOut">
+                    <Rect x={0} y={0} width={pad.left + FADE_EDGE_WIDTH} height={layout.height}>
+                      <LinearGradient
+                        start={vec(pad.left, 0)}
+                        end={vec(pad.left + FADE_EDGE_WIDTH, 0)}
+                        colors={['rgba(0,0,0,1)', 'rgba(0,0,0,0)']}
+                      />
+                    </Rect>
+                  </Group>
                 </Canvas>
 
                 <AxisLabels
@@ -734,7 +619,13 @@ export function NativeMultiSeriesChart({
                 {referenceLine?.label ? (
                   <ReferenceLineLabel
                     label={referenceLine.label}
-                    y={toScreenYJs(referenceLine.value, range.min, range.max, layout.height, pad)}
+                    y={toScreenYJs(
+                      referenceLine.value,
+                      displayMin,
+                      displayMax,
+                      layout.height,
+                      pad,
+                    )}
                     opacity={1}
                     padLeft={pad.left}
                     padRight={pad.right}
@@ -744,6 +635,26 @@ export function NativeMultiSeriesChart({
                   />
                 ) : null}
 
+                {/* Series endpoint labels */}
+                {seriesPaths.map((entry) =>
+                  entry.label ? (
+                    <View
+                      key={`label-${entry.id}`}
+                      pointerEvents="none"
+                      style={{
+                        position: 'absolute',
+                        left: entry.liveX + 8,
+                        top: entry.liveY - 7,
+                      }}
+                    >
+                      <Text style={[styles.seriesLabel, { color: entry.color }]}>
+                        {entry.label}
+                      </Text>
+                    </View>
+                  ) : null,
+                )}
+
+                {/* Scrub tooltip */}
                 {scrubInfo ? (
                   <View pointerEvents="none" style={[styles.tooltip, { top: pad.top + 8 }]}>
                     <Text style={[styles.tooltipText, { color: palette.tooltipText }]}>
@@ -755,29 +666,6 @@ export function NativeMultiSeriesChart({
                       </Text>
                     ))}
                   </View>
-                ) : null}
-
-                {badge && primarySeries && !empty ? (
-                  <BadgeOverlay
-                    badge={badge}
-                    empty={empty}
-                    variant={badgeVariant}
-                    skiaBadgeFlow={skiaBadgeFlow}
-                    badgeFlowA11yLabel={badgeStr}
-                    badgeNumFont={badgeNumFont}
-                    badgeValue={svBadgeValue}
-                    flowPillW={BADGE_PILL_BODY_W}
-                    badgeStr={badgeStr}
-                    badgeStyle={asBadge}
-                    badgeTextWrapStyle={asBadgeTextWrap}
-                    backgroundPath={badgeBgPath}
-                    innerPath={badgeInnerPath}
-                    innerColor={badgeInnerRgb}
-                    pillH={pillH}
-                    onBadgeTemplateLayout={noopBadgeLayout}
-                    pal={palette}
-                    badgeTextStyle={styles.badgeTxt}
-                  />
                 ) : null}
               </>
             )}
@@ -810,7 +698,9 @@ function ControlPill({
         },
       ]}
     >
-      <Text style={[styles.pillText, { color: active ? color : 'rgba(255,255,255,0.48)' }]}>{label}</Text>
+      <Text style={[styles.pillText, { color: active ? color : 'rgba(255,255,255,0.48)' }]}>
+        {label}
+      </Text>
     </Pressable>
   );
 }
@@ -827,18 +717,33 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   pillText: { fontSize: 11, fontWeight: '500' },
-  axisY: { position: 'absolute', fontSize: 11, fontWeight: '400', fontFamily: 'monospace' },
-  axisT: { position: 'absolute', fontSize: 11, fontWeight: '400', fontFamily: 'monospace', textAlign: 'center' },
-  referenceLabel: { fontFamily: 'monospace', fontSize: 11, fontWeight: '500' },
+  axisY: {
+    position: 'absolute',
+    fontSize: 11,
+    fontWeight: '400',
+    fontFamily: mono,
+  },
+  axisT: {
+    position: 'absolute',
+    fontSize: 11,
+    fontWeight: '400',
+    fontFamily: mono,
+    textAlign: 'center',
+  },
+  referenceLabel: { fontFamily: mono, fontSize: 11, fontWeight: '500' },
   tooltip: {
     position: 'absolute',
     left: 12,
     gap: 2,
   },
   tooltipText: {
-    fontFamily: 'monospace',
+    fontFamily: mono,
     fontSize: 12,
     fontWeight: '500',
   },
-  badgeTxt: { fontFamily: mono, fontSize: 11, fontWeight: '500' },
+  seriesLabel: {
+    fontFamily: mono,
+    fontSize: 10,
+    fontWeight: '600',
+  },
 });
