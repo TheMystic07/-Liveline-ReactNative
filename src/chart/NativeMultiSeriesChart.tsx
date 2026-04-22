@@ -13,10 +13,13 @@ import {
   vec,
 } from '@shopify/react-native-skia';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
-import { runOnJS } from 'react-native-reanimated';
+import {
+  runOnJS,
+  useDerivedValue,
+  type SharedValue,
+} from 'react-native-reanimated';
 
 import { buildPath } from './draw/buildLiveLinePath';
-import { lerp as lerpFr } from './math/lerp';
 import { resolvePalette } from './theme';
 import { GridCanvas } from './render/GridCanvas';
 import { AxisLabels } from './render/AxisLabels';
@@ -25,6 +28,7 @@ import { EmptyState } from './render/EmptyState';
 import { ReferenceLineCanvas } from './render/ReferenceLineCanvas';
 import { ReferenceLineLabel } from './render/ReferenceLineLabel';
 import type { LiveLineChartProps, LiveLinePoint } from './types';
+import { useChartSmoothingEngine } from './smoothingEngine';
 import {
   calcGridTicksJs,
   calcTimeTicksJs,
@@ -38,13 +42,8 @@ import {
 } from './nativeChartUtils';
 
 const MULTI_WIN_BUF = 0.015;
+const MULTI_WIN_BUF_BADGE = 0.05;
 const FADE_EDGE_WIDTH = 40;
-const RANGE_LERP_SPEED = 0.15;
-const RANGE_ADAPTIVE_BOOST = 0.2;
-const ADAPTIVE_SPEED_BOOST = 0.2;
-const VALUE_SNAP_THRESHOLD = 0.001;
-const LIVE_TIP_CLOCK_CATCHUP = 0.42;
-const MAX_DELTA_MS = 50;
 
 const mono = Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' });
 
@@ -55,30 +54,108 @@ type SmoothFrame = {
   seriesTips: Record<string, number>;
 };
 
-function buildSeriesTips(
-  series: ReadonlyArray<{ id: string; value: number }>,
-  prev?: Record<string, number>,
+function sameSeriesTips(
+  next: Record<string, number>,
+  prev: Record<string, number>,
 ) {
-  const next: Record<string, number> = {};
-  for (const entry of series) {
-    next[entry.id] = prev?.[entry.id] ?? entry.value;
+  const nextKeys = Object.keys(next);
+  const prevKeys = Object.keys(prev);
+  if (nextKeys.length !== prevKeys.length) return false;
+  for (const key of nextKeys) {
+    if (Math.abs((prev[key] ?? NaN) - next[key]!) > 1e-6) return false;
   }
-  return next;
+  return true;
 }
 
-function buildSeriesPath(
-  points: LiveLinePoint[],
-  tipT: number,
-  tipV: number,
-  lo: number,
-  hi: number,
-  w: number,
-  h: number,
-  pad: { top: number; right: number; bottom: number; left: number },
-  win: number,
-  buffer: number,
-) {
-  return buildPath(points, tipT, tipV, lo, hi, w, h, pad, win, buffer, false);
+function AnimatedSeriesStroke({
+  clipRect,
+  points,
+  tipT,
+  tipV,
+  min,
+  max,
+  width,
+  height,
+  pad,
+  win,
+  buffer,
+  lineWidth,
+  lineColor,
+  trailGlow,
+  trailGlowColor,
+  gradientLineColoring,
+  gradientStartColor,
+  gradientEndColor,
+}: {
+  clipRect: ReturnType<typeof rect> | undefined;
+  points: LiveLinePoint[];
+  tipT: SharedValue<number>;
+  tipV: SharedValue<number>;
+  min: SharedValue<number>;
+  max: SharedValue<number>;
+  width: number;
+  height: number;
+  pad: { top: number; right: number; bottom: number; left: number };
+  win: number;
+  buffer: number;
+  lineWidth: number;
+  lineColor: string;
+  trailGlow: boolean;
+  trailGlowColor: string;
+  gradientLineColoring: boolean;
+  gradientStartColor: string;
+  gradientEndColor: string;
+}) {
+  const dvPath = useDerivedValue(() => {
+    'worklet';
+    return buildPath(
+      points,
+      tipT.value,
+      tipV.value,
+      min.value,
+      max.value,
+      width,
+      height,
+      pad,
+      win,
+      buffer,
+      false,
+    );
+  }, [points, tipT, tipV, min, max, width, height, pad, win, buffer]);
+
+  if (!clipRect) return null;
+
+  return (
+    <Group clip={clipRect}>
+      {trailGlow ? (
+        <Path
+          path={dvPath}
+          style="stroke"
+          strokeWidth={lineWidth + 4}
+          strokeJoin="round"
+          strokeCap="round"
+          color={trailGlowColor}
+          opacity={0.5}
+        />
+      ) : null}
+      <Path
+        path={dvPath}
+        style="stroke"
+        strokeWidth={lineWidth}
+        strokeJoin="round"
+        strokeCap="round"
+        color={gradientLineColoring ? undefined : lineColor}
+      >
+        {gradientLineColoring ? (
+          <LinearGradient
+            start={vec(0, pad.top)}
+            end={vec(width - pad.right, height)}
+            colors={[gradientStartColor, gradientEndColor]}
+          />
+        ) : null}
+      </Path>
+    </Group>
+  );
 }
 
 function computeUnionRange(
@@ -116,6 +193,7 @@ export function NativeMultiSeriesChart({
   series = [],
   theme = 'dark',
   color = '#3b82f6',
+  lineWidth,
   window: controlledWin = 30,
   windows,
   onWindowChange,
@@ -126,6 +204,8 @@ export function NativeMultiSeriesChart({
   pinchToZoom = false,
   formatValue = defaultFormatValue,
   formatTime = defaultFormatTime,
+  lineTrailGlow = true,
+  gradientLineColoring = false,
   height = 300,
   emptyText = 'Waiting for ticks',
   loading = false,
@@ -135,7 +215,7 @@ export function NativeMultiSeriesChart({
   seriesToggleCompact = false,
   lerpSpeed = 0.08,
 }: LiveLineChartProps) {
-  const palette = resolvePalette(series[0]?.color ?? color, theme, undefined);
+  const palette = resolvePalette(series[0]?.color ?? color, theme, lineWidth);
   const [layout, setLayout] = useState({ width: 0, height });
   const [hiddenSeries, setHiddenSeries] = useState<Set<string>>(new Set());
   const [scrubX, setScrubX] = useState<number | null>(null);
@@ -147,6 +227,7 @@ export function NativeMultiSeriesChart({
     return windows[0].secs;
   }, [windows, controlledWin]);
   const activeWindow = pinchWindow ?? resolvedWin;
+  const winBuffer = badge ? MULTI_WIN_BUF_BADGE : MULTI_WIN_BUF;
 
   const pad = useMemo(
     () => ({
@@ -171,7 +252,7 @@ export function NativeMultiSeriesChart({
       ),
     [visibleSeries],
   );
-  const dataRightEdge = latestTime + activeWindow * MULTI_WIN_BUF;
+  const dataRightEdge = latestTime + activeWindow * winBuffer;
   const dataLeftEdge = dataRightEdge - activeWindow;
 
   const preparedSeries = useMemo(() => {
@@ -179,9 +260,10 @@ export function NativeMultiSeriesChart({
       const points = entry.data.filter(
         (point) => point.time >= dataLeftEdge - 2 && point.time <= dataRightEdge + 1,
       );
-      return { ...entry, points };
+      const seriesPalette = resolvePalette(entry.color ?? color, theme, lineWidth);
+      return { ...entry, points, palette: seriesPalette };
     });
-  }, [dataLeftEdge, dataRightEdge, visibleSeries]);
+  }, [color, dataLeftEdge, dataRightEdge, lineWidth, theme, visibleSeries]);
 
   const empty = loading || layout.width <= 0 || preparedSeries.every((entry) => entry.points.length < 2);
 
@@ -193,107 +275,71 @@ export function NativeMultiSeriesChart({
     () => visibleSeries.map((entry) => ({ id: entry.id, value: entry.value })),
     [visibleSeries],
   );
+  const engine = useChartSmoothingEngine({
+    targetMin: targetRange.min,
+    targetMax: targetRange.max,
+    seriesTargets: visibleTargets,
+    dataTipT: latestTime,
+    enabled: !empty,
+  });
   const [display, setDisplay] = useState<SmoothFrame>(() => ({
     min: targetRange.min,
     max: targetRange.max,
     tipT: latestTime,
-    seriesTips: buildSeriesTips(visibleTargets),
+    seriesTips: Object.fromEntries(visibleTargets.map((entry) => [entry.id, entry.value])),
   }));
-  const displayRef = useRef<SmoothFrame>(display);
+  const displayRef = useRef(display);
 
   useEffect(() => {
-    displayRef.current = display;
-  }, [display]);
+    if (!empty) engine.pulse();
+  }, [empty, engine, series, latestTime]);
 
   useEffect(() => {
-    const syncBase: SmoothFrame = {
-      min: targetRange.min,
-      max: targetRange.max,
-      tipT: latestTime,
-      seriesTips: buildSeriesTips(visibleTargets, displayRef.current.seriesTips),
-    };
-
     if (empty) {
-      displayRef.current = syncBase;
-      setDisplay(syncBase);
+      const idleFrame: SmoothFrame = {
+        min: targetRange.min,
+        max: targetRange.max,
+        tipT: latestTime,
+        seriesTips: Object.fromEntries(visibleTargets.map((entry) => [entry.id, entry.value])),
+      };
+      displayRef.current = idleFrame;
+      setDisplay(idleFrame);
       return;
     }
 
-    displayRef.current = {
-      ...displayRef.current,
-      seriesTips: buildSeriesTips(visibleTargets, displayRef.current.seriesTips),
-    };
-
     let rafId = 0;
-    let lastFrame = 0;
-
-    const tick = (nowMs: number) => {
-      const prev = displayRef.current;
-      const dt = lastFrame === 0 ? 16.67 : Math.min(MAX_DELTA_MS, nowMs - lastFrame);
-      lastFrame = nowMs;
-
-      const targetT = Math.max(Date.now() / 1000, latestTime);
-      let nextTipT = lerpFr(prev.tipT, targetT, LIVE_TIP_CLOCK_CATCHUP, dt);
-      if (Math.abs(nextTipT - targetT) < 0.002) nextTipT = targetT;
-
-      const currentRange = Math.max(1e-4, prev.max - prev.min);
-      const targetRangeSpan = Math.max(1e-4, targetRange.max - targetRange.min);
-      const rangeGap = Math.abs(currentRange - targetRangeSpan);
-      const rangeSpeed =
-        RANGE_LERP_SPEED + Math.min(rangeGap / currentRange, 1) * RANGE_ADAPTIVE_BOOST;
-      let nextMin = lerpFr(prev.min, targetRange.min, rangeSpeed, dt);
-      let nextMax = lerpFr(prev.max, targetRange.max, rangeSpeed, dt);
-      if (Math.abs(nextMin - targetRange.min) < currentRange * VALUE_SNAP_THRESHOLD) {
-        nextMin = targetRange.min;
-      }
-      if (Math.abs(nextMax - targetRange.max) < currentRange * VALUE_SNAP_THRESHOLD) {
-        nextMax = targetRange.max;
-      }
-
-      const nextRange = Math.max(1e-4, nextMax - nextMin);
-      const nextSeriesTips = buildSeriesTips(visibleTargets, prev.seriesTips);
-      let converged = Math.abs(nextTipT - targetT) < 0.002;
-
+    const tick = () => {
+      const nextSeriesTips: Record<string, number> = {};
       for (const entry of visibleTargets) {
-        const currentValue = prev.seriesTips[entry.id] ?? entry.value;
-        const gap = Math.abs(entry.value - currentValue);
-        const speed =
-          lerpSpeed + (1 - Math.min(gap / nextRange, 1)) * ADAPTIVE_SPEED_BOOST;
-        let nextValue = lerpFr(currentValue, entry.value, speed, dt);
-        if (Math.abs(nextValue - entry.value) < nextRange * VALUE_SNAP_THRESHOLD) {
-          nextValue = entry.value;
-        }
-        nextSeriesTips[entry.id] = nextValue;
-        if (Math.abs(nextValue - entry.value) >= 1e-4) converged = false;
+        nextSeriesTips[entry.id] = engine.getSeriesTipV(entry.id).value;
       }
-
-      if (Math.abs(nextMin - targetRange.min) >= 1e-4 || Math.abs(nextMax - targetRange.max) >= 1e-4) {
-        converged = false;
-      }
-
       const nextFrame: SmoothFrame = {
-        min: nextMin,
-        max: nextMax,
-        tipT: nextTipT,
+        min: engine.svMin.value,
+        max: engine.svMax.value,
+        tipT: engine.svTipT.value,
         seriesTips: nextSeriesTips,
       };
-
-      displayRef.current = nextFrame;
-      setDisplay(nextFrame);
-
-      if (!converged) {
-        rafId = requestAnimationFrame(tick);
+      const prev = displayRef.current;
+      if (
+        Math.abs(prev.min - nextFrame.min) > 1e-6 ||
+        Math.abs(prev.max - nextFrame.max) > 1e-6 ||
+        Math.abs(prev.tipT - nextFrame.tipT) > 1e-6 ||
+        !sameSeriesTips(nextFrame.seriesTips, prev.seriesTips)
+      ) {
+        displayRef.current = nextFrame;
+        setDisplay(nextFrame);
       }
+      rafId = requestAnimationFrame(tick);
     };
 
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [empty, latestTime, lerpSpeed, targetRange.max, targetRange.min, visibleTargets]);
+  }, [empty, engine, latestTime, targetRange.max, targetRange.min, visibleTargets]);
 
   const displayMin = display.min;
   const displayMax = display.max;
   const displayTipT = display.tipT;
-  const rightEdge = displayTipT + activeWindow * MULTI_WIN_BUF;
+  const rightEdge = displayTipT + activeWindow * winBuffer;
   const leftEdge = rightEdge - activeWindow;
 
   const chartWidth = layout.width - pad.left - pad.right;
@@ -308,29 +354,16 @@ export function NativeMultiSeriesChart({
     [formatTime, layout.width, leftEdge, pad, rightEdge],
   );
 
-  // Build paths using SMOOTHED range and tip values
+  // Build live marker positions using the smoothed range/tip snapshot.
   const seriesPaths = useMemo(() => {
     return preparedSeries.map((entry) => {
       const smoothedValue = display.seriesTips[entry.id] ?? entry.value;
-      const path = buildSeriesPath(
-        entry.points,
-        displayTipT,
-        smoothedValue,
-        displayMin,
-        displayMax,
-        layout.width,
-        layout.height,
-        pad,
-        activeWindow,
-        MULTI_WIN_BUF,
-      );
       const liveX = toScreenXJs(displayTipT, leftEdge, rightEdge, layout.width, pad);
       const liveY = toScreenYJs(smoothedValue, displayMin, displayMax, layout.height, pad);
       return {
         id: entry.id,
         color: entry.color,
         label: entry.label ?? entry.id,
-        path,
         liveX,
         liveY,
         points: entry.points,
@@ -346,7 +379,6 @@ export function NativeMultiSeriesChart({
     layout.width,
     layout.height,
     pad,
-    activeWindow,
     leftEdge,
     rightEdge,
   ]);
@@ -533,17 +565,28 @@ export function NativeMultiSeriesChart({
                     />
                   ) : null}
 
-                  {seriesPaths.map((entry) => (
-                    <Group key={entry.id} clip={clipRect}>
-                      <Path
-                        path={entry.path}
-                        style="stroke"
-                        strokeWidth={2}
-                        strokeJoin="round"
-                        strokeCap="round"
-                        color={entry.color}
-                      />
-                    </Group>
+                  {preparedSeries.map((entry) => (
+                    <AnimatedSeriesStroke
+                      key={entry.id}
+                      clipRect={clipRect}
+                      points={entry.points}
+                      tipT={engine.svTipT}
+                      tipV={engine.getSeriesTipV(entry.id)}
+                      min={engine.svMin}
+                      max={engine.svMax}
+                      width={layout.width}
+                      height={layout.height}
+                      pad={pad}
+                      win={activeWindow}
+                      buffer={winBuffer}
+                      lineWidth={entry.palette.lineWidth}
+                      lineColor={entry.palette.accent}
+                      trailGlow={lineTrailGlow}
+                      trailGlowColor={entry.palette.accentGlow}
+                      gradientLineColoring={gradientLineColoring}
+                      gradientStartColor={entry.palette.gridLabel}
+                      gradientEndColor={entry.palette.accent}
+                    />
                   ))}
 
                   {/* Endpoint dots + labels */}
