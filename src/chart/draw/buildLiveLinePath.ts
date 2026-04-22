@@ -108,12 +108,7 @@ export function buildPath(
   if (includeTip) {
     const tipX = pad.left + ((tipT - leftEdge) / (rightEdge - leftEdge || 1)) * cw;
     const tipY = cy(pad.top + (1 - (tipV - lo) / span) * ch);
-    const last = screenPoints[screenPoints.length - 1]!;
-    if (Math.abs(last.x - tipX) < 0.5) {
-      screenPoints[screenPoints.length - 1] = { x: tipX, y: tipY };
-    } else {
-      screenPoints.push({ x: tipX, y: tipY });
-    }
+    screenPoints.push({ x: tipX, y: tipY });
   }
 
   return buildSplinePath(screenPoints, floor ? h - pad.bottom : undefined);

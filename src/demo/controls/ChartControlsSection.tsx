@@ -3,6 +3,7 @@ import { View } from 'react-native';
 
 import { Chip, ControlRow } from '../Controls';
 import type { ChartConfig } from '../config/useChartConfig';
+import { DEMO_WINDOW_OPTIONS } from '../windowOptions';
 
 const ACCENTS = [
   { label: 'Blue', value: '#3b82f6' },
@@ -19,6 +20,8 @@ type Props = {
   chartViewSupportsOrderbook: boolean;
   chartViewSupportsGradient: boolean;
   chartViewSupportsTrailGlow: boolean;
+  /** Native Skia: snapshot one-shot line chart; web falls back to live. */
+  snapshotSupported: boolean;
 };
 
 function ChartControlsSectionInner({
@@ -28,8 +31,12 @@ function ChartControlsSectionInner({
   chartViewSupportsOrderbook,
   chartViewSupportsGradient,
   chartViewSupportsTrailGlow,
+  snapshotSupported,
 }: Props) {
   const { theme, accent } = config;
+  const lineView = config.chartView === 'line';
+  const liveActive = lineView && (config.lineRenderer === 'live' || !snapshotSupported);
+  const snapshotActive = lineView && config.lineRenderer === 'snapshot' && snapshotSupported;
   return (
     <View>
       <ControlRow label="Theme" labelColor={muted}>
@@ -46,14 +53,68 @@ function ChartControlsSectionInner({
       </ControlRow>
 
       <ControlRow label="Chart" labelColor={muted}>
-        <Chip active={config.chartView === 'line'} label="Line" onPress={() => { config.setChartView('line'); config.setCandleLineMorph(false); }} theme={theme} accent={accent} />
-        <Chip active={config.chartView === 'multi'} label="Multi" onPress={() => config.setChartView('multi')} theme={theme} accent={accent} />
-        <Chip active={config.chartView === 'candle'} label="Candle" onPress={() => config.setChartView('candle')} theme={theme} accent={accent} />
+        <Chip
+          active={config.chartView === 'line'}
+          label="Line"
+          onPress={() => {
+            config.setChartView('line');
+            config.setCandleLineMorph(false);
+          }}
+          theme={theme}
+          accent={accent}
+        />
+        <Chip
+          active={config.chartView === 'multi'}
+          label="Multi"
+          onPress={() => {
+            config.setLineRenderer('live');
+            config.setChartView('multi');
+          }}
+          theme={theme}
+          accent={accent}
+        />
+        <Chip
+          active={config.chartView === 'candle'}
+          label="Candle"
+          onPress={() => {
+            config.setLineRenderer('live');
+            config.setChartView('candle');
+          }}
+          theme={theme}
+          accent={accent}
+        />
       </ControlRow>
 
-      <ControlRow label="Engine" labelColor={muted}>
-        <Chip active={!config.staticChart} label="Live" onPress={() => config.setStaticChart(false)} theme={theme} accent={accent} />
-        <Chip active={config.staticChart} label="Static" onPress={() => config.setStaticChart(true)} theme={theme} accent={accent} />
+      <ControlRow label="Line" labelColor={muted}>
+        <Chip
+          active={liveActive}
+          label="Live"
+          onPress={() => config.setLineRenderer('live')}
+          disabled={!lineView}
+          theme={theme}
+          accent={accent}
+        />
+        <Chip
+          active={snapshotActive}
+          label="Snapshot"
+          onPress={() => config.setLineRenderer('snapshot')}
+          disabled={!lineView || !snapshotSupported}
+          theme={theme}
+          accent={accent}
+        />
+      </ControlRow>
+
+      <ControlRow label="Window" labelColor={muted}>
+        {DEMO_WINDOW_OPTIONS.map((opt) => (
+          <Chip
+            key={opt.secs}
+            active={config.windowSecs === opt.secs}
+            label={opt.label}
+            onPress={() => config.setWindowSecs(opt.secs)}
+            theme={theme}
+            accent={accent}
+          />
+        ))}
       </ControlRow>
 
       <ControlRow label="Effects" labelColor={muted}>

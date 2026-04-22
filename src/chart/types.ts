@@ -233,13 +233,42 @@ export interface LiveLineChartProps {
   lerpSpeed?: number;
   style?: ViewStyle;
   contentInset?: Partial<ChartPadding>;
-  /**
-   * Render a static chart variant that skips the live animation engine
-   * (no per-tick smoothing, no particle bursts, no pulse rings).
-   * Identical visuals for line and candlestick modes, but without
-   * the continuous `useFrameCallback` overhead.
-   */
-  static?: boolean;
+}
+
+/**
+ * One-shot line chart: same look as the live line chart, but all geometry is
+ * derived once from `data` and `value` (no live engine).
+ */
+export interface SnapshotLineChartProps {
+  data: LiveLinePoint[];
+  value: number;
+  theme?: LiveLineTheme;
+  color?: string;
+  lineWidth?: number;
+  window?: number;
+  grid?: boolean;
+  fill?: boolean;
+  badge?: boolean;
+  badgeVariant?: BadgeVariant;
+  liveDotGlow?: boolean;
+  lineTrailGlow?: boolean;
+  gradientLineColoring?: boolean;
+  referenceLine?: ReferenceLine;
+  exaggerate?: boolean;
+  height?: number;
+  emptyText?: string;
+  formatValue?: (value: number) => string;
+  formatTime?: (time: number) => string;
+  contentInset?: Partial<ChartPadding>;
+  style?: ViewStyle;
+  /** Pan to scrub (default true). */
+  scrub?: boolean;
+  snapToPointScrubbing?: boolean;
+  scrubHaptics?: boolean;
+  tooltipY?: number;
+  /** Draw a subtle outline behind tooltip text (default true). */
+  tooltipOutline?: boolean;
+  onHover?: (point: HoverPoint | null) => void;
 }
 
 export interface ScreenPoint {

@@ -4,6 +4,9 @@ import type { BadgeVariant } from '../../chart';
 
 export type ChartView = 'line' | 'multi' | 'candle';
 
+/** Line mode only: live engine vs one-shot `SnapshotLineChart` (Skia, no animation loop). */
+export type LineRenderer = 'live' | 'snapshot';
+
 export type ChartConfig = {
   theme: 'dark' | 'light';
   setTheme: (v: 'dark' | 'light') => void;
@@ -11,6 +14,8 @@ export type ChartConfig = {
   setAccent: (v: string) => void;
   chartView: ChartView;
   setChartView: (v: ChartView) => void;
+  lineRenderer: LineRenderer;
+  setLineRenderer: (v: LineRenderer) => void;
   windowSecs: number;
   setWindowSecs: (v: number) => void;
   showBadge: boolean;
@@ -31,8 +36,6 @@ export type ChartConfig = {
   setShowReferenceLine: (v: boolean) => void;
   candleLineMorph: boolean;
   setCandleLineMorph: (v: boolean) => void;
-  staticChart: boolean;
-  setStaticChart: (v: boolean) => void;
 };
 
 const DEFAULT_ACCENT = '#3b82f6';
@@ -41,6 +44,7 @@ export function useChartConfig(): ChartConfig {
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [accent, setAccent] = useState<string>(DEFAULT_ACCENT);
   const [chartView, setChartView] = useState<ChartView>('line');
+  const [lineRenderer, setLineRenderer] = useState<LineRenderer>('live');
   const [windowSecs, setWindowSecs] = useState<number>(30);
   const [showBadge, setShowBadge] = useState<boolean>(true);
   const [badgeVariant, setBadgeVariant] = useState<BadgeVariant>('default');
@@ -51,7 +55,6 @@ export function useChartConfig(): ChartConfig {
   const [showOrderbookStream, setShowOrderbookStream] = useState<boolean>(false);
   const [showReferenceLine, setShowReferenceLine] = useState<boolean>(false);
   const [candleLineMorph, setCandleLineMorph] = useState<boolean>(false);
-  const [staticChart, setStaticChart] = useState<boolean>(false);
 
   return {
     theme,
@@ -60,6 +63,8 @@ export function useChartConfig(): ChartConfig {
     setAccent,
     chartView,
     setChartView,
+    lineRenderer,
+    setLineRenderer,
     windowSecs,
     setWindowSecs,
     showBadge,
@@ -80,7 +85,5 @@ export function useChartConfig(): ChartConfig {
     setShowReferenceLine,
     candleLineMorph,
     setCandleLineMorph,
-    staticChart,
-    setStaticChart,
   };
 }
