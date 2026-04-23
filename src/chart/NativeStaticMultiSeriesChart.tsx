@@ -201,6 +201,7 @@ export function NativeStaticMultiSeriesChart({
           filteredData,
           lastVal,
           palette: resolvePalette(entry.color ?? color, theme, lineWidthProp, chartColors),
+          linePalette: resolvePalette(entry.color ?? color, theme, lineWidthProp),
         };
       }),
     [chartColors, color, leftEdge, lineWidthProp, rightEdge, theme, visibleSeries],
@@ -577,7 +578,7 @@ export function NativeStaticMultiSeriesChart({
                               <LinearGradient
                                 start={vec(0, pad.top)}
                                 end={vec(layout.width - pad.right, layout.height)}
-                                colors={[entry.palette.gridLabel, entry.palette.accent]}
+                                colors={[entry.linePalette.gridLabel, entry.palette.accent]}
                               />
                             ) : null}
                           </Path>

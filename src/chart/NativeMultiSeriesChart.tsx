@@ -315,7 +315,8 @@ export function NativeMultiSeriesChart({
         (point) => point.time >= dataLeftEdge - 2 && point.time <= dataRightEdge + 1,
       );
       const seriesPalette = resolvePalette(entry.color ?? color, theme, lineWidth, chartColors);
-      return { ...entry, rawPoints, palette: seriesPalette };
+      const linePalette = resolvePalette(entry.color ?? color, theme, lineWidth);
+      return { ...entry, rawPoints, palette: seriesPalette, linePalette };
     });
     const primaryBase = rawSeries[0]?.rawPoints[0]?.value ?? rawSeries[0]?.value ?? 0;
     return rawSeries.map((entry) => {
@@ -686,7 +687,7 @@ export function NativeMultiSeriesChart({
                       trailGlow={lineTrailGlow}
                       trailGlowColor={entry.palette.accentGlow}
                       gradientLineColoring={gradientLineColoring}
-                      gradientStartColor={entry.palette.gridLabel}
+                      gradientStartColor={entry.linePalette.gridLabel}
                       gradientEndColor={entry.palette.accent}
                     />
                   ))}

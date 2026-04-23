@@ -187,6 +187,10 @@ export function NativeStaticCandlestickChart({
   const win = useStaticWindowTransition(targetWin);
   const buf = windowBuffer(badge);
 
+  const linePal = useMemo(
+    () => resolvePalette(color, theme, lineWidthProp),
+    [color, lineWidthProp, theme],
+  );
   const pal = useMemo(
     () => resolvePalette(color, theme, lineWidthProp, chartColors),
     [chartColors, color, lineWidthProp, theme],
@@ -712,7 +716,7 @@ export function NativeStaticCandlestickChart({
                           trailGlow={lineTrailGlow}
                           trailGlowColor={pal.accentGlow}
                           gradientLineColoring={gradientLineColoring}
-                          gradientStartColor={pal.gridLabel}
+                          gradientStartColor={linePal.gridLabel}
                           gradientEndColor={pal.accent}
                           rangeTranslateX={svIdentityTranslateX}
                           rangeScaleY={svIdentityScaleY}
