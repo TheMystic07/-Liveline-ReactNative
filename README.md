@@ -239,6 +239,7 @@ Core:
 - `value`: latest live value
 - `theme`: `'dark' | 'light'`
 - `color`: accent color
+- `chartColors`: override chart chrome colors such as background, grid, axis labels, badges, tooltips, and controls without changing the series line palette
 - `height`: chart height
 - `window`: active visible time range in seconds
 - `windows`: selector options
@@ -265,6 +266,25 @@ Visual options:
 - `lineTrailGlow`
 - `gradientLineColoring`
 - `tooltipOutline`
+
+```tsx
+<LiveLineChart
+  data={points}
+  value={latest}
+  color="#22c55e"
+  theme="dark"
+  chartColors={{
+    surface: 'transparent',
+    plotSurface: '#050505',
+    gridLine: 'rgba(255,255,255,0.045)',
+    gridLabel: 'rgba(255,255,255,0.42)',
+    timeLabel: 'rgba(255,255,255,0.32)',
+    crosshair: 'rgba(255,255,255,0.22)',
+    tooltipBg: 'rgba(8,8,8,0.96)',
+    controlBarBg: 'rgba(255,255,255,0.03)',
+  }}
+/>
+```
 
 Mode selection:
 
