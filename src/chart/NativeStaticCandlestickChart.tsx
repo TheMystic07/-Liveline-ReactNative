@@ -20,6 +20,7 @@ import {
   cancelAnimation,
   runOnJS,
   useAnimatedReaction,
+  useAnimatedStyle,
   useDerivedValue,
   useSharedValue,
   withTiming,
@@ -46,6 +47,7 @@ import {
 } from './draw/livelineCandlestick';
 import { useStaticDrawAnimation } from './hooks/useStaticDrawAnimation';
 import { useStaticScrub } from './hooks/useStaticScrub';
+import { useStaticWindowTransition } from './hooks/useStaticWindowTransition';
 import {
   calcGridTicksJs,
   calcTimeTicksJs,
@@ -134,6 +136,7 @@ function buildControlOptions(
 export function NativeStaticCandlestickChart({
   candles: candlesProp = [],
   theme = 'dark',
+  chartColors,
   color = '#3b82f6',
   lineWidth: lineWidthProp,
   window: controlledWin = 30,
@@ -180,13 +183,13 @@ export function NativeStaticCandlestickChart({
     return windows[0]!.secs;
   }, [controlledWin, windows]);
   const [pinchWindow, setPinchWindow] = useState<number | null>(null);
-  const win = pinchWindow ?? resolvedWin;
+  const targetWin = pinchWindow ?? resolvedWin;
+  const win = useStaticWindowTransition(targetWin);
   const buf = windowBuffer(badge);
-  const empty = candlesProp.length === 0;
 
   const pal = useMemo(
-    () => resolvePalette(color, theme, lineWidthProp),
-    [color, lineWidthProp, theme],
+    () => resolvePalette(color, theme, lineWidthProp, chartColors),
+    [chartColors, color, lineWidthProp, theme],
   );
 
   const [layout, setLayout] = useState({ width: 0, height: 0 });
@@ -210,8 +213,8 @@ export function NativeStaticCandlestickChart({
   const tipV = lastCandle?.close ?? 0;
   const animationKey = useMemo(
     () =>
-      `${resolvedWin}:${candlesProp.length}:${candlesProp[0]?.time ?? 0}:${tipT}:${tipV}`,
-    [candlesProp, resolvedWin, tipT, tipV],
+      `${candlesProp.length}:${candlesProp[0]?.time ?? 0}:${tipT}:${tipV}`,
+    [candlesProp, tipT, tipV],
   );
 
   const candleWidthSecs = useMemo(() => inferCandleWidthSecs(candlesProp, win), [candlesProp, win]);
@@ -220,6 +223,7 @@ export function NativeStaticCandlestickChart({
     () => candlesProp.filter((candle) => candle.time >= leftEdge - 2 && candle.time <= rightEdge + 1),
     [candlesProp, leftEdge, rightEdge],
   );
+  const empty = loading || layout.width <= 0 || visibleCandles.length < 2;
   const rng = useMemo(
     () => computeCandleRange(visibleCandles, referenceLine?.value, exaggerate),
     [exaggerate, referenceLine?.value, visibleCandles],
@@ -323,6 +327,16 @@ export function NativeStaticCandlestickChart({
   );
   const trackedTimeLabels = useTrackedTimeLabels(timeTicks);
 
+  const lastCandleX = useMemo(() => {
+    if (layout.width <= 0 || !lastCandle) return pad.left;
+    const x = toScreenXJs(tipT + candleWidthSecs / 2, leftEdge, rightEdge, layout.width, pad);
+    return clamp(x, pad.left, layout.width - pad.right);
+  }, [candleWidthSecs, lastCandle, layout.width, leftEdge, pad, rightEdge, tipT]);
+  const drawRevealWidth = useMemo(
+    () => clamp(lastCandleX - pad.left, 0, chartW),
+    [chartW, lastCandleX, pad.left],
+  );
+
   const {
     drawComplete,
     dvClipRect,
@@ -333,7 +347,7 @@ export function NativeStaticCandlestickChart({
     dvEndDotOp,
   } = useStaticDrawAnimation({
     ready: !empty && layout.width > 0,
-    chartWidth: chartW,
+    chartWidth: drawRevealWidth,
     chartHeight: layout.height,
     padLeft: pad.left,
     animationKey,
@@ -391,18 +405,27 @@ export function NativeStaticCandlestickChart({
     svVisibleCandles.value = [...visibleCandles];
   }, [svVisibleCandles, visibleCandles]);
 
-  const lastCandleX = useMemo(
-    () =>
-      layout.width > 0 && lastCandle
-        ? toScreenXJs(tipT + candleWidthSecs / 2, leftEdge, rightEdge, layout.width, pad)
-        : 0,
-    [candleWidthSecs, lastCandle, layout.width, leftEdge, pad, rightEdge, tipT],
-  );
   const lastCandleCloseY = useMemo(
     () =>
       layout.height > 0 && lastCandle ? toScreenYJs(tipV, rng.min, rng.max, layout.height, pad) : 0,
     [lastCandle, layout.height, pad, rng.max, rng.min, tipV],
   );
+  const dvSplitX = useDerivedValue(() => {
+    if (svScrubOp.value <= 0.01) return layout.width - pad.right;
+    return clamp(svScrubX.value, pad.left, lastCandleX);
+  }, [layout.width, pad.left, pad.right, lastCandleX]);
+  const dvClipL = useDerivedValue(() => {
+    const xs = dvSplitX.value;
+    return rect(pad.left, pad.top, xs - pad.left, chartH);
+  }, [pad.left, pad.top, chartH]);
+  const dvClipR = useDerivedValue(() => {
+    const xs = dvSplitX.value;
+    return rect(xs, pad.top, layout.width - pad.right - xs, chartH);
+  }, [layout.width, pad.top, pad.right, chartH]);
+  const dvRightSegOp = useDerivedValue(() => {
+    if (svScrubOp.value <= 0.01) return 1;
+    return Math.max(0, 1 - svScrubOp.value * 0.6);
+  });
 
   const dvDrawDotY = useDerivedValue(() => {
     const candles = svVisibleCandles.value;
@@ -439,22 +462,35 @@ export function NativeStaticCandlestickChart({
       referenceLine ? toScreenYJs(referenceLine.value, rng.min, rng.max, layout.height, pad) : 0,
     [layout.height, pad, referenceLine, rng.max, rng.min],
   );
-  const dvHoverX = useDerivedValue(() => svScrubX.value, [svScrubX]);
+  const dvHoverX = useDerivedValue(() => {
+    if (!scrub || svScrubOp.value <= 0.01) return -100;
+    return clamp(svScrubX.value, pad.left, lastCandleX);
+  }, [scrub, pad.left, lastCandleX]);
   const dvHoverY = useDerivedValue(
-    () => (scrubTip ? toScreenYJs(svScrubHv.value, rng.min, rng.max, layout.height, pad) : 0),
-    [layout.height, pad, rng.max, rng.min, scrubTip, svScrubHv],
+    () => (scrub && svScrubOp.value > 0.01 ? toScreenYJs(svScrubHv.value, rng.min, rng.max, layout.height, pad) : -100),
+    [layout.height, pad, rng.max, rng.min, scrub, svScrubHv],
   );
+  const dvCrossEffectiveOp = useDerivedValue(() => {
+    const scrubAmt = svScrubOp.value;
+    if (scrubAmt <= 0.01) return 0;
+    const cw = Math.max(1, layout.width - pad.left - pad.right);
+    const dist = lastCandleX - dvHoverX.value;
+    const fadeStart = Math.min(80, cw * 0.3);
+    if (dist < 5) return 0;
+    if (dist >= fadeStart) return scrubAmt;
+    return ((dist - 5) / (fadeStart - 5)) * scrubAmt;
+  }, [layout.width, pad.left, pad.right, lastCandleX]);
   const dvCrossP1 = useDerivedValue(
-    () => ({ x: svScrubX.value, y: pad.top }),
-    [pad.top, svScrubX],
+    () => ({ x: dvHoverX.value, y: pad.top }),
+    [pad.top],
   );
   const dvCrossP2 = useDerivedValue(
-    () => ({ x: svScrubX.value, y: layout.height - pad.bottom }),
-    [layout.height, pad.bottom, svScrubX],
+    () => ({ x: dvHoverX.value, y: layout.height - pad.bottom }),
+    [layout.height, pad.bottom],
   );
-  const dvCrossLineOp = useDerivedValue(() => svScrubOp.value * 0.3, [svScrubOp]);
-  const dvCrossDotR = useDerivedValue(() => (svScrubOp.value > 0.01 ? 4.5 : 0), [svScrubOp]);
-  const dvCrossDotOp = useDerivedValue(() => svScrubOp.value, [svScrubOp]);
+  const dvCrossLineOp = useDerivedValue(() => dvCrossEffectiveOp.value * 0.5);
+  const dvCrossDotR = useDerivedValue(() => 4 * Math.min(dvCrossEffectiveOp.value * 3, 1));
+  const dvCrossDotOp = useDerivedValue(() => (dvCrossEffectiveOp.value > 0.01 ? 1 : 0));
   const dvDashY = useDerivedValue(
     () => toScreenYJs(tipV, rng.min, rng.max, layout.height, pad),
     [layout.height, pad, rng.max, rng.min, tipV],
@@ -498,15 +534,13 @@ export function NativeStaticCandlestickChart({
     [badgePillW, pillH],
   );
   const badgeX = useMemo(() => layout.width - pad.right + 4, [layout.width, pad.right]);
-  const asBadge = useMemo(
-    () => ({
+  const asBadge = useAnimatedStyle(() => ({
+      opacity: badge ? 1 - svScrubOp.value : 0,
       left: badgeX,
       top: lastCandleCloseY - pillH / 2,
       width: BADGE_TAIL_LEN + badgePillW,
       height: pillH,
-    }),
-    [badgePillW, badgeX, lastCandleCloseY, pillH],
-  );
+    }));
   const asBadgeTextWrap = useMemo(() => ({ opacity: 1 }), []);
 
   const candleScrubLayout = useMemo(
@@ -582,13 +616,13 @@ export function NativeStaticCandlestickChart({
   return (
     <View style={[styles.root, { height }, style]}>
       {windowControls.length > 0 ? (
-        <ChartControlRow options={windowControls} theme={theme} styleVariant={ws} marginLeft={pad.left} />
+        <ChartControlRow options={windowControls} theme={theme} styleVariant={ws} marginLeft={pad.left} colors={chartColors} />
       ) : null}
       {modeControls.length > 0 ? (
-        <ChartControlRow options={modeControls} theme={theme} styleVariant={ws} marginLeft={pad.left} />
+        <ChartControlRow options={modeControls} theme={theme} styleVariant={ws} marginLeft={pad.left} colors={chartColors} />
       ) : null}
       {morphControls.length > 0 ? (
-        <ChartControlRow options={morphControls} theme={theme} styleVariant={ws} marginLeft={pad.left} />
+        <ChartControlRow options={morphControls} theme={theme} styleVariant={ws} marginLeft={pad.left} colors={chartColors} />
       ) : null}
       <GestureDetector gesture={gesture}>
         <View style={[styles.shell, { backgroundColor: pal.surface }]}>
@@ -664,9 +698,9 @@ export function NativeStaticCandlestickChart({
                       <Group opacity={dvMorphLineOverlayOp}>
                         <LinePathLayer
                           clipRect={clipRect}
-                          leftClip={clipRect}
-                          rightClip={clipRect}
-                          rightOpacity={1}
+                          leftClip={dvClipL}
+                          rightClip={dvClipR}
+                          rightOpacity={dvRightSegOp}
                           revealOpacity={1}
                           path={morphLinePath}
                           layoutHeight={layout.height}

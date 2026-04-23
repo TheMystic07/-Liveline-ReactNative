@@ -1,4 +1,4 @@
-import type { ChartPalette, LiveLineTheme } from './types';
+import type { ChartChromeColors, ChartPalette, LiveLineTheme } from './types';
 
 /** Parse any CSS color string to [r, g, b]. Handles hex (#rgb, #rrggbb). */
 export function parseColorRgb(color: string): [number, number, number] {
@@ -63,11 +63,12 @@ export function resolvePalette(
   accent: string,
   theme: LiveLineTheme,
   lineWidth?: number,
+  chartColors?: ChartChromeColors,
 ): ChartPalette {
   const [r, g, b] = parseColorRgb(accent);
   const isDark = theme === 'dark';
 
-  return {
+  const palette: ChartPalette = {
     // Core
     accent,
     background: isDark ? '#0a0a0a' : '#ffffff',
@@ -131,4 +132,53 @@ export function resolvePalette(
     fadeLeftStart: isDark ? 'rgba(18, 18, 18, 0.98)' : 'rgba(248, 248, 248, 0.98)',
     fadeLeftEnd: isDark ? 'rgba(18, 18, 18, 0)' : 'rgba(248, 248, 248, 0)',
   };
+  if (!chartColors) return palette;
+
+  const next: ChartPalette = { ...palette };
+  const overrideKeys = [
+    'background',
+    'surface',
+    'plotSurface',
+    'border',
+    'gridLine',
+    'gridLabel',
+    'axisLine',
+    'timeLabel',
+    'badgeOuterBg',
+    'badgeOuterShadow',
+    'badgeBg',
+    'badgeText',
+    'dashLine',
+    'refLine',
+    'refLabel',
+    'crosshair',
+    'tooltipBg',
+    'tooltipText',
+    'tooltipMuted',
+    'bgRgb',
+    'fadeLeftStart',
+    'fadeLeftEnd',
+  ] satisfies Array<keyof ChartPalette>;
+  for (const key of overrideKeys) {
+    const value = chartColors[key as keyof ChartChromeColors];
+    if (value !== undefined) {
+      (next as Record<keyof ChartPalette, ChartPalette[keyof ChartPalette]>)[key] =
+        value as ChartPalette[keyof ChartPalette];
+    }
+  }
+
+  if (chartColors.background !== undefined && chartColors.bgRgb === undefined) {
+    next.bgRgb = parseColorRgb(chartColors.background);
+  }
+  if (
+    chartColors.background !== undefined &&
+    chartColors.fadeLeftStart === undefined &&
+    chartColors.fadeLeftEnd === undefined
+  ) {
+    const [bgR, bgG, bgB] = next.bgRgb;
+    next.fadeLeftStart = rgba(bgR, bgG, bgB, 0.98);
+    next.fadeLeftEnd = rgba(bgR, bgG, bgB, 0);
+  }
+
+  return next;
 }

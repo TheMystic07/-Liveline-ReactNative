@@ -1,11 +1,12 @@
 import { StyleSheet, Text, View } from 'react-native';
 import type { ViewStyle } from 'react-native';
 
-import type { LiveLineTheme } from './types';
+import type { ChartChromeColors, LiveLineTheme } from './types';
 import { resolvePalette } from './theme';
 
 export type WebFallbackChartProps = {
   theme?: LiveLineTheme;
+  chartColors?: ChartChromeColors;
   color?: string;
   height?: number;
   emptyText?: string;
@@ -14,12 +15,13 @@ export type WebFallbackChartProps = {
 
 export function WebFallbackChart({
   theme = 'dark',
+  chartColors,
   color = '#3b82f6',
   height = 300,
   emptyText = 'Native chart renderer only',
   style,
 }: WebFallbackChartProps) {
-  const palette = resolvePalette(color, theme, undefined);
+  const palette = resolvePalette(color, theme, undefined, chartColors);
 
   return (
     <View

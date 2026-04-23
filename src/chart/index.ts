@@ -8,6 +8,7 @@ export type {
   LiveLineWindowStyle,
   WindowOption,
   ChartPalette,
+  ChartChromeColors,
   BadgeVariant,
   ReferenceLine,
   DegenOptions,

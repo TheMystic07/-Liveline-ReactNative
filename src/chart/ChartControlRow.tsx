@@ -1,7 +1,7 @@
 import { memo, useMemo } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
-import type { LiveLineTheme, LiveLineWindowStyle } from './types';
+import type { ChartChromeColors, LiveLineTheme, LiveLineWindowStyle } from './types';
 
 export type ChartControlOption = {
   key: string | number;
@@ -16,6 +16,14 @@ type ChartControlRowProps = {
   theme: LiveLineTheme;
   styleVariant?: LiveLineWindowStyle;
   marginLeft?: number;
+  colors?: Pick<
+    ChartChromeColors,
+    | 'controlBarBg'
+    | 'controlIndicatorBg'
+    | 'controlActiveText'
+    | 'controlInactiveText'
+    | 'controlDisabledText'
+  >;
 };
 
 function ChartControlRowImpl({
@@ -23,6 +31,7 @@ function ChartControlRowImpl({
   theme,
   styleVariant = 'default',
   marginLeft = 0,
+  colors,
 }: ChartControlRowProps) {
   const isDark = theme === 'dark';
   const ui = useMemo(
@@ -34,14 +43,33 @@ function ChartControlRowImpl({
     }),
     [isDark],
   );
+  const controlUi = useMemo(
+    () => ({
+      indicatorBg: colors?.controlIndicatorBg ?? ui.indicatorBg,
+      activeTxt: colors?.controlActiveText ?? ui.activeTxt,
+      inactiveTxt: colors?.controlInactiveText ?? ui.inactiveTxt,
+      disabledTxt: colors?.controlDisabledText ?? ui.disabledTxt,
+    }),
+    [
+      colors?.controlActiveText,
+      colors?.controlDisabledText,
+      colors?.controlInactiveText,
+      colors?.controlIndicatorBg,
+      ui.activeTxt,
+      ui.disabledTxt,
+      ui.inactiveTxt,
+      ui.indicatorBg,
+    ],
+  );
 
   const metrics = useMemo(() => {
-    const barBg =
+    const defaultBarBg =
       styleVariant === 'text'
         ? 'transparent'
         : isDark
           ? 'rgba(255,255,255,0.03)'
           : 'rgba(0,0,0,0.02)';
+    const barBg = colors?.controlBarBg ?? defaultBarBg;
     if (styleVariant === 'text') {
       return {
         gap: 4,
@@ -73,7 +101,7 @@ function ChartControlRowImpl({
       padH: 10,
       padV: 3,
     };
-  }, [isDark, styleVariant]);
+  }, [colors?.controlBarBg, isDark, styleVariant]);
 
   if (options.length === 0) return null;
 
@@ -100,7 +128,7 @@ function ChartControlRowImpl({
                 paddingHorizontal: metrics.padH,
                 paddingVertical: metrics.padV,
                 borderRadius: metrics.btnRadius,
-                backgroundColor: option.active ? ui.indicatorBg : 'transparent',
+                backgroundColor: option.active ? controlUi.indicatorBg : 'transparent',
                 opacity: option.disabled ? 0.45 : pressed ? 0.82 : 1,
               },
             ]}
@@ -110,10 +138,10 @@ function ChartControlRowImpl({
                 styles.label,
                 {
                   color: option.disabled
-                    ? ui.disabledTxt
+                    ? controlUi.disabledTxt
                     : option.active
-                      ? ui.activeTxt
-                      : ui.inactiveTxt,
+                      ? controlUi.activeTxt
+                      : controlUi.inactiveTxt,
                   fontWeight: option.active ? '600' : '400',
                 },
               ]}

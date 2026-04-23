@@ -14,8 +14,13 @@ import {
 } from '@shopify/react-native-skia';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import {
+  cancelAnimation,
+  Easing,
   runOnJS,
   useDerivedValue,
+  useSharedValue,
+  withRepeat,
+  withTiming,
   type SharedValue,
 } from 'react-native-reanimated';
 
@@ -44,6 +49,7 @@ import {
 const MULTI_WIN_BUF = 0.015;
 const MULTI_WIN_BUF_BADGE = 0.05;
 const FADE_EDGE_WIDTH = 40;
+const MULTI_PULSE_DURATION = 1100;
 
 const mono = Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' });
 
@@ -81,6 +87,10 @@ function AnimatedSeriesStroke({
   buffer,
   lineWidth,
   lineColor,
+  fill,
+  fillOpacity,
+  fillStartColor,
+  fillEndColor,
   trailGlow,
   trailGlowColor,
   gradientLineColoring,
@@ -100,6 +110,10 @@ function AnimatedSeriesStroke({
   buffer: number;
   lineWidth: number;
   lineColor: string;
+  fill: boolean;
+  fillOpacity: number;
+  fillStartColor: string;
+  fillEndColor: string;
   trailGlow: boolean;
   trailGlowColor: string;
   gradientLineColoring: boolean;
@@ -122,21 +136,57 @@ function AnimatedSeriesStroke({
       false,
     );
   }, [points, tipT, tipV, min, max, width, height, pad, win, buffer]);
+  const dvFillPath = useDerivedValue(() => {
+    'worklet';
+    return buildPath(
+      points,
+      tipT.value,
+      tipV.value,
+      min.value,
+      max.value,
+      width,
+      height,
+      pad,
+      win,
+      buffer,
+      true,
+    );
+  }, [points, tipT, tipV, min, max, width, height, pad, win, buffer]);
 
   if (!clipRect) return null;
 
   return (
     <Group clip={clipRect}>
+      {fill ? (
+        <Path path={dvFillPath} opacity={fillOpacity}>
+          <LinearGradient
+            start={vec(0, pad.top)}
+            end={vec(0, height - pad.bottom)}
+            colors={[fillStartColor, fillEndColor]}
+          />
+        </Path>
+      ) : null}
       {trailGlow ? (
-        <Path
-          path={dvPath}
-          style="stroke"
-          strokeWidth={lineWidth + 4}
-          strokeJoin="round"
-          strokeCap="round"
-          color={trailGlowColor}
-          opacity={0.5}
-        />
+        <>
+          <Path
+            path={dvPath}
+            style="stroke"
+            strokeWidth={lineWidth + 10}
+            strokeJoin="round"
+            strokeCap="round"
+            color={trailGlowColor}
+            opacity={0.16}
+          />
+          <Path
+            path={dvPath}
+            style="stroke"
+            strokeWidth={lineWidth + 5}
+            strokeJoin="round"
+            strokeCap="round"
+            color={trailGlowColor}
+            opacity={0.42}
+          />
+        </>
       ) : null}
       <Path
         path={dvPath}
@@ -161,6 +211,7 @@ function AnimatedSeriesStroke({
 function computeUnionRange(
   series: Array<{ points: LiveLinePoint[]; value: number }>,
   referenceValue?: number,
+  exaggerate = false,
 ) {
   let min = Infinity;
   let max = -Infinity;
@@ -180,18 +231,19 @@ function computeUnionRange(
     return { min: 0, max: 1 };
   }
   const rawRange = max - min;
-  const minRange = rawRange * 0.1 || 0.4;
+  const minRange = rawRange * (exaggerate ? 0.02 : 0.1) || (exaggerate ? 0.04 : 0.4);
   if (rawRange < minRange) {
     const mid = (min + max) / 2;
     return { min: mid - minRange / 2, max: mid + minRange / 2 };
   }
-  const margin = rawRange * 0.12;
+  const margin = rawRange * (exaggerate ? 0.01 : 0.12);
   return { min: min - margin, max: max + margin };
 }
 
 export function NativeMultiSeriesChart({
   series = [],
   theme = 'dark',
+  chartColors,
   color = '#3b82f6',
   lineWidth,
   window: controlledWin = 30,
@@ -199,6 +251,7 @@ export function NativeMultiSeriesChart({
   onWindowChange,
   referenceLine,
   badge = true,
+  fill = true,
   scrub = true,
   snapToPointScrubbing = false,
   pinchToZoom = false,
@@ -206,6 +259,7 @@ export function NativeMultiSeriesChart({
   formatTime = defaultFormatTime,
   lineTrailGlow = true,
   gradientLineColoring = false,
+  exaggerate = true,
   height = 300,
   emptyText = 'Waiting for ticks',
   loading = false,
@@ -215,7 +269,7 @@ export function NativeMultiSeriesChart({
   seriesToggleCompact = false,
   lerpSpeed = 0.08,
 }: LiveLineChartProps) {
-  const palette = resolvePalette(series[0]?.color ?? color, theme, lineWidth);
+  const palette = resolvePalette(series[0]?.color ?? color, theme, lineWidth, chartColors);
   const [layout, setLayout] = useState({ width: 0, height });
   const [hiddenSeries, setHiddenSeries] = useState<Set<string>>(new Set());
   const [scrubX, setScrubX] = useState<number | null>(null);
@@ -256,24 +310,38 @@ export function NativeMultiSeriesChart({
   const dataLeftEdge = dataRightEdge - activeWindow;
 
   const preparedSeries = useMemo(() => {
-    return visibleSeries.map((entry) => {
-      const points = entry.data.filter(
+    const rawSeries = visibleSeries.map((entry) => {
+      const rawPoints = entry.data.filter(
         (point) => point.time >= dataLeftEdge - 2 && point.time <= dataRightEdge + 1,
       );
-      const seriesPalette = resolvePalette(entry.color ?? color, theme, lineWidth);
-      return { ...entry, points, palette: seriesPalette };
+      const seriesPalette = resolvePalette(entry.color ?? color, theme, lineWidth, chartColors);
+      return { ...entry, rawPoints, palette: seriesPalette };
     });
-  }, [color, dataLeftEdge, dataRightEdge, lineWidth, theme, visibleSeries]);
+    const primaryBase = rawSeries[0]?.rawPoints[0]?.value ?? rawSeries[0]?.value ?? 0;
+    return rawSeries.map((entry) => {
+      const seriesBase = entry.rawPoints[0]?.value ?? entry.value;
+      const toDisplayValue = (value: number) => primaryBase + (value - seriesBase);
+      const points = entry.rawPoints.map((point) => ({
+        time: point.time,
+        value: toDisplayValue(point.value),
+      }));
+      return {
+        ...entry,
+        points,
+        displayValue: toDisplayValue(entry.value),
+      };
+    });
+  }, [chartColors, color, dataLeftEdge, dataRightEdge, lineWidth, theme, visibleSeries]);
 
   const empty = loading || layout.width <= 0 || preparedSeries.every((entry) => entry.points.length < 2);
 
   const targetRange = useMemo(
-    () => computeUnionRange(preparedSeries, referenceLine?.value),
-    [preparedSeries, referenceLine?.value],
+    () => computeUnionRange(preparedSeries, referenceLine?.value, exaggerate),
+    [exaggerate, preparedSeries, referenceLine?.value],
   );
   const visibleTargets = useMemo(
-    () => visibleSeries.map((entry) => ({ id: entry.id, value: entry.value })),
-    [visibleSeries],
+    () => preparedSeries.map((entry) => ({ id: entry.id, value: entry.displayValue })),
+    [preparedSeries],
   );
   const engine = useChartSmoothingEngine({
     targetMin: targetRange.min,
@@ -289,10 +357,32 @@ export function NativeMultiSeriesChart({
     seriesTips: Object.fromEntries(visibleTargets.map((entry) => [entry.id, entry.value])),
   }));
   const displayRef = useRef(display);
+  const svPulse = useSharedValue(1);
 
   useEffect(() => {
     if (!empty) engine.pulse();
   }, [empty, engine, series, latestTime]);
+
+  useEffect(() => {
+    cancelAnimation(svPulse);
+    if (empty) {
+      svPulse.value = 1;
+      return;
+    }
+    svPulse.value = 0;
+    svPulse.value = withRepeat(
+      withTiming(1, { duration: MULTI_PULSE_DURATION, easing: Easing.out(Easing.quad) }),
+      -1,
+      false,
+    );
+    return () => {
+      cancelAnimation(svPulse);
+      svPulse.value = 1;
+    };
+  }, [empty, svPulse]);
+
+  const dvPulseRingR = useDerivedValue(() => 5 + svPulse.value * 12, [svPulse]);
+  const dvPulseRingOp = useDerivedValue(() => (1 - svPulse.value) * 0.35, [svPulse]);
 
   useEffect(() => {
     if (empty) {
@@ -357,7 +447,7 @@ export function NativeMultiSeriesChart({
   // Build live marker positions using the smoothed range/tip snapshot.
   const seriesPaths = useMemo(() => {
     return preparedSeries.map((entry) => {
-      const smoothedValue = display.seriesTips[entry.id] ?? entry.value;
+      const smoothedValue = display.seriesTips[entry.id] ?? entry.displayValue;
       const liveX = toScreenXJs(displayTipT, leftEdge, rightEdge, layout.width, pad);
       const liveY = toScreenYJs(smoothedValue, displayMin, displayMax, layout.height, pad);
       return {
@@ -367,6 +457,7 @@ export function NativeMultiSeriesChart({
         liveX,
         liveY,
         points: entry.points,
+        rawPoints: entry.rawPoints,
         smoothedValue,
       };
     });
@@ -397,14 +488,15 @@ export function NativeMultiSeriesChart({
     const values = seriesPaths
       .map((entry) => {
         const snap = snapToPointScrubbing ? nearestPointAtTimeJs(entry.points, scrubTime) : null;
-        const value = snap ? snap.value : interpAtTimeJs(entry.points, scrubTime);
-        if (value == null) return null;
+        const displayValue = snap ? snap.value : interpAtTimeJs(entry.points, scrubTime);
+        const rawValue = interpAtTimeJs(entry.rawPoints, snap?.time ?? scrubTime);
+        if (displayValue == null || rawValue == null) return null;
         return {
           id: entry.id,
           label: entry.label,
           color: entry.color,
-          value,
-          y: toScreenYJs(value, displayMin, displayMax, layout.height, pad),
+          value: rawValue,
+          y: toScreenYJs(displayValue, displayMin, displayMax, layout.height, pad),
         };
       })
       .filter(Boolean) as Array<{
@@ -493,6 +585,9 @@ export function NativeMultiSeriesChart({
               active={resolvedWin === entry.secs && pinchWindow == null}
               label={entry.label}
               color={palette.accent}
+              inactiveBorderColor={palette.border}
+              inactiveBgColor={chartColors?.controlBarBg ?? palette.surface}
+              inactiveTextColor={chartColors?.controlInactiveText ?? palette.gridLabel}
               onPress={() => onWindowChange?.(entry.secs)}
             />
           ))}
@@ -507,6 +602,9 @@ export function NativeMultiSeriesChart({
               active={!hiddenSeries.has(entry.id)}
               label={seriesToggleCompact ? '•' : entry.label ?? entry.id}
               color={entry.color}
+              inactiveBorderColor={palette.border}
+              inactiveBgColor={chartColors?.controlBarBg ?? palette.surface}
+              inactiveTextColor={chartColors?.controlInactiveText ?? palette.gridLabel}
               onPress={() => handleSeriesToggle(entry.id)}
             />
           ))}
@@ -565,7 +663,7 @@ export function NativeMultiSeriesChart({
                     />
                   ) : null}
 
-                  {preparedSeries.map((entry) => (
+                  {preparedSeries.map((entry, index) => (
                     <AnimatedSeriesStroke
                       key={entry.id}
                       clipRect={clipRect}
@@ -581,6 +679,10 @@ export function NativeMultiSeriesChart({
                       buffer={winBuffer}
                       lineWidth={entry.palette.lineWidth}
                       lineColor={entry.palette.accent}
+                      fill={fill}
+                      fillOpacity={index === 0 ? 0.9 : 0.42}
+                      fillStartColor={entry.palette.accentFillTop}
+                      fillEndColor={entry.palette.accentFillBottom}
                       trailGlow={lineTrailGlow}
                       trailGlowColor={entry.palette.accentGlow}
                       gradientLineColoring={gradientLineColoring}
@@ -592,7 +694,18 @@ export function NativeMultiSeriesChart({
                   {/* Endpoint dots + labels */}
                   {seriesPaths.map((entry) => (
                     <Group key={`dot-${entry.id}`}>
-                      <Circle cx={entry.liveX} cy={entry.liveY} r={3} color={entry.color} />
+                      {lineTrailGlow ? (
+                        <Circle
+                          cx={entry.liveX}
+                          cy={entry.liveY}
+                          r={dvPulseRingR}
+                          color={entry.color}
+                          opacity={dvPulseRingOp}
+                        />
+                      ) : null}
+                      <Circle cx={entry.liveX} cy={entry.liveY} r={7} color={entry.color} opacity={0.18} />
+                      <Circle cx={entry.liveX} cy={entry.liveY} r={4.25} color={entry.color} />
+                      <Circle cx={entry.liveX} cy={entry.liveY} r={1.8} color={palette.badgeText} opacity={0.72} />
                     </Group>
                   ))}
 
@@ -723,11 +836,17 @@ function ControlPill({
   active,
   label,
   color,
+  inactiveBorderColor,
+  inactiveBgColor,
+  inactiveTextColor,
   onPress,
 }: {
   active: boolean;
   label: string;
   color: string;
+  inactiveBorderColor: string;
+  inactiveBgColor: string;
+  inactiveTextColor: string;
   onPress: () => void;
 }) {
   return (
@@ -736,12 +855,12 @@ function ControlPill({
       style={[
         styles.pill,
         {
-          borderColor: active ? `${color}66` : 'rgba(255,255,255,0.08)',
-          backgroundColor: active ? `${color}18` : 'rgba(255,255,255,0.02)',
+          borderColor: active ? `${color}66` : inactiveBorderColor,
+          backgroundColor: active ? `${color}18` : inactiveBgColor,
         },
       ]}
     >
-      <Text style={[styles.pillText, { color: active ? color : 'rgba(255,255,255,0.48)' }]}>
+      <Text style={[styles.pillText, { color: active ? color : inactiveTextColor }]}>
         {label}
       </Text>
     </Pressable>

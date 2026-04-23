@@ -158,6 +158,7 @@ export function NativeCandlestickChart({
   liveCandle,
   candleWidth: candleWidthProp,
   theme = 'dark',
+  chartColors,
   color = '#3b82f6',
   window: controlledWin = 30,
   windows,
@@ -177,7 +178,7 @@ export function NativeCandlestickChart({
   style,
   contentInset,
 }: LiveLineChartProps) {
-  const palette = resolvePalette(color, theme, undefined);
+  const palette = resolvePalette(color, theme, undefined, chartColors);
   const badgeNumFont = useSkiaFont(BADGE_NUMBER_FLOW_FONT_SRC, 11);
   const skiaBadgeFlow =
     !!badgeNumFont &&
@@ -487,6 +488,9 @@ export function NativeCandlestickChart({
               active={resolvedWin === entry.secs && pinchWindow == null}
               label={entry.label}
               color={palette.accent}
+              inactiveBorderColor={palette.border}
+              inactiveBgColor={chartColors?.controlBarBg ?? palette.surface}
+              inactiveTextColor={chartColors?.controlInactiveText ?? palette.gridLabel}
               onPress={() => onWindowChange?.(entry.secs)}
             />
           ))}
@@ -741,11 +745,17 @@ function ControlPill({
   active,
   label,
   color,
+  inactiveBorderColor,
+  inactiveBgColor,
+  inactiveTextColor,
   onPress,
 }: {
   active: boolean;
   label: string;
   color: string;
+  inactiveBorderColor: string;
+  inactiveBgColor: string;
+  inactiveTextColor: string;
   onPress: () => void;
 }) {
   return (
@@ -754,12 +764,12 @@ function ControlPill({
       style={[
         styles.pill,
         {
-          borderColor: active ? `${color}66` : 'rgba(255,255,255,0.08)',
-          backgroundColor: active ? `${color}18` : 'rgba(255,255,255,0.02)',
+          borderColor: active ? `${color}66` : inactiveBorderColor,
+          backgroundColor: active ? `${color}18` : inactiveBgColor,
         },
       ]}
     >
-      <Text style={[styles.pillText, { color: active ? color : 'rgba(255,255,255,0.48)' }]}>{label}</Text>
+      <Text style={[styles.pillText, { color: active ? color : inactiveTextColor }]}>{label}</Text>
     </Pressable>
   );
 }

@@ -4,6 +4,7 @@ import type {
   BadgeVariant,
   CandlePoint,
   ChartPadding,
+  ChartChromeColors,
   HoverPoint,
   LiveLinePoint,
   LiveLineSeries,
@@ -36,6 +37,8 @@ export interface StaticChartProps {
   /*  Visual (same as live)                                              */
   /* ------------------------------------------------------------------ */
   theme?: LiveLineTheme;
+  /** Overrides chart chrome colors (background, grid, axis labels, badges, tooltips, controls) without changing the series line palette. */
+  chartColors?: ChartChromeColors;
   color?: string;
   /** Stroke width of the main line in pixels (default 2). */
   lineWidth?: number;

@@ -11,7 +11,7 @@ import {
   vec,
 } from '@shopify/react-native-skia';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
-import { runOnJS, useDerivedValue, useSharedValue } from 'react-native-reanimated';
+import { runOnJS, useAnimatedStyle, useDerivedValue, useSharedValue } from 'react-native-reanimated';
 
 import {
   BADGE_LINE_H,
@@ -24,6 +24,7 @@ import {
 import { buildPath } from './draw/buildLiveLinePath';
 import { useStaticDrawAnimation } from './hooks/useStaticDrawAnimation';
 import { useStaticScrub } from './hooks/useStaticScrub';
+import { useStaticWindowTransition } from './hooks/useStaticWindowTransition';
 import {
   calcGridTicksJs,
   calcTimeTicksJs,
@@ -106,6 +107,7 @@ function buildWindowControls(
 export function NativeStaticMultiSeriesChart({
   series = [],
   theme = 'dark',
+  chartColors,
   color = '#3b82f6',
   lineWidth: lineWidthProp,
   window: controlledWin = 30,
@@ -115,6 +117,7 @@ export function NativeStaticMultiSeriesChart({
   grid = true,
   badge = true,
   badgeVariant = 'default',
+  fill = true,
   referenceLine,
   lineTrailGlow = true,
   gradientLineColoring = false,
@@ -142,7 +145,8 @@ export function NativeStaticMultiSeriesChart({
     return windows[0]!.secs;
   }, [controlledWin, windows]);
   const [pinchWindow, setPinchWindow] = useState<number | null>(null);
-  const win = pinchWindow ?? resolvedWin;
+  const targetWin = pinchWindow ?? resolvedWin;
+  const win = useStaticWindowTransition(targetWin);
   const buf = badge ? WIN_BUF_BADGE : WIN_BUF;
 
   const [layout, setLayout] = useState({ width: 0, height: 0 });
@@ -159,8 +163,8 @@ export function NativeStaticMultiSeriesChart({
   const chartH = Math.max(0, layout.height - pad.top - pad.bottom);
 
   const primaryPal = useMemo(
-    () => resolvePalette(series[0]?.color ?? color, theme, lineWidthProp),
-    [color, lineWidthProp, series, theme],
+    () => resolvePalette(series[0]?.color ?? color, theme, lineWidthProp, chartColors),
+    [chartColors, color, lineWidthProp, series, theme],
   );
   const visibleSeries = series.length > 0 ? series : [];
   const latestTime = useMemo(
@@ -173,13 +177,13 @@ export function NativeStaticMultiSeriesChart({
   );
   const animationKey = useMemo(
     () =>
-      `${resolvedWin}:${visibleSeries
+      `${visibleSeries
         .map(
           (entry) =>
             `${entry.id}:${entry.data.length}:${entry.data[0]?.time ?? 0}:${entry.data[entry.data.length - 1]?.time ?? 0}:${entry.value}`,
         )
         .join('|')}`,
-    [resolvedWin, visibleSeries],
+    [visibleSeries],
   );
 
   const rightEdge = latestTime + win * buf;
@@ -196,10 +200,10 @@ export function NativeStaticMultiSeriesChart({
           ...entry,
           filteredData,
           lastVal,
-          palette: resolvePalette(entry.color ?? color, theme, lineWidthProp),
+          palette: resolvePalette(entry.color ?? color, theme, lineWidthProp, chartColors),
         };
       }),
-    [color, leftEdge, lineWidthProp, rightEdge, theme, visibleSeries],
+    [chartColors, color, leftEdge, lineWidthProp, rightEdge, theme, visibleSeries],
   );
 
   const empty =
@@ -235,6 +239,27 @@ export function NativeStaticMultiSeriesChart({
         : [],
     [buf, empty, latestTime, layout.height, layout.width, pad, preparedSeries, rng.max, rng.min, win],
   );
+  const seriesFillPaths = useMemo(
+    () =>
+      !empty && layout.width > 0
+        ? preparedSeries.map((entry) =>
+            buildPath(
+              entry.data,
+              latestTime,
+              entry.lastVal,
+              rng.min,
+              rng.max,
+              layout.width,
+              layout.height,
+              pad,
+              win,
+              buf,
+              true,
+            ),
+          )
+        : [],
+    [buf, empty, latestTime, layout.height, layout.width, pad, preparedSeries, rng.max, rng.min, win],
+  );
 
   const gridTicks = useMemo(
     () =>
@@ -252,11 +277,20 @@ export function NativeStaticMultiSeriesChart({
     [empty, formatTime, layout.width, leftEdge, pad, rightEdge],
   );
   const trackedTimeLabels = useTrackedTimeLabels(timeTicks);
+  const primaryDrawEndX = useMemo(() => {
+    if (layout.width <= 0 || latestTime <= 0) return pad.left;
+    const x = toScreenXJs(latestTime, leftEdge, rightEdge, layout.width, pad);
+    return clamp(x, pad.left, layout.width - pad.right);
+  }, [latestTime, layout.width, leftEdge, pad, rightEdge]);
+  const drawRevealWidth = useMemo(
+    () => clamp(primaryDrawEndX - pad.left, 0, chartW),
+    [chartW, pad.left, primaryDrawEndX],
+  );
 
   const { drawComplete, dvClipRect, dvDrawDotX, dvGridOp, dvDrawDotOp, dvEndDotOp } =
     useStaticDrawAnimation({
       ready: !empty && layout.width > 0,
-      chartWidth: chartW,
+      chartWidth: drawRevealWidth,
       chartHeight: layout.height,
       padLeft: pad.left,
       animationKey,
@@ -369,17 +403,31 @@ export function NativeStaticMultiSeriesChart({
       referenceLine ? toScreenYJs(referenceLine.value, rng.min, rng.max, layout.height, pad) : 0,
     [layout.height, pad, referenceLine, rng.max, rng.min],
   );
-  const dvHoverX = useDerivedValue(() => svScrubX.value);
+  const primaryLiveX = endDots[0]?.x ?? 0;
+  const dvHoverX = useDerivedValue(() => {
+    if (!scrub || svScrubOp.value <= 0.01) return -100;
+    return clamp(svScrubX.value, pad.left, primaryLiveX);
+  }, [scrub, pad.left, primaryLiveX]);
   const dvHoverY = useDerivedValue(
-    () => (multiScrubInfo ? toScreenYJs(svScrubHv.value, rng.min, rng.max, layout.height, pad) : 0),
-    [layout.height, multiScrubInfo, pad, rng.max, rng.min, svScrubHv],
+    () => (scrub && svScrubOp.value > 0.01 ? toScreenYJs(svScrubHv.value, rng.min, rng.max, layout.height, pad) : -100),
+    [layout.height, pad, rng.max, rng.min, scrub, svScrubHv],
   );
-  const dvCrossP1 = useDerivedValue(() => vec(svScrubX.value, pad.top), [pad.top, svScrubX]);
+  const dvCrossEffectiveOp = useDerivedValue(() => {
+    const scrubAmt = svScrubOp.value;
+    if (scrubAmt <= 0.01) return 0;
+    const cw = Math.max(1, layout.width - pad.left - pad.right);
+    const dist = primaryLiveX - dvHoverX.value;
+    const fadeStart = Math.min(80, cw * 0.3);
+    if (dist < 5) return 0;
+    if (dist >= fadeStart) return scrubAmt;
+    return ((dist - 5) / (fadeStart - 5)) * scrubAmt;
+  }, [layout.width, pad.left, pad.right, primaryLiveX]);
+  const dvCrossP1 = useDerivedValue(() => vec(dvHoverX.value, pad.top), [pad.top]);
   const dvCrossP2 = useDerivedValue(
-    () => vec(svScrubX.value, layout.height - pad.bottom),
-    [layout.height, pad.bottom, svScrubX],
+    () => vec(dvHoverX.value, layout.height - pad.bottom),
+    [layout.height, pad.bottom],
   );
-  const dvCrossLineOp = useDerivedValue(() => svScrubOp.value * 0.3, [svScrubOp]);
+  const dvCrossLineOp = useDerivedValue(() => dvCrossEffectiveOp.value * 0.5);
 
   const [flowPillW, setFlowPillW] = useState(80);
   const pillH = BADGE_LINE_H + BADGE_PAD_Y * 2;
@@ -406,15 +454,13 @@ export function NativeStaticMultiSeriesChart({
   );
   const badgeX = useMemo(() => layout.width - pad.right + 4, [layout.width, pad.right]);
   const badgeY = endDots[0]?.y ?? 0;
-  const asBadge = useMemo(
-    () => ({
+  const asBadge = useAnimatedStyle(() => ({
+      opacity: badge ? 1 - svScrubOp.value : 0,
       left: badgeX,
       top: badgeY - pillH / 2,
       width: BADGE_TAIL_LEN + badgePillW,
       height: pillH,
-    }),
-    [badgePillW, badgeX, badgeY, pillH],
-  );
+    }));
   const asBadgeTextWrap = useMemo(() => ({ opacity: 1 }), []);
 
   const baseY = layout.height - pad.bottom;
@@ -454,6 +500,7 @@ export function NativeStaticMultiSeriesChart({
           theme={theme as LiveLineTheme}
           styleVariant={ws}
           marginLeft={pad.left}
+          colors={chartColors}
         />
       ) : null}
       <GestureDetector gesture={gesture}>
@@ -495,6 +542,18 @@ export function NativeStaticMultiSeriesChart({
                       const entry = preparedSeries[idx]!;
                       return (
                         <Group key={entry.id} clip={clipRect}>
+                          {fill ? (
+                            <Path path={seriesFillPaths[idx] ?? ''} opacity={idx === 0 ? 0.9 : 0.42}>
+                              <LinearGradient
+                                start={vec(0, pad.top)}
+                                end={vec(0, layout.height - pad.bottom)}
+                                colors={[
+                                  entry.palette.accentFillTop,
+                                  entry.palette.accentFillBottom,
+                                ]}
+                              />
+                            </Path>
+                          ) : null}
                           {lineTrailGlow ? (
                             <Path
                               path={path}

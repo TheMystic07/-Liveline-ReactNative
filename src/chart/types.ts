@@ -142,11 +142,47 @@ export interface ChartPalette {
   fadeLeftEnd: string;
 }
 
+export type ChartChromeColors = Partial<
+  Pick<
+    ChartPalette,
+    | 'background'
+    | 'surface'
+    | 'plotSurface'
+    | 'border'
+    | 'gridLine'
+    | 'gridLabel'
+    | 'axisLine'
+    | 'timeLabel'
+    | 'badgeOuterBg'
+    | 'badgeOuterShadow'
+    | 'badgeBg'
+    | 'badgeText'
+    | 'dashLine'
+    | 'refLine'
+    | 'refLabel'
+    | 'crosshair'
+    | 'tooltipBg'
+    | 'tooltipText'
+    | 'tooltipMuted'
+    | 'bgRgb'
+    | 'fadeLeftStart'
+    | 'fadeLeftEnd'
+  >
+> & {
+  controlBarBg?: string;
+  controlIndicatorBg?: string;
+  controlActiveText?: string;
+  controlInactiveText?: string;
+  controlDisabledText?: string;
+};
+
 export interface LiveLineChartProps {
   data: LiveLinePoint[];
   value: number;
   series?: LiveLineSeries[];
   theme?: LiveLineTheme;
+  /** Overrides chart chrome colors (background, grid, axis labels, badges, tooltips, controls) without changing the series line palette. */
+  chartColors?: ChartChromeColors;
   color?: string;
   /** Stroke width of the main line in pixels (default 2, matches upstream Liveline). */
   lineWidth?: number;

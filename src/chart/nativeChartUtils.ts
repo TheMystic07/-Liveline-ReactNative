@@ -2,6 +2,7 @@ import type { ChartPadding, LiveLinePoint } from './types';
 import { pickValueInterval, niceTimeInterval } from './math/intervals';
 
 export function clamp(value: number, min: number, max: number) {
+  'worklet';
   return Math.min(max, Math.max(min, value));
 }
 
@@ -24,6 +25,7 @@ export function toScreenXJs(
   width: number,
   pad: ChartPadding,
 ) {
+  'worklet';
   const chartWidth = Math.max(1, width - pad.left - pad.right);
   return pad.left + ((time - leftEdge) / (rightEdge - leftEdge || 1)) * chartWidth;
 }
@@ -35,12 +37,14 @@ export function toScreenYJs(
   height: number,
   pad: ChartPadding,
 ) {
+  'worklet';
   const chartHeight = Math.max(1, height - pad.top - pad.bottom);
   const span = Math.max(0.0001, max - min);
   return pad.top + (1 - (value - min) / span) * chartHeight;
 }
 
 export function interpAtTimeJs(points: readonly LiveLinePoint[], target: number) {
+  'worklet';
   if (points.length === 0) return null;
   if (target <= points[0].time) return points[0].value;
   for (let index = 1; index < points.length; index += 1) {
@@ -56,6 +60,7 @@ export function interpAtTimeJs(points: readonly LiveLinePoint[], target: number)
 }
 
 export function nearestPointAtTimeJs(points: readonly LiveLinePoint[], target: number) {
+  'worklet';
   if (points.length === 0) return null;
   let nearest = points[0];
   let bestDistance = Math.abs(points[0].time - target);

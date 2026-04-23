@@ -842,6 +842,7 @@ export function NativeLiveLineChart({
   data,
   value,
   theme = 'dark',
+  chartColors,
   color = '#3b82f6',
   lineWidth,
   window: controlledWin = 30,
@@ -899,9 +900,13 @@ export function NativeLiveLineChart({
   const degenOptions = typeof degen === 'object' ? degen : undefined;
 
   /* ---- palette ---- */
-  const pal = useMemo(
+  const linePal = useMemo(
     () => resolvePalette(color, theme, lineWidth),
-    [color, theme, lineWidth],
+    [color, lineWidth, theme],
+  );
+  const pal = useMemo(
+    () => resolvePalette(color, theme, lineWidth, chartColors),
+    [chartColors, color, lineWidth, theme],
   );
 
   const [smoothedLive, setSmoothedLive] = useState<CandlePoint | null>(null);
@@ -921,7 +926,7 @@ export function NativeLiveLineChart({
     badge && badgeNumberFlow !== false && skiaDefaultNumberFormat && badgeNumFont != null;
   const skiaScrubFlow =
     scrub && scrubNumberFlow !== false && skiaDefaultNumberFormat;
-  const lineRevealStartRgb = useMemo(() => parseColorRgb(pal.gridLabel), [pal.gridLabel]);
+  const lineRevealStartRgb = useMemo(() => parseColorRgb(linePal.gridLabel), [linePal.gridLabel]);
   const lineRevealEndRgb = useMemo(() => parseColorRgb(pal.accent), [pal.accent]);
 
   const winUi = useMemo(
@@ -932,14 +937,30 @@ export function NativeLiveLineChart({
     }),
     [isDark],
   );
+  const winControlUi = useMemo(
+    () => ({
+      indicatorBg: chartColors?.controlIndicatorBg ?? winUi.indicatorBg,
+      activeTxt: chartColors?.controlActiveText ?? winUi.activeTxt,
+      inactiveTxt: chartColors?.controlInactiveText ?? winUi.inactiveTxt,
+    }),
+    [
+      chartColors?.controlActiveText,
+      chartColors?.controlInactiveText,
+      chartColors?.controlIndicatorBg,
+      winUi.activeTxt,
+      winUi.inactiveTxt,
+      winUi.indicatorBg,
+    ],
+  );
 
   const winBarMetrics = useMemo(() => {
-    const barBg =
+    const defaultBarBg =
       ws === 'text'
         ? 'transparent'
         : isDark
           ? 'rgba(255,255,255,0.03)'
           : 'rgba(0,0,0,0.02)';
+    const barBg = chartColors?.controlBarBg ?? defaultBarBg;
     if (ws === 'text') {
       return {
         gap: 4,
@@ -977,7 +998,7 @@ export function NativeLiveLineChart({
       padV: 3,
       indRadius: 4,
     };
-  }, [ws, isDark]);
+  }, [chartColors?.controlBarBg, ws, isDark]);
 
   /* ---- layout ---- */
   const [layout, setLayout] = useState({ width: 0, height });
@@ -3119,7 +3140,7 @@ export function NativeLiveLineChart({
                 style={[
                   windowIndStyle,
                   {
-                    backgroundColor: winUi.indicatorBg,
+                    backgroundColor: winControlUi.indicatorBg,
                     borderRadius: winBarMetrics.indRadius,
                   },
                 ]}
@@ -3130,8 +3151,8 @@ export function NativeLiveLineChart({
                 key={o.secs}
                 active={o.secs === resolvedWin}
                 label={o.label}
-                activeColor={winUi.activeTxt}
-                inactiveColor={winUi.inactiveTxt}
+                activeColor={winControlUi.activeTxt}
+                inactiveColor={winControlUi.inactiveTxt}
                 borderRadius={winBarMetrics.btnRadius}
                 paddingH={winBarMetrics.padH}
                 paddingV={winBarMetrics.padV}
@@ -3151,8 +3172,8 @@ export function NativeLiveLineChart({
                 active={!isCandle}
                 label="Line"
                 onPress={() => onModeChange('line')}
-                activeColor={winUi.activeTxt}
-                inactiveColor={winUi.inactiveTxt}
+                activeColor={winControlUi.activeTxt}
+                inactiveColor={winControlUi.inactiveTxt}
                 borderRadius={winBarMetrics.btnRadius}
                 paddingH={winBarMetrics.padH}
                 paddingV={winBarMetrics.padV}
@@ -3161,8 +3182,8 @@ export function NativeLiveLineChart({
                 active={isCandle}
                 label="Candle"
                 onPress={() => onModeChange('candle')}
-                activeColor={winUi.activeTxt}
-                inactiveColor={winUi.inactiveTxt}
+                activeColor={winControlUi.activeTxt}
+                inactiveColor={winControlUi.inactiveTxt}
                 borderRadius={winBarMetrics.btnRadius}
                 paddingH={winBarMetrics.padH}
                 paddingV={winBarMetrics.padV}
@@ -3175,8 +3196,8 @@ export function NativeLiveLineChart({
                 active={!lineMode}
                 label="Bars"
                 onPress={() => onLineModeChange(false)}
-                activeColor={winUi.activeTxt}
-                inactiveColor={winUi.inactiveTxt}
+                activeColor={winControlUi.activeTxt}
+                inactiveColor={winControlUi.inactiveTxt}
                 borderRadius={winBarMetrics.btnRadius}
                 paddingH={winBarMetrics.padH}
                 paddingV={winBarMetrics.padV}
@@ -3185,8 +3206,8 @@ export function NativeLiveLineChart({
                 active={lineMode}
                 label="Morph"
                 onPress={() => onLineModeChange(true)}
-                activeColor={winUi.activeTxt}
-                inactiveColor={winUi.inactiveTxt}
+                activeColor={winControlUi.activeTxt}
+                inactiveColor={winControlUi.inactiveTxt}
                 borderRadius={winBarMetrics.btnRadius}
                 paddingH={winBarMetrics.padH}
                 paddingV={winBarMetrics.padV}
@@ -3277,7 +3298,7 @@ export function NativeLiveLineChart({
                         trailGlow={lineTrailGlow}
                         trailGlowColor={pal.accentGlow}
                         gradientLineColoring={gradientLineColoring}
-                        gradientStartColor={pal.gridLabel}
+                        gradientStartColor={linePal.gridLabel}
                         gradientEndColor={pal.accent}
                         rangeTranslateX={svIdentityTranslateX}
                         rangeScaleY={svIdentityRangeScaleY}
@@ -3371,7 +3392,7 @@ export function NativeLiveLineChart({
                           trailGlow={lineTrailGlow}
                           trailGlowColor={pal.accentGlow}
                           gradientLineColoring={gradientLineColoring}
-                          gradientStartColor={pal.gridLabel}
+                          gradientStartColor={linePal.gridLabel}
                           gradientEndColor={pal.accent}
                           rangeTranslateX={svIdentityTranslateX}
                           rangeScaleY={svIdentityRangeScaleY}

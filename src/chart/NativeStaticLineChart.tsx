@@ -16,6 +16,7 @@ import { useSkiaFont } from 'number-flow-react-native/skia';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import {
   runOnJS,
+  useAnimatedStyle,
   useDerivedValue,
   useSharedValue,
 } from 'react-native-reanimated';
@@ -53,6 +54,7 @@ import {
 
 import { useStaticDrawAnimation } from './hooks/useStaticDrawAnimation';
 import { useStaticScrub } from './hooks/useStaticScrub';
+import { useStaticWindowTransition } from './hooks/useStaticWindowTransition';
 
 import { AxisLabels } from './render/AxisLabels';
 import { BadgeOverlay } from './render/BadgeOverlay';
@@ -99,6 +101,7 @@ function windowEdges(now: number, win: number, buffer: number) {
 export function NativeStaticLineChart({
   data,
   theme = 'dark',
+  chartColors,
   color = '#3b82f6',
   lineWidth: lineWidthProp,
   window: controlledWin = 30,
@@ -133,7 +136,6 @@ export function NativeStaticLineChart({
   contentInset,
 }: StaticChartProps) {
   const buf = windowBuffer(badge);
-  const empty = data.length === 0;
   const ws: LiveLineWindowStyle = windowStyleProp ?? 'default';
 
   const resolvedWin = useMemo(() => {
@@ -142,12 +144,17 @@ export function NativeStaticLineChart({
     return windows[0]!.secs;
   }, [controlledWin, windows]);
   const [pinchWindow, setPinchWindow] = useState<number | null>(null);
-  const win = pinchWindow ?? resolvedWin;
+  const targetWin = pinchWindow ?? resolvedWin;
+  const win = useStaticWindowTransition(targetWin);
 
   /* ---- Palette ---- */
-  const pal = useMemo(
+  const linePal = useMemo(
     () => resolvePalette(color, theme, lineWidthProp),
-    [color, theme, lineWidthProp],
+    [color, lineWidthProp, theme],
+  );
+  const pal = useMemo(
+    () => resolvePalette(color, theme, lineWidthProp, chartColors),
+    [chartColors, color, lineWidthProp, theme],
   );
 
   /* ---- Layout ---- */
@@ -170,8 +177,8 @@ export function NativeStaticLineChart({
     [data],
   );
   const animationKey = useMemo(
-    () => `${resolvedWin}:${data.length}:${data[0]?.time ?? 0}:${lastPoint?.time ?? 0}:${lastPoint?.value ?? 0}`,
-    [resolvedWin, data, lastPoint],
+    () => `${data.length}:${data[0]?.time ?? 0}:${lastPoint?.time ?? 0}:${lastPoint?.value ?? 0}`,
+    [data, lastPoint],
   );
   const tipT = lastPoint?.time ?? 0;
   const tipV = lastPoint?.value ?? 0;
@@ -185,6 +192,7 @@ export function NativeStaticLineChart({
     () => data.filter((p) => p.time >= leftEdge - 2 && p.time <= rightEdge + 1),
     [data, leftEdge, rightEdge],
   );
+  const empty = loading || layout.width <= 0 || visibleData.length < 2;
 
   const rng = useMemo(
     () => computeRange(visibleData, tipV, referenceLine?.value, exaggerate),
@@ -227,6 +235,15 @@ export function NativeStaticLineChart({
   );
   const trackedTimeLabels = useTrackedTimeLabels(timeTicks);
 
+  const lastPointX = useMemo(
+    () => (layout.width > 0 && lastPoint ? toScreenXJs(tipT, leftEdge, rightEdge, layout.width, pad) : pad.left),
+    [tipT, leftEdge, rightEdge, layout.width, pad, lastPoint],
+  );
+  const drawRevealWidth = useMemo(
+    () => clamp(lastPointX - pad.left, 0, chartW),
+    [chartW, lastPointX, pad.left],
+  );
+
   /* ---- Draw animation ---- */
   const {
     svDrawProgress,
@@ -239,7 +256,7 @@ export function NativeStaticLineChart({
     dvEndDotOp,
   } = useStaticDrawAnimation({
     ready: !empty && layout.width > 0,
-    chartWidth: chartW,
+    chartWidth: drawRevealWidth,
     chartHeight: layout.height,
     padLeft: pad.left,
     animationKey,
@@ -309,14 +326,26 @@ export function NativeStaticLineChart({
   }, [data, svLineData]);
 
   // Live dot position (last data point)
-  const lastPointX = useMemo(
-    () => (layout.width > 0 && lastPoint ? toScreenXJs(tipT, leftEdge, rightEdge, layout.width, pad) : 0),
-    [tipT, leftEdge, rightEdge, layout.width, pad, lastPoint],
-  );
   const lastPointY = useMemo(
     () => (layout.height > 0 && lastPoint ? toScreenYJs(tipV, rng.min, rng.max, layout.height, pad) : 0),
     [tipV, rng.min, rng.max, layout.height, pad, lastPoint],
   );
+  const dvSplitX = useDerivedValue(() => {
+    if (svScrubOp.value <= 0.01) return layout.width - pad.right;
+    return clamp(svScrubX.value, pad.left, lastPointX);
+  }, [layout.width, pad.left, pad.right, lastPointX]);
+  const dvClipL = useDerivedValue(() => {
+    const xs = dvSplitX.value;
+    return rect(pad.left, pad.top, xs - pad.left, chartH);
+  }, [pad.left, pad.top, chartH]);
+  const dvClipR = useDerivedValue(() => {
+    const xs = dvSplitX.value;
+    return rect(xs, pad.top, layout.width - pad.right - xs, chartH);
+  }, [layout.width, pad.top, pad.right, chartH]);
+  const dvRightSegOp = useDerivedValue(() => {
+    if (svScrubOp.value <= 0.01) return 1;
+    return Math.max(0, 1 - svScrubOp.value * 0.6);
+  });
 
   // Drawing dot Y: interpolate value at the draw progress position
   const dvDrawDotY = useDerivedValue(() => {
@@ -346,19 +375,37 @@ export function NativeStaticLineChart({
   );
 
   // Crosshair derived values
-  const dvHoverX = useDerivedValue(() => svScrubX.value);
+  const dvHoverX = useDerivedValue(() => {
+    if (!scrub || svScrubOp.value <= 0.01) return -100;
+    return clamp(svScrubX.value, pad.left, lastPointX);
+  }, [scrub, pad.left, lastPointX]);
   const dvHoverY = useDerivedValue(() => {
-    if (!scrubTip) return 0;
-    return toScreenYJs(svScrubHv.value, rng.min, rng.max, layout.height, pad);
-  }, [rng.min, rng.max, layout.height, pad, scrubTip]);
-  const dvCrossP1 = useDerivedValue(() => ({ x: svScrubX.value, y: pad.top }), [pad.top]);
+    if (!scrub || svScrubOp.value <= 0.01 || chartW <= 0) return -100;
+    const re = tipT + win * buf;
+    const le = re - win;
+    const ht = le + ((dvHoverX.value - pad.left) / Math.max(1, chartW)) * (re - le);
+    const hv = interpAtTimeJs(svLineData.value, ht) ?? svScrubHv.value;
+    return toScreenYJs(hv, rng.min, rng.max, layout.height, pad);
+  }, [scrub, chartW, tipT, win, buf, pad, rng.min, rng.max, layout.height, svLineData]);
+  const dvCrossEffectiveOp = useDerivedValue(() => {
+    const scrubAmt = svScrubOp.value;
+    if (scrubAmt <= 0.01) return 0;
+    const cw = Math.max(1, layout.width - pad.left - pad.right);
+    const hx = dvHoverX.value;
+    const dist = lastPointX - hx;
+    const fadeStart = Math.min(80, cw * 0.3);
+    if (dist < 5) return 0;
+    if (dist >= fadeStart) return scrubAmt;
+    return ((dist - 5) / (fadeStart - 5)) * scrubAmt;
+  }, [layout.width, pad.left, pad.right, lastPointX]);
+  const dvCrossP1 = useDerivedValue(() => ({ x: dvHoverX.value, y: pad.top }), [pad.top]);
   const dvCrossP2 = useDerivedValue(
-    () => ({ x: svScrubX.value, y: layout.height - pad.bottom }),
+    () => ({ x: dvHoverX.value, y: layout.height - pad.bottom }),
     [layout.height, pad.bottom],
   );
-  const dvCrossLineOp = useDerivedValue(() => svScrubOp.value * 0.3);
-  const dvCrossDotR = useDerivedValue(() => (svScrubOp.value > 0.01 ? 4.5 : 0));
-  const dvCrossDotOp = useDerivedValue(() => svScrubOp.value);
+  const dvCrossLineOp = useDerivedValue(() => dvCrossEffectiveOp.value * 0.5);
+  const dvCrossDotR = useDerivedValue(() => 4 * Math.min(dvCrossEffectiveOp.value * 3, 1));
+  const dvCrossDotOp = useDerivedValue(() => (dvCrossEffectiveOp.value > 0.01 ? 1 : 0));
 
   // Dashed price line
   const dvDashY = useDerivedValue(
@@ -419,15 +466,13 @@ export function NativeStaticLineChart({
     [layout.width, pad.right],
   );
 
-  const asBadge = useMemo(
-    () => ({
+  const asBadge = useAnimatedStyle(() => ({
+      opacity: badge ? 1 - svScrubOp.value : 0,
       left: badgeX,
       top: lastPointY - pillH / 2,
       width: BADGE_TAIL_LEN + badgePillW,
       height: pillH,
-    }),
-    [badgeX, lastPointY, badgePillW, pillH],
-  );
+    }));
 
   const asBadgeTextWrap = useMemo(() => ({ opacity: 1 }), []);
 
@@ -507,6 +552,7 @@ export function NativeStaticLineChart({
           theme={theme}
           styleVariant={ws}
           marginLeft={pad.left}
+          colors={chartColors}
         />
       ) : null}
       <GestureDetector gesture={gesture}>
@@ -549,13 +595,24 @@ export function NativeStaticLineChart({
                   {/* Fill gradient (clipped by draw animation) */}
                   {fill && clipRect ? (
                     <Group clip={dvClipRect} opacity={dvGridOp}>
-                      <Path path={fillPath}>
-                        <LinearGradient
-                          start={vec(0, pad.top)}
-                          end={vec(0, layout.height - pad.bottom)}
-                          colors={[pal.accentFillTop, pal.accentFillBottom]}
-                        />
-                      </Path>
+                      <Group clip={dvClipL}>
+                        <Path path={fillPath}>
+                          <LinearGradient
+                            start={vec(0, pad.top)}
+                            end={vec(0, layout.height - pad.bottom)}
+                            colors={[pal.accentFillTop, pal.accentFillBottom]}
+                          />
+                        </Path>
+                      </Group>
+                      <Group clip={dvClipR} opacity={dvRightSegOp}>
+                        <Path path={fillPath}>
+                          <LinearGradient
+                            start={vec(0, pad.top)}
+                            end={vec(0, layout.height - pad.bottom)}
+                            colors={[pal.accentFillTop, pal.accentFillBottom]}
+                          />
+                        </Path>
+                      </Group>
                     </Group>
                   ) : null}
 
@@ -564,9 +621,9 @@ export function NativeStaticLineChart({
                     <Group clip={dvClipRect}>
                       <LinePathLayer
                         clipRect={clipRect}
-                        leftClip={clipRect}
-                        rightClip={clipRect}
-                        rightOpacity={1}
+                        leftClip={dvClipL}
+                        rightClip={dvClipR}
+                        rightOpacity={dvRightSegOp}
                         revealOpacity={1}
                         path={linePath}
                         layoutHeight={layout.height}
@@ -578,7 +635,7 @@ export function NativeStaticLineChart({
                         trailGlow={lineTrailGlow}
                         trailGlowColor={pal.accentGlow}
                         gradientLineColoring={gradientLineColoring}
-                        gradientStartColor={pal.gridLabel}
+                        gradientStartColor={linePal.gridLabel}
                         gradientEndColor={pal.accent}
                         rangeTranslateX={svIdentityTranslateX}
                         rangeScaleY={svIdentityScaleY}

@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Gesture } from 'react-native-gesture-handler';
 import {
+  cancelAnimation,
   Easing,
   runOnJS,
-  useDerivedValue,
   useSharedValue,
   withTiming,
   type SharedValue,
@@ -262,27 +262,50 @@ export function useStaticScrub(input: UseStaticScrubInput): UseStaticScrubOutput
   const svScrubJsLastOp = useSharedValue(-1);
 
   const [scrubTip, setScrubTip] = useState<ScrubTipState>(null);
+  const lastScrubHapticCentRef = useRef<number | null>(null);
+  const lastScrubHapticTsRef = useRef(0);
+
+  const clearScrubTip = useCallback(() => {
+    lastScrubHapticCentRef.current = null;
+    lastScrubHapticTsRef.current = 0;
+    setScrubTip(null);
+  }, []);
 
   const applyScrubTip = useCallback(
     (hx: number, hv: number, ht: number, op: number, cand?: CandlePoint) => {
+      if (op <= 0.01) {
+        clearScrubTip();
+        return;
+      }
+      if (haptics) {
+        const cent = Math.round(hv * 100);
+        const prev = lastScrubHapticCentRef.current;
+        const nowMs = Date.now();
+        if (prev !== null && prev !== cent && nowMs - lastScrubHapticTsRef.current >= 48) {
+          scrubCentTickHaptic();
+          lastScrubHapticTsRef.current = nowMs;
+        }
+        lastScrubHapticCentRef.current = cent;
+      }
       setScrubTip((prev) => {
         if (
           prev &&
-          Math.abs(prev.hx - hx) < 0.1 &&
-          Math.abs(prev.hv - hv) < 1e-8 &&
-          Math.abs(prev.opacity - op) < 0.01
+          Math.abs(prev.hx - hx) < 0.8 &&
+          Math.abs(prev.hv - hv) < 2e-4 &&
+          Math.abs(prev.ht - ht) < 1e-5 &&
+          prev.candle?.time === cand?.time &&
+          prev.candle?.open === cand?.open &&
+          prev.candle?.high === cand?.high &&
+          prev.candle?.low === cand?.low &&
+          prev.candle?.close === cand?.close
         ) {
           return prev;
         }
         return { hx, hv, ht, opacity: op, candle: cand };
       });
     },
-    [],
+    [clearScrubTip, haptics],
   );
-
-  const clearScrubTip = useCallback(() => {
-    setScrubTip(null);
-  }, []);
 
   const onScrubPanBeginHaptic = useCallback(() => {
     if (haptics) scrubPanBeginHaptic();
@@ -302,6 +325,7 @@ export function useStaticScrub(input: UseStaticScrubInput): UseStaticScrubOutput
       .onBegin((e) => {
         'worklet';
         if (drawComplete.value !== 1) return;
+        cancelAnimation(svScrubOp);
 
         let hx: number;
         let hv: number;

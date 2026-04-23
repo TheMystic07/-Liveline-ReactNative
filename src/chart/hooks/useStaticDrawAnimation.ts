@@ -6,58 +6,34 @@ import {
   useDerivedValue,
   useSharedValue,
   withTiming,
-  type SharedValue,
   type DerivedValue,
+  type SharedValue,
 } from 'react-native-reanimated';
 import { rect, type SkHostRect } from '@shopify/react-native-skia';
-
-/* ------------------------------------------------------------------ */
-/*  Types                                                              */
-/* ------------------------------------------------------------------ */
 
 export type DrawEasing = 'ease-out' | 'linear' | 'ease-in-out';
 
 export type UseStaticDrawAnimationInput = {
-  /** True when the chart has data and layout is ready. */
   ready: boolean;
-  /** Chart content width (layoutWidth - pad.left - pad.right). */
   chartWidth: number;
-  /** Full layout height (used for clip rect). */
   chartHeight: number;
-  /** Left padding (clip rect starts here). */
   padLeft: number;
-  /** Dataset/window signature used to decide when the reveal animation should replay. */
   animationKey?: string | number;
-  /** Draw animation duration in ms (default 1200). */
   duration: number;
-  /** Easing curve (default 'ease-out'). */
   easing: DrawEasing;
-  /** Called on the JS thread when the draw animation completes. */
   onComplete?: () => void;
 };
 
 export type UseStaticDrawAnimationOutput = {
-  /** 0→1 progress of the draw animation. */
   svDrawProgress: SharedValue<number>;
-  /** 0 during animation, 1 when complete. */
   drawComplete: SharedValue<number>;
-  /** Animated clip rect that reveals the chart left-to-right. */
   dvClipRect: DerivedValue<SkHostRect>;
-  /** X position of the leading edge of the clip (for the drawing dot). */
-  dvDrawDotX: DerivedValue<number>;
-  /** Grid opacity (fades in fast, 0→15% of draw progress). */
-  dvGridOp: DerivedValue<number>;
-  /** Badge opacity (fades in at 85%→100% of draw progress). */
-  dvBadgeOp: DerivedValue<number>;
-  /** Drawing dot opacity (1 during draw, fades out on complete). */
+  dvDrawDotX: SharedValue<number>;
+  dvGridOp: SharedValue<number>;
+  dvBadgeOp: SharedValue<number>;
   dvDrawDotOp: SharedValue<number>;
-  /** Static end dot opacity (0 during draw, 1 on complete). */
   dvEndDotOp: SharedValue<number>;
 };
-
-/* ------------------------------------------------------------------ */
-/*  Easing map                                                         */
-/* ------------------------------------------------------------------ */
 
 function resolveEasing(e: DrawEasing) {
   switch (e) {
@@ -70,10 +46,6 @@ function resolveEasing(e: DrawEasing) {
       return Easing.out(Easing.cubic);
   }
 }
-
-/* ------------------------------------------------------------------ */
-/*  Hook                                                               */
-/* ------------------------------------------------------------------ */
 
 export function useStaticDrawAnimation(
   input: UseStaticDrawAnimationInput,
@@ -91,17 +63,26 @@ export function useStaticDrawAnimation(
 
   const svDrawProgress = useSharedValue(0);
   const drawComplete = useSharedValue(0);
+  const dvDrawDotX = useSharedValue(padLeft);
+  const dvGridOp = useSharedValue(0);
+  const dvBadgeOp = useSharedValue(0);
   const dvDrawDotOp = useSharedValue(0);
   const dvEndDotOp = useSharedValue(0);
 
   useEffect(() => {
     cancelAnimation(svDrawProgress);
+    cancelAnimation(dvDrawDotX);
+    cancelAnimation(dvGridOp);
+    cancelAnimation(dvBadgeOp);
     cancelAnimation(dvDrawDotOp);
     cancelAnimation(dvEndDotOp);
 
     if (!ready || chartWidth <= 0) {
       svDrawProgress.value = 0;
       drawComplete.value = 0;
+      dvDrawDotX.value = padLeft;
+      dvGridOp.value = 0;
+      dvBadgeOp.value = 0;
       dvDrawDotOp.value = 0;
       dvEndDotOp.value = 0;
       return;
@@ -109,8 +90,24 @@ export function useStaticDrawAnimation(
 
     svDrawProgress.value = 0;
     drawComplete.value = 0;
-    dvDrawDotOp.value = 1;
+    dvDrawDotX.value = padLeft;
+    dvGridOp.value = 0;
+    dvBadgeOp.value = 0;
+    dvDrawDotOp.value = 0;
     dvEndDotOp.value = 0;
+
+    dvDrawDotX.value = withTiming(padLeft + chartWidth, {
+      duration,
+      easing: resolveEasing(easing),
+    });
+    dvGridOp.value = withTiming(1, {
+      duration: Math.max(1, duration * 0.15),
+      easing: Easing.out(Easing.quad),
+    });
+    dvBadgeOp.value = withTiming(1, {
+      duration: Math.max(1, duration * 0.15),
+      easing: Easing.out(Easing.quad),
+    });
     svDrawProgress.value = withTiming(
       1,
       { duration, easing: resolveEasing(easing) },
@@ -119,7 +116,6 @@ export function useStaticDrawAnimation(
         if (finished) {
           drawComplete.value = 1;
           dvEndDotOp.value = withTiming(1, { duration: 140, easing: Easing.out(Easing.quad) });
-          dvDrawDotOp.value = withTiming(0, { duration: 200, easing: Easing.out(Easing.quad) });
           if (onComplete) runOnJS(onComplete)();
         }
       },
@@ -131,34 +127,20 @@ export function useStaticDrawAnimation(
     duration,
     easing,
     onComplete,
+    padLeft,
     svDrawProgress,
     drawComplete,
+    dvDrawDotX,
+    dvGridOp,
+    dvBadgeOp,
     dvDrawDotOp,
     dvEndDotOp,
   ]);
 
-  // Clip rect: expands from padLeft to padLeft + chartWidth
   const dvClipRect = useDerivedValue(() => {
-    const w = svDrawProgress.value * chartWidth;
-    return rect(padLeft - 1, 0, w + 2, chartHeight);
+    const width = svDrawProgress.value * chartWidth;
+    return rect(padLeft - 1, 0, width + 2, chartHeight);
   }, [padLeft, chartWidth, chartHeight]);
-
-  // Drawing dot X position (leading edge of clip)
-  const dvDrawDotX = useDerivedValue(
-    () => padLeft + svDrawProgress.value * chartWidth,
-    [padLeft, chartWidth],
-  );
-
-  // Grid opacity: fast fade-in (0→15% of progress maps to 0→1 opacity)
-  const dvGridOp = useDerivedValue(
-    () => Math.min(1, svDrawProgress.value * (1 / 0.15)),
-  );
-
-  // Badge opacity: fades in at 85%→100% of progress
-  const dvBadgeOp = useDerivedValue(() => {
-    const p = svDrawProgress.value;
-    return p > 0.85 ? (p - 0.85) / 0.15 : 0;
-  });
 
   return {
     svDrawProgress,
