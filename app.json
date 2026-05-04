@@ -3,6 +3,7 @@
     "name": "liveline-native",
     "slug": "liveline-native",
     "version": "1.0.0",
+    "entryPoint": "./index.ts",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",

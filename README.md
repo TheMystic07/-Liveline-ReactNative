@@ -2,64 +2,73 @@
 
 React Native Liveline-style charts built with Expo, Skia, Gesture Handler, and Reanimated.
 
-This repo exposes a native `LiveLineChart` component with:
+**Package:** [`@gurshabad90/liveline-native`](https://www.npmjs.com/package/@gurshabad90/liveline-native) (see `package.json` for the current `version`).
 
-- live line mode
-- candlestick mode
-- multi-series mode
-- scrubbing and crosshair hover
-- badge and scrub number-flow rendering
-- window switching
-- optional orderbook stream overlay
+This repo exposes:
+
+- **`LiveLineChart`** — real-time line, candle, or multi-series rendering with the live Skia engine
+- **`StaticChart`** — the same look for **non-streaming** data: a left-to-right **draw-on-load** animation, then full **scrub** (crosshair, tooltip, haptics) on native; no momentum, particles, or orderbook
+
+Also included:
+
+- scrubbing, crosshair, and hover callbacks
+- badge and optional Skia number-flow for badge / scrub
+- time window controls (`window` / `windows` / `onWindowChange`)
+- optional orderbook stream overlay (live line mode, native)
+- **`chartColors`** (live + static) to override **chrome** (background, grid, axes, tooltips, controls) while keeping the series accent from `color`
 
 ## Status
 
-- iOS / Android: supported
-- Web: fallback placeholder only
+- **iOS / Android:** supported (Skia + Reanimated)
+- **Web:** `LiveLineChart` and `StaticChart` render a **small fallback** card (`WebFallbackChart`) because the full native pipeline is not wired for web in this build
 
-The chart is wired for the native Skia/Reanimated pipeline. On web, `LiveLineChart` renders a fallback card instead of the live chart.
-
-## Run The Demo
+## Run the demo
 
 ```bash
 npm install
 npm start
 ```
 
-## Install As A Package
-
-Once published:
+## Install as a package
 
 ```bash
 npm install @gurshabad90/liveline-native
 ```
 
-Required peer dependencies in the consuming app:
+Required peer dependencies in the consuming app (align versions with your Expo / RN stack):
 
 ```bash
-npm install react react-native react-native-gesture-handler react-native-reanimated @shopify/react-native-skia number-flow-react-native expo-haptics
+npm install react react-native react-native-gesture-handler react-native-reanimated react-native-worklets @shopify/react-native-skia number-flow-react-native expo-haptics
 ```
 
-This package is intended for native React Native / Expo apps. Web still falls back to a placeholder view.
+The published package ships:
+
+- `src/**` for the React Native entry, so Metro compiles the original hooks / worklets code in the consumer app
+- `dist/**` for ESM, CJS, and `.d.ts`
 
 ## Import
 
-Inside this repo, import from `src/chart`:
+**In this repo** (app / demo), you can import from the chart entry:
 
 ```tsx
-import { LiveLineChart, type LiveLinePoint } from './src/chart';
+import { LiveLineChart, StaticChart, type LiveLinePoint } from './src/chart';
 ```
 
-From the published package:
+**From npm:**
+
+```tsx
+import { LiveLineChart, StaticChart, type LiveLinePoint, type StaticChartProps } from '@gurshabad90/liveline-native';
+```
+
+### Public exports (high level)
+
+- **Components:** `LiveLineChart`, `StaticChart`, `LivelineTransition`, `BadgeSkiaNumberFlow`, `ScrubSkiaNumberFlow`
+- **Types:** `LiveLineChartProps`, `StaticChartProps`, `LiveLinePoint`, `CandlePoint`, `LiveLineSeries`, `ChartPalette`, `ChartChromeColors`, `HoverPoint`, `ReferenceLine`, `WindowOption`, `LiveLineTheme`, `LiveLineWindowStyle`, and related types from the package
+
+## Minimal example — live line
 
 ```tsx
 import { LiveLineChart, type LiveLinePoint } from '@gurshabad90/liveline-native';
-```
-
-## Minimal Example
-
-```tsx
-import { LiveLineChart, type LiveLinePoint } from './src/chart';
 
 const data: LiveLinePoint[] = [
   { time: 1713430800, value: 101.2 },
@@ -88,11 +97,58 @@ export function Example() {
 }
 ```
 
-## Data Model
+## Static chart (`StaticChart`)
 
-`LiveLineChart` expects unix time in seconds, not milliseconds.
+Use **`StaticChart`** when you have a **complete** series in memory and want Liveline-style visuals **without** the live engine (no per-tick smoothing, no degen / particles / orderbook). Typical uses: **screenshots**, **history** panels, or **export** views.
 
-Line points:
+Behavior on **native**:
+
+1. The line (or candle / multi series) **draws left to right** once (`drawDuration`, `drawEasing`).
+2. When the draw finishes, **`onDrawComplete`** runs and **scrub** becomes active (pan, crosshair, tooltip, optional haptics) — same interaction model as the live chart, without streaming updates.
+
+**Web** uses the same placeholder as `LiveLineChart`.
+
+```tsx
+import { StaticChart, type LiveLinePoint } from '@gurshabad90/liveline-native';
+
+const data: LiveLinePoint[] = [/* ... */];
+const value = data[data.length - 1]!.value;
+
+export function HistoryPanel() {
+  return (
+    <StaticChart
+      data={data}
+      value={value}
+      color="#3b82f6"
+      theme="dark"
+      height={320}
+      window={30}
+      grid
+      fill
+      badge
+      drawDuration={1200}
+      drawEasing="ease-out"
+      onDrawComplete={() => console.log('ready to scrub')}
+      scrub
+      snapToPointScrubbing
+    />
+  );
+}
+```
+
+Mode routing matches the live API:
+
+- **Line (default):** `data` + `value` only
+- **Multi-series:** pass **`series`**
+- **Candles:** set **`mode="candle"`** and provide **`candles`** (and optional `lineMode`, toggles, etc. — see `StaticChartProps` in `src/chart/staticTypes.ts`)
+
+`StaticChartProps` is a **subset** of the live prop surface, plus **draw** controls (`drawDuration`, `drawEasing`, `onDrawComplete`) and without live-only flags such as `degen` / `orderbook` / `paused` streaming.
+
+## Data model
+
+`LiveLineChart` / `StaticChart` use **Unix time in seconds** (not milliseconds) on the time axis.
+
+**Line points:**
 
 ```ts
 type LiveLinePoint = {
@@ -101,7 +157,7 @@ type LiveLinePoint = {
 };
 ```
 
-Candle points:
+**Candle points:**
 
 ```ts
 type CandlePoint = {
@@ -113,7 +169,7 @@ type CandlePoint = {
 };
 ```
 
-Multi-series entries:
+**Multi-series:**
 
 ```ts
 type LiveLineSeries = {
@@ -125,7 +181,7 @@ type LiveLineSeries = {
 };
 ```
 
-Orderbook snapshot:
+**Orderbook snapshot (live line overlay):**
 
 ```ts
 type LiveOrderbookSnapshot = {
@@ -134,9 +190,9 @@ type LiveOrderbookSnapshot = {
 };
 ```
 
-## Common Usage
+## Common usage
 
-### Line Chart
+### Line chart (live)
 
 ```tsx
 <LiveLineChart
@@ -161,7 +217,7 @@ type LiveOrderbookSnapshot = {
 />
 ```
 
-### Candlestick Mode
+### Candlestick mode (live)
 
 ```tsx
 <LiveLineChart
@@ -180,24 +236,17 @@ type LiveOrderbookSnapshot = {
 />
 ```
 
-Notes:
+- `mode="candle"` switches the native renderer to candles.
+- `candles` — visible history buckets; `liveCandle` — current in-progress bucket.
+- `lineMode` toggles the candle-to-line morph overlay.
 
-- `mode="candle"` switches the native chart renderer into candle mode.
-- `candles` should contain the visible historical buckets.
-- `liveCandle` is the current in-progress bucket.
-- `lineMode` enables the candle-to-line morph overlay.
-
-### Multi-Series Mode
+### Multi-series (live)
 
 ```tsx
 <LiveLineChart
   data={primary.data}
   value={primary.value}
-  series={[
-    primary,
-    hedge,
-    benchmark,
-  ]}
+  series={[primary, hedge, benchmark]}
   theme="dark"
   grid
   badge
@@ -205,12 +254,9 @@ Notes:
 />
 ```
 
-Notes:
+Passing **`series`** selects the multi-series native renderer. `data` / `value` should still describe the **primary** series.
 
-- Passing `series` switches to the multi-series renderer.
-- `data` and `value` should still describe the primary series.
-
-### Orderbook Stream Overlay
+### Orderbook stream overlay (live line)
 
 ```tsx
 <LiveLineChart
@@ -229,43 +275,11 @@ Notes:
 />
 ```
 
-This renders floating size labels behind the chart line. It is only meaningful on native.
+Floating size labels draw behind the line (native, meaningful in line mode with a feed).
 
-## Props You'll Use Most
+## Chart chrome: `chartColors` (`ChartChromeColors`)
 
-Core:
-
-- `data`: line points
-- `value`: latest live value
-- `theme`: `'dark' | 'light'`
-- `color`: accent color
-- `chartColors`: override chart chrome colors such as background, grid, axis labels, badges, tooltips, and controls without changing the series line palette
-- `height`: chart height
-- `window`: active visible time range in seconds
-- `windows`: selector options
-- `onWindowChange`: callback for built-in window controls
-
-Interactivity:
-
-- `scrub`: enable panning / hover tooltip
-- `snapToPointScrubbing`: snap hover to nearest real point
-- `pinchToZoom`: temporary pinch zoom
-- `scrubHaptics`: native haptics while scrubbing
-- `onHover`: receive the current hover point
-
-Visual options:
-
-- `grid`
-- `fill`
-- `badge`
-- `badgeVariant`
-- `pulse`
-- `momentum`
-- `referenceLine`
-- `liveDotGlow`
-- `lineTrailGlow`
-- `gradientLineColoring`
-- `tooltipOutline`
+Both **`LiveLineChart`** and **`StaticChart`** accept optional **`chartColors`**: partial overrides for **UI chrome** (background, grid, axis labels, badges, tooltips, fade, ref/dash tints, etc.) and optional **control bar** token strings (`controlBarBg`, `controlActiveText`, …). The **series stroke** still comes from **`color`** (and per-series `color` in multi mode).
 
 ```tsx
 <LiveLineChart
@@ -286,77 +300,82 @@ Visual options:
 />
 ```
 
-Mode selection:
+See **`ChartChromeColors`** in `src/chart/types.ts` for the full key set.
 
-- `mode`: `'line' | 'candle'`
-- `series`: enables multi-series mode
-- `candles`
-- `liveCandle`
-- `lineMode`
-- `lineData`
-- `lineValue`
+## Props you will use most (live `LiveLineChart`)
 
-## Number Flow Notes
+**Core**
 
-`badgeNumberFlow` and `scrubNumberFlow` use `number-flow-react-native` for rolling digits.
+- `data`, `value`, `theme`, `color`, `chartColors`, `height`
+- `window`, `windows`, `onWindowChange`, `windowStyle`
 
-They work best when your formatter matches the default two-decimal output:
+**Interactivity**
+
+- `scrub`, `snapToPointScrubbing`, `pinchToZoom`, `scrubHaptics`, `scrubNumberFlow`, `onHover`, `paused`
+
+**Visual**
+
+- `grid`, `fill`, `badge`, `badgeVariant`, `badgeNumberFlow`, `pulse`, `momentum`, `referenceLine`
+- `liveDotGlow`, `lineTrailGlow`, `gradientLineColoring`, `tooltipY`, `tooltipOutline`, `exaggerate`, `lineWidth`
+
+**Mode**
+
+- `mode`, `series`, `candles`, `liveCandle`, `lineMode`, `lineData`, `lineValue`, `showBuiltInModeToggle`, `showBuiltInMorphToggle`, `candleWidth`, `onModeChange`, `onLineModeChange`
+
+**Extras**
+
+- `orderbook`, `degen`, `loading`, `formatValue`, `formatTime`, `contentInset`, `style`
+
+## Number Flow
+
+`badgeNumberFlow` and `scrubNumberFlow` use `number-flow-react-native` for rolling digits. They work best with the default two-decimal formatter:
 
 ```ts
-(value) => value.toFixed(2)
+(value: number) => value.toFixed(2);
 ```
 
-If you use a custom `formatValue` that does not behave like `toFixed(2)`, the chart falls back to plain text for those slots.
+Custom `formatValue` that does not follow that pattern falls back to plain text in those slots.
 
-## Native Setup Notes
+## Native setup in another app
 
-This repo already has the required dependencies installed:
+Standard React Native / Expo setup is still required:
 
-- `expo`
-- `@shopify/react-native-skia`
-- `react-native-gesture-handler`
-- `react-native-reanimated`
-- `number-flow-react-native`
+- import `react-native-gesture-handler` first in the app entry
+- wrap the app root with `GestureHandlerRootView`
+- keep the usual `react-native-reanimated`, `react-native-worklets`, and Skia Babel / Metro setup from your app stack
 
-If you move the chart into another app, keep the usual native setup for:
+No `patch-package` changes should be needed in the consuming app for `@gurshabad90/liveline-native`.
 
-- `react-native-gesture-handler`
-- `react-native-reanimated`
-- `@shopify/react-native-skia`
+## Build and publish
 
-## Build And Publish
-
-Build the package:
+Build:
 
 ```bash
 npm run build
 ```
 
-The package build outputs:
+Outputs (published in the npm package):
 
-- `dist/index.js`
-- `dist/index.cjs`
-- `dist/index.d.ts`
+- `src/index.ts` (React Native entry)
+- `dist/index.js` (ESM)
+- `dist/index.cjs` (CJS)
+- `dist/index.d.ts` (types)
 
-Publish to npm:
+Release (maintainers):
 
 ```bash
 npm login
+npm version patch   # or minor / major; creates a git tag
 npm publish --access public
 ```
 
-Before the first publish, verify:
+`prepack` runs `npm run build && npm run verify:package` automatically, and `npm run check` bundles the package validation steps for CI.
 
-- the package name in [package.json](/D:/Code/YEET/LivelineRewriteCODEX/liveline-native/package.json:1) is available on npm
-- the npm account has access to the `@gurshabad90` scope, or change the package name to one you control
+**Before the first publish:** confirm the package name in `package.json` and scope (`@gurshabad90`) on npm, and that you are logged in with access to that scope.
 
-## Demo Reference
+## Repository layout (reference)
 
-The demo app uses the chart here:
-
-- [App.tsx](/D:/Code/YEET/LivelineRewriteCODEX/liveline-native/App.tsx:1)
-
-Public exports live here:
-
-- [src/chart/index.ts](/D:/Code/YEET/LivelineRewriteCODEX/liveline-native/src/chart/index.ts:1)
-- [src/chart/types.ts](/D:/Code/YEET/LivelineRewriteCODEX/liveline-native/src/chart/types.ts:1)
+- Demo app: `App.tsx`
+- Chart exports: `src/chart/index.ts`
+- Live + shared types: `src/chart/types.ts`
+- Static API: `src/chart/staticTypes.ts`, `src/chart/StaticChart.tsx`
