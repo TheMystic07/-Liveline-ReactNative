@@ -2,6 +2,7 @@ import type { SkFont } from '@shopify/react-native-skia';
 import { SkiaNumberFlow } from 'number-flow-react-native/skia';
 import type { SharedValue } from 'react-native-reanimated';
 import { useDerivedValue } from 'react-native-reanimated';
+import interNumberFlowFont from '../../assets/inter-number-flow.ttf';
 
 import {
   BADGE_LINE_H,
@@ -13,8 +14,7 @@ import { chartSkiaNumberFlowStable, formatPriceCentsWorklet } from './chartNumbe
 const pillH = BADGE_LINE_H + BADGE_PAD_Y * 2;
 
 /** Remote Inter TTF — same family as number-flow Skia docs; `useSkiaFont` falls back to system font until loaded. */
-export const BADGE_NUMBER_FLOW_FONT_SRC =
-  'https://fonts.gstatic.com/s/inter/v20/UcCO3FwrK3iLTeHuS_nVMrMxCp50SjIw2boKoduKmMEVuI6fMZg.ttf';
+export const BADGE_NUMBER_FLOW_FONT_SRC = interNumberFlowFont;
 
 type BadgeSkiaNumberFlowProps = {
   svTipV: SharedValue<number>;

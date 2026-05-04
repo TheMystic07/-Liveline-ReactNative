@@ -1,5 +1,5 @@
 import { Circle, Line as SkiaLine } from '@shopify/react-native-skia';
-import { memo } from 'react';
+import React, { memo } from 'react';
 
 type Vec2 = { x: number; y: number };
 

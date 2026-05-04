@@ -1,4 +1,4 @@
-import { memo } from 'react';
+import React, { memo } from 'react';
 import { StyleSheet, Text } from 'react-native';
 
 import { Canvas, Group, Path, Shadow } from '@shopify/react-native-skia';

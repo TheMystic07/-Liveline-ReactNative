@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import type { SkFont } from '@shopify/react-native-skia';
 import { runOnJS, useAnimatedReaction, type SharedValue } from 'react-native-reanimated';
 

@@ -4,7 +4,7 @@ import {
   Line as SkiaLine,
   vec,
 } from '@shopify/react-native-skia';
-import { memo } from 'react';
+import React, { memo } from 'react';
 import type { SharedValue } from 'react-native-reanimated';
 
 import type { ChartPadding, ChartPalette } from '../types';

@@ -1,4 +1,4 @@
-import { memo } from 'react';
+import React, { memo } from 'react';
 import { Text } from 'react-native';
 
 import type { ChartPadding, ChartPalette } from '../types';

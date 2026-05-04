@@ -1,5 +1,5 @@
 import { Circle, Group, Shadow } from '@shopify/react-native-skia';
-import { memo } from 'react';
+import React, { memo } from 'react';
 
 type LiveDotLayerProps = {
   revealOpacity: number | any;

@@ -17,7 +17,7 @@ if (!pkg._originalMain) {
 // Rewrite to dist entries for publishing
 pkg.main = './dist/index.cjs';
 pkg.module = './dist/index.js';
-pkg['react-native'] = './dist/index.cjs';
+pkg['react-native'] = './src/index.ts';
 pkg.types = './dist/index.d.ts';
 
 writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');

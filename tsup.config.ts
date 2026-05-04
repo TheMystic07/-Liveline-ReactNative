@@ -3,20 +3,25 @@ import babel from 'esbuild-plugin-babel';
 
 export default defineConfig({
   entry: ['src/index.ts'],
-  format: ['esm', 'cjs'],
+  format: ['cjs', 'esm'],
   dts: true,
   splitting: false,
   sourcemap: true,
   clean: true,
   esbuildOptions(options) {
     options.jsx = 'automatic';
+    options.jsxImportSource = 'react';
   },
   esbuildPlugins: [
     babel({
-      filter: /\.(ts|tsx)$/,
       config: {
+        presets: [
+          ['@babel/preset-react', { runtime: 'automatic' }],
+          '@babel/preset-typescript',
+        ],
         plugins: ['react-native-worklets/plugin'],
       },
+      filter: /\.(ts|tsx)$/,
     }),
   ],
   external: [

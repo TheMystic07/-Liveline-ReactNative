@@ -1,4 +1,4 @@
-import { memo } from 'react';
+import React, { memo } from 'react';
 import { View } from 'react-native';
 
 import { Chip, ControlRow } from '../Controls';

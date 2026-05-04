@@ -4,7 +4,7 @@ import {
   Path,
   vec,
 } from '@shopify/react-native-skia';
-import { memo } from 'react';
+import React, { memo } from 'react';
 import {
   useDerivedValue,
   type SharedValue,
