@@ -1,6 +1,6 @@
 {
   "name": "@gurshabad90/liveline-native",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "type": "module",
   "description": "React Native Liveline-style real-time charts with Skia, Reanimated, candle mode, and multi-series support.",
   "keywords": [
