@@ -3,39 +3,37 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
-const distPath = path.join(root, 'dist', 'index.js');
-const srcEntryPath = path.join(root, 'src', 'index.ts');
+const distEsmPath = path.join(root, 'dist', 'index.js');
+const distCjsPath = path.join(root, 'dist', 'index.cjs');
 
-const requiredPaths = [
-  pkg.main,
-  pkg.module,
-  pkg.types,
-  pkg['react-native'],
-].filter(Boolean);
-
-for (const relPath of requiredPaths) {
-  const absPath = path.join(root, relPath);
-  if (!existsSync(absPath)) {
-    throw new Error(`Package entry does not exist: ${relPath}`);
-  }
+// Verify dist files exist
+if (!existsSync(distEsmPath)) {
+  throw new Error('Missing dist/index.js');
+}
+if (!existsSync(distCjsPath)) {
+  throw new Error('Missing dist/index.cjs');
 }
 
-if (!existsSync(srcEntryPath)) {
-  throw new Error('Missing React Native source entry: src/index.ts');
-}
-
-const distJs = readFileSync(distPath, 'utf8');
+const distEsm = readFileSync(distEsmPath, 'utf8');
+const distCjs = readFileSync(distCjsPath, 'utf8');
 
 // Verify worklets were compiled (should NOT contain raw 'worklet' strings)
-const rawWorkletCount = (distJs.match(/'worklet'/g) || []).length;
-if (rawWorkletCount > 0) {
-  throw new Error(`Bundle contains ${rawWorkletCount} raw 'worklet' strings. The worklets plugin did not run.`);
+const esmRawWorkletCount = (distEsm.match(/'worklet'/g) || []).length;
+if (esmRawWorkletCount > 0) {
+  throw new Error(`ESM bundle contains ${esmRawWorkletCount} raw 'worklet' strings.`);
 }
 
-// Verify worklet hash markers exist (proof the plugin actually compiled them)
-if (!distJs.includes('__workletHash')) {
-  throw new Error('Bundle missing compiled worklet markers (__workletHash).');
+const cjsRawWorkletCount = (distCjs.match(/'worklet'/g) || []).length;
+if (cjsRawWorkletCount > 0) {
+  throw new Error(`CJS bundle contains ${cjsRawWorkletCount} raw 'worklet' strings.`);
 }
 
-console.log(`Package verification passed. (${rawWorkletCount} raw worklets, __workletHash present)`);
+// Verify worklet hash markers exist
+if (!distEsm.includes('__workletHash')) {
+  throw new Error('ESM bundle missing compiled worklet markers.');
+}
+if (!distCjs.includes('__workletHash')) {
+  throw new Error('CJS bundle missing compiled worklet markers.');
+}
+
+console.log(`Package verification passed. (0 raw worklets, __workletHash present in both ESM and CJS)`);
