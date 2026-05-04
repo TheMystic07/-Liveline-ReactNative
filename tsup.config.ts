@@ -1,4 +1,5 @@
 import { defineConfig } from 'tsup';
+import babel from 'esbuild-plugin-babel';
 
 export default defineConfig({
   entry: ['src/index.ts'],
@@ -10,6 +11,14 @@ export default defineConfig({
   esbuildOptions(options) {
     options.jsx = 'automatic';
   },
+  esbuildPlugins: [
+    babel({
+      filter: /\.(ts|tsx)$/,
+      config: {
+        plugins: ['react-native-worklets/plugin'],
+      },
+    }),
+  ],
   external: [
     'react',
     'react-native',

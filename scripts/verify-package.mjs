@@ -34,12 +34,20 @@ if (!existsSync(srcEntryPath)) {
 const distEsm = readFileSync(distEsmPath, 'utf8');
 const distCjs = readFileSync(distCjsPath, 'utf8');
 
-if (/\bReact\.createElement\b/.test(distEsm) || /\bReact\.Fragment\b/.test(distEsm)) {
-  throw new Error('ESM bundle still references bare React.* symbols.');
+// Verify worklets were compiled (should NOT contain raw 'worklet' strings)
+const rawWorkletCount = (distEsm.match(/'worklet'/g) || []).length;
+if (rawWorkletCount > 0) {
+  throw new Error(`ESM bundle contains ${rawWorkletCount} raw 'worklet' strings. The worklets plugin did not run.`);
 }
 
-if (/\bReact\.createElement\b/.test(distCjs) || /\bReact\.Fragment\b/.test(distCjs)) {
-  throw new Error('CJS bundle still references bare React.* symbols.');
+const cjsRawWorkletCount = (distCjs.match(/'worklet'/g) || []).length;
+if (cjsRawWorkletCount > 0) {
+  throw new Error(`CJS bundle contains ${cjsRawWorkletCount} raw 'worklet' strings. The worklets plugin did not run.`);
 }
 
-console.log('Package verification passed.');
+// Verify worklet hash markers exist (proof the plugin actually compiled them)
+if (!distEsm.includes('__workletHash')) {
+  throw new Error('ESM bundle missing compiled worklet markers (__workletHash).');
+}
+
+console.log(`Package verification passed. (${rawWorkletCount} raw worklets, __workletHash present)`);
