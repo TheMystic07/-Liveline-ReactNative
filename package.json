@@ -40,7 +40,7 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "build": "tsup",
+    "build": "tsup && node ./scripts/patch-dist-font-asset.mjs",
     "typecheck": "tsc --noEmit",
     "prepack": "npm run build"
   },
